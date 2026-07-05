@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e1a">
+<meta name="description" content="Usf Panel — VLESS Tunnel حرفه‌ای در ۳۰ ثانیه، رایگان روی HuggingFace Spaces">
+<title>🔺 Usf Panel — استقرار یک‌کلیکی</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#0a0e1a;
+  --card:rgba(20,27,45,0.55);
+  --glass:rgba(255,255,255,0.04);
+  --accent:#f5c542;
+  --accent-2:#ffd76b;
+  --accent-soft:rgba(245,197,66,0.12);
+  --accent-glow:rgba(245,197,66,0.35);
+  --text:#f8fafc;
+  --text-2:#cbd5e1;
+  --text-3:#94a3b8;
+  --text-4:#64748b;
+  --border:rgba(245,197,66,0.18);
+  --border-soft:rgba(255,255,255,0.06);
+  --success:#22c55e;
+  --success-soft:rgba(34,197,94,0.12);
+  --danger:#ef4444;
+  --danger-soft:rgba(239,68,68,0.12);
+  --warn:#f59e0b;
+  --info:#3b82f6;
+  --radius:16px;
+  --radius-lg:24px;
+}
+html{scroll-behavior:smooth}
+body{
+  font-family:'Vazirmatn','Segoe UI',Tahoma,sans-serif;
+  font-size:16px;line-height:1.65;color:var(--text);background:var(--bg);
+  min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased;
+}
+/* Background orbs */
+.orbs{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.3;animation:float 20s ease-in-out infinite}
+.orb-1{background:rgba(245,197,66,.5);width:400px;height:400px;top:-100px;right:-100px}
+.orb-2{background:rgba(99,102,241,.4);width:500px;height:500px;bottom:-150px;left:-150px;animation-delay:-7s}
+.orb-3{background:rgba(34,197,94,.3);width:300px;height:300px;top:50%;left:50%;animation-delay:-14s}
+@keyframes float{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-30px) scale(1.1)}66%{transform:translate(-20px,20px) scale(.95)}}
+.container{max-width:760px;margin:0 auto;padding:20px;position:relative;z-index:1}
+
+/* Hero */
+.hero{text-align:center;padding:50px 10px 30px}
+.hero .logo{font-size:64px;margin-bottom:12px;display:inline-block;animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 20px var(--accent-glow))}50%{filter:drop-shadow(0 0 40px var(--accent-glow))}}
+.hero h1{font-size:42px;font-weight:800;background:linear-gradient(135deg,var(--text),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:6px;letter-spacing:-1px}
+.hero .subtitle{font-size:18px;color:var(--text-2);margin-bottom:12px;font-weight:500}
+.hero .desc{font-size:14px;color:var(--text-3);max-width:500px;margin:0 auto 24px}
+.hero .badges{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+.badge{padding:4px 12px;border-radius:999px;font-size:11px;font-weight:600;background:var(--glass);border:1px solid var(--border-soft);color:var(--text-3)}
+.badge.gold{background:var(--accent-soft);border-color:var(--border);color:var(--accent)}
+.badge.green{background:var(--success-soft);border-color:rgba(34,197,94,.2);color:var(--success)}
+
+/* Progress bar */
+.progress-wrap{margin:30px 0 20px;padding:0 10px}
+.progress-track{height:6px;background:rgba(255,255,255,.05);border-radius:999px;overflow:hidden;position:relative}
+.progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:999px;transition:width .6s cubic-bezier(.4,0,.2,1);box-shadow:0 0 12px var(--accent-glow)}
+.progress-steps{display:flex;justify-content:space-between;margin-top:10px;font-size:11px;color:var(--text-4)}
+.progress-steps span{transition:color .3s}
+.progress-steps span.active{color:var(--accent);font-weight:700}
+.progress-steps span.done{color:var(--success)}
+
+/* Wizard card */
+.wizard{
+  background:var(--card);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);
+  border:1px solid var(--border);border-radius:var(--radius-lg);padding:32px 28px;
+  box-shadow:0 30px 60px -15px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.04) inset;
+  position:relative;overflow:hidden;min-height:380px;
+}
+.wizard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.6}
+.step{display:none;animation:stepIn .5s cubic-bezier(.16,1,.3,1)}
+.step.active{display:block}
+@keyframes stepIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.step h2{font-size:22px;font-weight:700;margin-bottom:8px;color:var(--text)}
+.step .step-desc{font-size:14px;color:var(--text-3);margin-bottom:20px;line-height:1.7}
+
+/* Form elements */
+.form-group{margin-bottom:16px}
+.form-label{font-size:13px;font-weight:600;color:var(--text-2);margin-bottom:6px;display:block}
+.form-input{
+  width:100%;padding:13px 16px;background:rgba(0,0,0,.35);border:1px solid var(--border-soft);
+  border-radius:12px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .2s;
+  direction:ltr;text-align:left;
+}
+.form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(245,197,66,.1)}
+.form-input::placeholder{color:var(--text-4)}
+.form-hint{font-size:12px;color:var(--text-4);margin-top:5px}
+
+/* Instructions box */
+.instructions{
+  background:var(--glass);border:1px solid var(--border-soft);border-radius:12px;
+  padding:16px 18px;margin-bottom:18px;
+}
+.instructions ol{padding-right:20px;margin-top:8px}
+.instructions li{font-size:13px;color:var(--text-2);margin-bottom:6px;line-height:1.7}
+.instructions a{color:var(--accent);text-decoration:none;border-bottom:1px dashed rgba(245,197,66,.4)}
+.instructions a:hover{color:var(--accent-2)}
+.instructions .ext-link{display:inline-flex;align-items:center;gap:4px}
+
+/* Buttons */
+.btn{
+  border:none;font-family:inherit;font-weight:700;border-radius:12px;cursor:pointer;
+  transition:all .2s;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  font-size:15px;padding:13px 24px;width:100%;
+}
+.btn-primary{background:var(--accent);color:#0a0e1a}
+.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
+.btn-primary:active{transform:translateY(0)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-secondary{background:var(--glass);color:var(--text-2);border:1px solid var(--border-soft)}
+.btn-secondary:hover{background:rgba(255,255,255,.06);color:var(--text)}
+.btn-danger{background:var(--danger-soft);color:var(--danger);border:1px solid rgba(239,68,68,.2)}
+.btn-row{display:flex;gap:10px;margin-top:12px}
+.btn-row .btn{width:auto;flex:1}
+
+/* Deploy log */
+.deploy-log{
+  background:rgba(0,0,0,.35);border:1px solid var(--border-soft);border-radius:12px;
+  padding:16px 18px;font-family:'Courier New',monospace;font-size:12px;line-height:2;
+  max-height:280px;overflow-y:auto;margin-bottom:16px;direction:ltr;text-align:left;
+}
+.deploy-log::-webkit-scrollbar{width:4px}
+.deploy-log::-webkit-scrollbar-thumb{background:rgba(245,197,66,.3);border-radius:2px}
+.log-line{color:var(--text-3);padding:2px 0;animation:logIn .3s ease}
+.log-line.ok{color:var(--success)}
+.log-line.err{color:var(--danger)}
+.log-line.info{color:var(--info)}
+.log-line.warn{color:var(--warn)}
+@keyframes logIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+
+/* Spinner */
+.spinner{
+  width:40px;height:40px;border:3px solid rgba(245,197,66,.15);border-top-color:var(--accent);
+  border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.center{text-align:center}
+
+/* Result card */
+.result-card{
+  background:linear-gradient(135deg,var(--success-soft),rgba(34,197,94,.02));
+  border:1px solid rgba(34,197,94,.2);border-radius:16px;padding:20px;margin-bottom:16px;
+}
+.result-card .check{font-size:36px;text-align:center;margin-bottom:8px}
+.result-card h3{font-size:16px;font-weight:700;color:var(--success);margin-bottom:12px;text-align:center}
+.result-url{
+  display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.35);border:1px solid var(--border-soft);
+  border-radius:10px;padding:10px 12px;margin-bottom:12px;
+}
+.result-url a{flex:1;color:var(--accent);text-decoration:none;font-family:'Courier New',monospace;font-size:12px;word-break:break-all;direction:ltr;text-align:left}
+.result-url a:hover{color:var(--accent-2)}
+.copy-btn{
+  background:var(--accent);color:#0a0e1a;border:none;padding:7px 12px;border-radius:8px;
+  font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;font-family:inherit;
+}
+.copy-btn:hover{background:var(--accent-2)}
+.login-info{
+  display:flex;gap:12px;justify-content:center;flex-wrap:wrap;
+}
+.login-info .cred{
+  background:rgba(0,0,0,.3);padding:8px 14px;border-radius:8px;font-size:13px;
+  border:1px solid var(--border-soft);
+}
+.login-info .cred span{color:var(--text-4);margin-left:4px}
+.login-info .cred b{color:var(--text);font-family:'Courier New',monospace;direction:ltr}
+
+/* Quick start */
+.quick-start{margin-top:16px}
+.quick-start h4{font-size:14px;font-weight:700;margin-bottom:10px;color:var(--text-2)}
+.quick-start ol{padding-right:20px}
+.quick-start li{font-size:13px;color:var(--text-3);margin-bottom:8px;line-height:1.7}
+.quick-start a{color:var(--accent);text-decoration:none}
+
+/* Error box */
+.error-box{
+  background:var(--danger-soft);border:1px solid rgba(239,68,68,.25);border-radius:12px;
+  padding:14px 16px;margin-bottom:16px;font-size:13px;color:var(--danger);line-height:1.7;
+  display:none;
+}
+.error-box.show{display:block;animation:shake .4s}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+
+/* Features */
+.features{margin:50px 0 30px}
+.features h2{font-size:24px;font-weight:700;text-align:center;margin-bottom:24px;color:var(--text)}
+.features-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.feature{
+  background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border:1px solid var(--border-soft);border-radius:14px;padding:18px 16px;transition:all .2s;
+}
+.feature:hover{border-color:var(--border);transform:translateY(-2px)}
+.feature .icon{font-size:28px;margin-bottom:8px}
+.feature h3{font-size:14px;font-weight:700;margin-bottom:4px;color:var(--text)}
+.feature p{font-size:12px;color:var(--text-3);line-height:1.6}
+
+/* How it works */
+.how-it-works{margin:40px 0;text-align:center}
+.how-it-works h2{font-size:24px;font-weight:700;margin-bottom:24px}
+.steps-flow{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+.flow-step{
+  background:var(--glass);border:1px solid var(--border-soft);border-radius:14px;
+  padding:14px 18px;min-width:120px;text-align:center;
+}
+.flow-step .num{width:28px;height:28px;background:var(--accent);color:#0a0e1a;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;margin:0 auto 8px}
+.flow-step .title{font-size:12px;font-weight:600;color:var(--text-2)}
+.flow-arrow{color:var(--text-4);font-size:20px}
+
+/* FAQ */
+.faq{margin:40px 0}
+.faq h2{font-size:24px;font-weight:700;text-align:center;margin-bottom:20px}
+.faq-item{
+  background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border:1px solid var(--border-soft);border-radius:12px;margin-bottom:8px;overflow:hidden;
+}
+.faq-item summary{
+  padding:14px 18px;font-size:14px;font-weight:600;color:var(--text-2);cursor:pointer;
+  list-style:none;display:flex;justify-content:space-between;align-items:center;
+}
+.faq-item summary::-webkit-details-marker{display:none}
+.faq-item summary::after{content:'+';font-size:20px;color:var(--accent);transition:transform .2s}
+.faq-item[open] summary::after{transform:rotate(45deg)}
+.faq-item p{padding:0 18px 14px;font-size:13px;color:var(--text-3);line-height:1.7}
+.faq-item p a{color:var(--accent);text-decoration:none}
+
+/* Footer */
+footer{text-align:center;padding:30px 10px 20px;border-top:1px solid var(--border-soft);margin-top:40px}
+footer .links{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:12px}
+footer a{color:var(--text-3);text-decoration:none;font-size:13px;transition:color .2s}
+footer a:hover{color:var(--accent)}
+footer .copyright{font-size:11px;color:var(--text-4)}
+
+/* Toast */
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);
+  background:rgba(20,27,45,.95);backdrop-filter:blur(12px);color:#fff;
+  padding:12px 22px;border-radius:999px;font-size:13px;font-weight:500;
+  border:1px solid var(--border);box-shadow:0 14px 36px rgba(0,0,0,.5);
+  opacity:0;transition:all .35s;z-index:1000;pointer-events:none;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Loading overlay */
+.loading-overlay{
+  position:fixed;inset:0;background:var(--bg);z-index:9999;display:flex;
+  align-items:center;justify-content:center;flex-direction:column;gap:16px;
+  transition:opacity .5s;
+}
+.loading-overlay.hide{opacity:0;pointer-events:none}
+.loading-overlay .spinner{width:50px;height:50px;border-width:4px}
+.loading-overlay p{color:var(--text-3);font-size:14px}
+
+/* Responsive */
+@media(max-width:600px){
+  .hero{padding:30px 10px 20px}
+  .hero h1{font-size:32px}
+  .hero .subtitle{font-size:16px}
+  .hero .logo{font-size:52px}
+  .wizard{padding:24px 18px}
+  .step h2{font-size:18px}
+  .features-grid{grid-template-columns:1fr}
+  .flow-arrow{transform:rotate(90deg)}
+  .container{padding:14px}
+  .btn{font-size:14px;padding:12px 18px}
+}
+@media(max-width:380px){
+  .hero h1{font-size:26px}
+  .features-grid{gap:8px}
+  .feature{padding:14px 12px}
+}
+</style>
+</head>
+<body>
+
+<!-- Loading overlay -->
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="spinner"></div>
+  <p>در حال بارگذاری Usf Panel...</p>
+</div>
+
+<!-- Background orbs -->
+<div class="orbs">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+
+<div class="container">
+
+  <!-- Hero -->
+  <header class="hero">
+    <div class="logo">🔺</div>
+    <h1>Usf Panel</h1>
+    <p class="subtitle">VLESS Tunnel حرفه‌ای در ۳۰ ثانیه — کاملاً رایگان</p>
+    <p class="desc">بدون نیاز به سرور، بدون نیاز به دانش فنی. فقط یک توکن HuggingFace بدهید و پنل شما آماده می‌شود.</p>
+    <div class="badges">
+      <span class="badge gold">⚡ ۲-۴ برابر سرعت</span>
+      <span class="badge green">🛡️ ضد نشت IP</span>
+      <span class="badge">📱 ریسپانسیو</span>
+      <span class="badge">🎨 Glassmorphism</span>
+    </div>
+  </header>
+
+  <!-- Progress -->
+  <div class="progress-wrap">
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-steps">
+      <span id="ps1" class="active">۱. توکن</span>
+      <span id="ps2">۲. تنظیمات</span>
+      <span id="ps3">۳. استقرار</span>
+      <span id="ps4">۴. آماده</span>
+    </div>
+  </div>
+
+  <!-- Wizard -->
+  <div class="wizard">
+
+    <!-- Step 1: Token -->
+    <section class="step active" id="step1">
+      <h2>🔑 توکن HuggingFace خود را وارد کنید</h2>
+      <p class="step-desc">برای ساخت Space رایگان، به یک توکن HuggingFace با دسترسی <b>Write</b> نیاز دارید. ساخت توکن کاملاً رایگان و کمتر از ۳۰ ثانیه است.</p>
+
+      <div class="instructions">
+        <ol>
+          <li>به صفحه <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" class="ext-link">HuggingFace Tokens <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a> بروید</li>
+          <li>روی دکمه <b>«New token»</b> کلیک کنید</li>
+          <li>نام توکن: <code>Usf Deploy</code> (یا هر نامی)</li>
+          <li>نوع توکن: <b style="color:var(--success)">Write</b> ← بسیار مهم!</li>
+          <li>روی <b>«Create token»</b> کلیک کنید و توکن را کپی کنید</li>
+        </ol>
+      </div>
+
+      <div class="error-box" id="error1"></div>
+
+      <div class="form-group">
+        <label class="form-label">توکن HuggingFace</label>
+        <input type="text" class="form-input" id="tokenInput" placeholder="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+        <div class="form-hint">توکن با <code>hf_</code> شروع می‌شود و حدود ۳۷ کاراکتر است.</div>
+      </div>
+
+      <button class="btn btn-primary" id="btnValidate" onclick="validateToken()">
+        <span>تایید توکن و ادامه</span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      </button>
+    </section>
+
+    <!-- Step 2: Settings -->
+    <section class="step" id="step2">
+      <h2>⚙️ تنظیمات پنل</h2>
+      <p class="step-desc">نام Space و رمز عبور مدیر را مشخص کنید. این تنظیمات بعداً قابل تغییر خواهند بود.</p>
+
+      <div class="form-group">
+        <label class="form-label">نام کاربری HuggingFace شما</label>
+        <input type="text" class="form-input" id="hfUsername" readonly style="opacity:.6;cursor:not-allowed">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">نام Space (انگلیسی، بدون فاصله)</label>
+        <input type="text" class="form-input" id="spaceName" value="usf" placeholder="usf" pattern="[a-z0-9\-]+" autocomplete="off">
+        <div class="form-hint">آدرس نهایی پنل شما: <code id="urlPreview">https://username-usf.hf.space</code></div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">رمز عبور مدیر</label>
+        <input type="text" class="form-input" id="adminPassword" value="admin" placeholder="admin" autocomplete="off">
+        <div class="form-hint">⚠️ پیش‌فرض <code>admin</code> است. حتماً بعد از اولین ورود تغییرش دهید!</div>
+      </div>
+
+      <div class="error-box" id="error2"></div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(1)">← بازگشت</button>
+        <button class="btn btn-primary" id="btnDeploy" onclick="startDeploy()">
+          🚀 استقرار پنل
+        </button>
+      </div>
+    </section>
+
+    <!-- Step 3: Deploying -->
+    <section class="step" id="step3">
+      <h2>🚀 در حال استقرار...</h2>
+      <p class="step-desc">لطفاً صبر کنید. این فرآیند حدود ۲-۳ دقیقه طول می‌کشد. صفحه را نبندید.</p>
+
+      <div class="center" style="margin-bottom:16px">
+        <div class="spinner"></div>
+      </div>
+
+      <div class="deploy-log" id="deployLog"></div>
+
+      <div class="error-box" id="error3"></div>
+    </section>
+
+    <!-- Step 4: Done -->
+    <section class="step" id="step4">
+      <div class="result-card">
+        <div class="check">✅</div>
+        <h3>پنل شما با موفقیت ساخته شد!</h3>
+
+        <div class="result-url">
+          <a href="#" id="panelUrl" target="_blank" rel="noopener">—</a>
+          <button class="copy-btn" onclick="copyUrl()">کپی</button>
+        </div>
+
+        <div class="login-info">
+          <div class="cred"><span>👤</span> <b>admin</b></div>
+          <div class="cred"><span>🔑</span> <b id="finalPassword">admin</b></div>
+        </div>
+      </div>
+
+      <div class="quick-start">
+        <h4>📚 شروع سریع:</h4>
+        <ol>
+          <li>روی لینک بالا کلیک کنید تا پنل باز شود</li>
+          <li>با <code>admin</code> و رمزی که تنظیم کردید وارد شوید</li>
+          <li><b>فوراً رمز را تغییر دهید:</b> Settings → Change Password</li>
+          <li>یک Inbound جدید بسازید: Inbounds → Add Inbound</li>
+          <li>لینک <code>/status/{uuid}</code> را به کاربران خود بدهید</li>
+          <li>کاربران لینک Sub را در کلاینت VLESS خود وارد می‌کنند</li>
+        </ol>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="goToStep(1)">🔄 استقرار پنل جدید</button>
+        <a class="btn btn-primary" id="openPanelBtn" href="#" target="_blank" rel="noopener">باز کردن پنل →</a>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Features -->
+  <section class="features">
+    <h2>✨ چرا Usf Panel؟</h2>
+    <div class="features-grid">
+      <div class="feature">
+        <div class="icon">⚡</div>
+        <h3>سرعت ۲-۴ برابر</h3>
+        <p>uvloop + orjson + httptools + بافر 512KB + TCP_NODELAY + فشرده‌سازی WebSocket</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🛡️</div>
+        <h3>ضد نشت IP</h3>
+        <p>HMAC-signed paths، پاک‌سازی هدرها، rate limiting، uTLS Chrome fingerprint</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🎨</div>
+        <h3>طراحی حرفه‌ای</h3>
+        <p>Glassmorphism، گیج SVG متحرک، شمارش معکوس زنده، تم تاریک/روشن</p>
+      </div>
+      <div class="feature">
+        <div class="icon">💾</div>
+        <h3>پایداری داده</h3>
+        <p>SQLite persistence — داده‌ها بعد از restart های HuggingFace حفظ می‌شوند</p>
+      </div>
+      <div class="feature">
+        <div class="icon">📱</div>
+        <h3>۶ کلاینت Deep-Link</h3>
+        <p>V2RayN، V2RayNG، Streisand، Shadowrocket، Foxray — یک کلیک کافی است</p>
+      </div>
+      <div class="feature">
+        <div class="icon">🆓</div>
+        <h3>کاملاً رایگان</h3>
+        <p>روی HuggingFace Spaces رایگان، بدون نیاز به سرور یا دامنه</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- How it works -->
+  <section class="how-it-works">
+    <h2>🔧 نحوه کار</h2>
+    <div class="steps-flow">
+      <div class="flow-step">
+        <div class="num">۱</div>
+        <div class="title">توکن HF<br>می‌گیرید</div>
+      </div>
+      <div class="flow-arrow">←</div>
+      <div class="flow-step">
+        <div class="num">۲</div>
+        <div class="title">ما Space<br>می‌سازیم</div>
+      </div>
+      <div class="flow-arrow">←</div>
+      <div class="flow-step">
+        <div class="num">۳</div>
+        <div class="title">فایل‌ها<br>آپلود می‌شود</div>
+      </div>
+      <div class="flow-arrow">←</div>
+      <div class="flow-step">
+        <div class="num">۴</div>
+        <div class="title">پنل شما<br>آماده است</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="faq">
+    <h2>❓ سوالات متداول</h2>
+
+    <details class="faq-item">
+      <summary>آیا واقعاً رایگان است؟</summary>
+      <p>بله! HuggingFace Spaces یک لایه رایگان با 16GB RAM و 2 vCPU ارائه می‌دهد که برای استفاده شخصی کاملاً کافی است. هیچ کارت اعتباری نیاز نیست.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>آیا توکن من امن است؟</summary>
+      <p>بله. توکن شما فقط در مرورگر شما استفاده می‌شود و به هیچ سروری ارسال نمی‌شود. تمام ارتباطات مستقیماً بین مرورگر شما و API های HuggingFace انجام می‌شود. بعد از استقرار، توکن را از <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">صفحه تنظیمات</a> می‌توانید حذف کنید.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>اگر Space از قبل وجود داشته باشد چه؟</summary>
+      <p>اگر Space با همان نام از قبل وجود داشته باشد، فایل‌ها به‌روزرسانی می‌شوند و تنظیمات دوباره اعمال می‌گردند. داده‌های قبلی شما (لینک‌ها، ترافیک) حفظ می‌شوند.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>خطای "سهمیه تکمیل شده" چه означает؟</summary>
+      <p>HuggingFace در لایه رایگان فقط اجازه می‌دهد یک Space همزمان روشن باشد. اگر Space های دیگری دارید، از <a href="https://huggingface.co/settings" target="_blank" rel="noopener">صفحه Spaces</a> آن‌ها را pause کنید و دوباره تلاش کنید.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>پنل بعد از مدتی خاموش می‌شود؟</summary>
+      <p>HuggingFace Spaces رایگان هر ۴۸ ساعت یا در صورت بی‌فعالیتی restart می‌شود. اما Usf Panel از SQLite استفاده می‌کند، بنابراین تمام داده‌های شما (لینک‌ها، ترافیک، تنظیمات) حفظ می‌شوند. Space به‌صورت خودکار دوباره روشن می‌شود.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>چگونه سرعت را بیشتر کنم؟</summary>
+      <p>راهنمای کامل بهینه‌سازی سرعت در <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/SPEED_OPTIMIZATION.md" target="_blank" rel="noopener">GitHub</a> موجود است. نکات کلیدی: mux را در کلاینت فعال کنید، IPv6 را غیرفعال کنید، DNS را از طریق پروکسی هدایت کنید.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>چگونه از نشت IP جلوگیری کنم؟</summary>
+      <p>راهنمای کامل ضد نشت در <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/ANTI_LEAK.md" target="_blank" rel="noopener">GitHub</a> موجود است. مهم‌ترین موارد: IPv6 را در کلاینت ببندید، WebRTC را در مرورگر غیرفعال کنید، DNS را از طریق پروکسی هدایت کنید.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>کدام کلاینت‌ها پشتیبانی می‌شوند؟</summary>
+      <p>تمام کلاینت‌های VLESS: V2RayN (ویندوز)، V2RayNG (اندروید)، Streisand (iOS)، Shadowrocket (iOS)، Foxray (مک)، Nekoray (لینوکس/ویندوز). صفحه status دکمه‌های deep-link برای ۶ کلاینت محبوب دارد.</p>
+    </details>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="links">
+      <a href="https://github.com/Godde3s/Usf-panel" target="_blank" rel="noopener">📂 GitHub</a>
+      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/DEPLOY.md" target="_blank" rel="noopener">📖 مستندات</a>
+      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/SPEED_OPTIMIZATION.md" target="_blank" rel="noopener">⚡ بهینه‌سازی سرعت</a>
+      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/ANTI_LEAK.md" target="_blank" rel="noopener">🛡️ ضد نشت</a>
+      <a href="https://huggingface.co/spaces/U1sf0014/usf" target="_blank" rel="noopener">🧪 دمو زنده</a>
+    </div>
+    <div class="copyright">© 2026 Usf Panel — MIT License</div>
+  </footer>
+
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script type="module">
+import { whoami, createRepo, commit } from "https://esm.sh/@huggingface/hub@0.15.1";
+
+// ─── State ──────────────────────────────────────────────────────────────────
+const state = {
+  accessToken: null,
+  username: null,
+  spaceName: "usf",
+  password: "admin",
+  spaceId: null,
+};
+
+// ─── DOM helpers ────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const steps = ["step1", "step2", "step3", "step4"];
+const psSteps = ["ps1", "ps2", "ps3", "ps4"];
+
+function goToStep(n) {
+  steps.forEach((s, i) => {
+    $(s).classList.toggle("active", i === n - 1);
+  });
+  psSteps.forEach((p, i) => {
+    const el = $(p);
+    el.classList.remove("active", "done");
+    if (i < n - 1) el.classList.add("done");
+    else if (i === n - 1) el.classList.add("active");
+  });
+  // Progress bar
+  const pct = ((n - 1) / 3) * 100;
+  $("progressFill").style.width = pct + "%";
+  // Hide all error boxes
+  ["error1", "error2", "error3"].forEach(e => $(e).classList.remove("show"));
+  // Scroll to top of wizard
+  $("progressFill").parentElement.parentElement.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function showError(boxId, msg) {
+  const box = $(boxId);
+  box.textContent = msg;
+  box.classList.add("show");
+}
+
+function showToast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2500);
+}
+
+function logMsg(msg, type = "") {
+  const log = $("deployLog");
+  const line = document.createElement("div");
+  line.className = "log-line " + type;
+  const time = new Date().toLocaleTimeString("fa-IR");
+  const prefix = type === "ok" ? "✓" : type === "err" ? "✗" : type === "warn" ? "⚠" : type === "info" ? "ℹ" : "→";
+  line.textContent = `[${time}] ${prefix} ${msg}`;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ─── Step 1: Validate token ─────────────────────────────────────────────────
+window.validateToken = async function() {
+  const token = $("tokenInput").value.trim();
+  const btn = $("btnValidate");
+
+  if (!token || !token.startsWith("hf_")) {
+    showError("error1", "توکن نامعتبر است. توکن باید با «hf_» شروع شود.");
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner" style="width:18px;height:18px;border-width:2px"></div> در حال بررسی...';
+
+  try {
+    const info = await whoami({ credentials: { accessToken: token } });
+    if (!info || !info.name) throw new Error("پاسخ نامعتبر از سرور");
+
+    state.accessToken = token;
+    state.username = info.name;
+
+    // Move to step 2
+    $("hfUsername").value = info.name;
+    updateUrlPreview();
+    goToStep(2);
+  } catch (e) {
+    let msg = "توکن نامعتبر است.";
+    if (e.message && e.message.includes("401")) {
+      msg = "توکن نامعتبر یا منقضی است. لطفاً یک توکن جدید با دسترسی «Write» بسازید.";
+    } else if (e.message && e.message.includes("403")) {
+      msg = "توکن دسترسی کافی ندارد. مطمئن شوید توکن از نوع «Write» است.";
+    } else if (e.message) {
+      msg = "خطا: " + e.message;
+    }
+    showError("error1", msg);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<span>تایید توکن و ادامه</span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>';
+  }
+};
+
+// Update URL preview when space name changes
+$("spaceName").addEventListener("input", updateUrlPreview);
+function updateUrlPreview() {
+  const name = $("spaceName").value.trim() || "usf";
+  const username = state.username || "username";
+  $("urlPreview").textContent = `https://${username}-${name}.hf.space`;
+}
+
+// ─── Step 2: Start deploy ───────────────────────────────────────────────────
+window.startDeploy = async function() {
+  state.spaceName = $("spaceName").value.trim().toLowerCase() || "usf";
+  state.password = $("adminPassword").value.trim() || "admin";
+
+  // Validate space name
+  if (!/^[a-z0-9\-]+$/.test(state.spaceName)) {
+    showError("error2", "نام Space فقط می‌تواند شامل حروف کوچک انگلیسی، اعداد و خط تیره باشد.");
+    return;
+  }
+
+  goToStep(3);
+  $("deployLog").innerHTML = "";
+
+  try {
+    // ─── 1. Create Space ────────────────────────────────────────────────────
+    logMsg("در حال ایجاد Space...", "info");
+    try {
+      await createRepo({
+        repo: { type: "space", name: state.spaceName },
+        credentials: { accessToken: state.accessToken },
+        sdk: "docker",
+        private: false,
+      });
+      logMsg(`Space «${state.username}/${state.spaceName}» ایجاد شد`, "ok");
+    } catch (e) {
+      if (e.message && (e.message.includes("409") || e.message.includes("already") || e.message.includes("exists"))) {
+        logMsg("Space از قبل وجود دارد — فایل‌ها به‌روزرسانی می‌شوند", "warn");
+      } else if (e.message && e.message.includes("quota")) {
+        throw new Error("سهمیه Space های شما تکمیل شده است. لطفاً Space های دیگر خود را از huggingface.co/settings pause کنید و دوباره تلاش کنید.");
+      } else {
+        throw e;
+      }
+    }
+
+    // ─── 2. Download files from GitHub ──────────────────────────────────────
+    logMsg("در حال دانلود فایل‌های پنل از GitHub...", "info");
+    const fileUrls = {
+      "app.py": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/app.py",
+      "requirements.txt": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/requirements.txt",
+      "Dockerfile": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/Dockerfile",
+    };
+
+    const operations = [];
+    for (const [path, url] of Object.entries(fileUrls)) {
+      logMsg(`دانلود ${path}...`, "info");
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`خطا در دانلود ${path}: HTTP ${res.status}`);
+      const content = await res.text();
+      operations.push({
+        operation: "add",
+        path: path,
+        content: new Blob([content], { type: "text/plain" }),
+      });
+      logMsg(`${path} (${(content.length / 1024).toFixed(1)} KB) آماده شد`, "ok");
+    }
+
+    // ─── 3. Generate README.md with HF metadata ─────────────────────────────
+    const readmeContent = `---
+title: Usf Panel
+emoji: 🔺
+colorFrom: yellow
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: true
+license: mit
+---
+
+# 🔺 Usf Panel
+
+Premium VLESS Tunnel & Subscription Manager
+
+Auto-deployed from https://godde3s.github.io/Usf-panel
+
+## Login
+- Username: admin
+- Password: (set during deployment)
+
+Change the password immediately after first login!
+`;
+    operations.push({
+      operation: "add",
+      path: "README.md",
+      content: new Blob([readmeContent], { type: "text/plain" }),
+    });
+    logMsg("README.md تولید شد", "ok");
+
+    // ─── 4. Upload all files in one commit ───────────────────────────────────
+    logMsg("در حال آپلود فایل‌ها به HuggingFace...", "info");
+    await commit({
+      repo: { type: "space", name: `${state.username}/${state.spaceName}` },
+      credentials: { accessToken: state.accessToken },
+      title: "△ Usf Panel v1.0.0 — auto-deploy",
+      operations,
+    });
+    logMsg("تمام فایل‌ها با موفقیت آپلود شدند", "ok");
+
+    // ─── 5. Set secrets ──────────────────────────────────────────────────────
+    logMsg("در حال تنظیم رمز عبور و کلیدهای امنیتی...", "info");
+    const secretKey = generateSecretKey();
+    await setSecret("ADMIN_USERNAME", "admin");
+    await setSecret("ADMIN_PASSWORD", state.password);
+    await setSecret("SECRET_KEY", secretKey);
+    logMsg("تنظیمات امنیتی اعمال شد", "ok");
+
+    // ─── 6. Restart Space (to pick up secrets) ───────────────────────────────
+    logMsg("در حال راه‌اندازی مجدد Space...", "info");
+    try {
+      await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}/restart`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${state.accessToken}` },
+      });
+      logMsg("راه‌اندازی مجدد ارسال شد", "ok");
+    } catch (e) {
+      logMsg("هشدار: restart خودکار ناموفق بود (ممکن است نیاز به restart دستی باشد)", "warn");
+    }
+
+    // ─── 7. Wait for build ───────────────────────────────────────────────────
+    logMsg("در حال انتظار برای build... (این مرحله ۲-۳ دقیقه طول می‌کشد)", "info");
+    await waitForBuild();
+
+    // ─── 8. Done! ────────────────────────────────────────────────────────────
+    logMsg("پنل با موفقیت ساخته شد! 🎉", "ok");
+
+    // Show result
+    const panelUrl = `https://${state.username}-${state.spaceName}.hf.space`;
+    $("panelUrl").href = panelUrl;
+    $("panelUrl").textContent = panelUrl;
+    $("openPanelBtn").href = panelUrl;
+    $("finalPassword").textContent = state.password;
+
+    // Update progress to 100%
+    $("progressFill").style.width = "100%";
+
+    goToStep(4);
+    showToast("✅ پنل شما آماده است!");
+  } catch (e) {
+    logMsg("خطا: " + (e.message || e), "err");
+    showError("error3", "❌ " + (e.message || "خطای ناشناخته. لطفاً دوباره تلاش کنید."));
+  }
+};
+
+async function setSecret(key, value) {
+  const res = await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}/secrets`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${state.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ key, value }),
+  });
+  if (!res.ok) throw new Error(`خطا در تنظیم ${key}`);
+}
+
+function generateSecretKey() {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let key = "";
+  for (let i = 0; i < 64; i++) {
+    key += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return key;
+}
+
+async function waitForBuild() {
+  const maxAttempts = 72; // 6 minutes max (5s * 72)
+  let lastStage = "";
+
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}`, {
+        headers: { Authorization: `Bearer ${state.accessToken}` },
+      });
+      if (!res.ok) {
+        await sleep(5000);
+        continue;
+      }
+      const data = await res.json();
+      const stage = (data.runtime || {}).stage || "UNKNOWN";
+
+      if (stage !== lastStage) {
+        const stageText = translateStage(stage);
+        logMsg(`وضعیت build: ${stageText}`, "info");
+        lastStage = stage;
+      }
+
+      if (stage === "RUNNING") {
+        logMsg("Space در حال اجراست!", "ok");
+        return;
+      }
+      if (stage === "PAUSED") {
+        throw new Error("Space متوقف شد. ممکن است سهمیه شما تکمیل شده باشد. Space های دیگر خود را pause کنید.");
+      }
+      if (stage === "ERROR" || stage === "RUNNING_ERROR") {
+        throw new Error("Build ناموفق بود. لاگ‌ها را در HuggingFace بررسی کنید.");
+      }
+
+      await sleep(5000);
+    } catch (e) {
+      if (e.message && (e.message.includes("متوقف") || e.message.includes("ناموفق"))) {
+        throw e;
+      }
+      // Network error, retry
+      await sleep(5000);
+    }
+  }
+  throw new Error("زمان انتظار برای build به پایان رسید. ممکن است Space هنوز در حال build باشد — چند دقیقه بعد دوباره بررسی کنید.");
+}
+
+function translateStage(stage) {
+  const map = {
+    "BUILDING": "در حال build...",
+    "RUNNING": "در حال اجرا",
+    "PAUSED": "متوقف شده",
+    "ERROR": "خطا",
+    "RUNNING_ERROR": "خطا در اجرا",
+    "NO_APP_FILE": "فایل اپ پیدا نشد",
+    "UNKNOWN": "نامشخص",
+  };
+  return map[stage] || stage;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ─── Copy URL ───────────────────────────────────────────────────────────────
+window.copyUrl = function() {
+  const url = $("panelUrl").href;
+  navigator.clipboard.writeText(url).then(() => {
+    showToast("✅ لینک کپی شد!");
+  }).catch(() => {
+    showToast("کپی ناموفق بود", true);
+  });
+};
+
+// ─── Enter key support ──────────────────────────────────────────────────────
+$("tokenInput").addEventListener("keypress", (e) => {
+  if (e.key === "Enter") validateToken();
+});
+
+// ─── Hide loading overlay ───────────────────────────────────────────────────
+window.addEventListener("load", () => {
+  setTimeout(() => {
+    $("loadingOverlay").classList.add("hide");
+    setTimeout(() => $("loadingOverlay").remove(), 500);
+  }, 300);
+});
+
+// Make goToStep accessible globally
+window.goToStep = goToStep;
+</script>
+</body>
+</html>
