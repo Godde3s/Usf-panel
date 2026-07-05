@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database (SQLite local persistence — should NOT be committed)
+*.db
+*.db-journal
+usf.db
+
+# Logs
+*.log
+
+# Secrets — NEVER commit
+.env.local
+secrets.txt
+*.secret
+
+# HF Space local clone
+.hf/
+
+# Agent working directory
+agent-ctx/

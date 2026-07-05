@@ -1,0 +1,54 @@
+name: Sync to HuggingFace Space
+
+# This workflow automatically syncs the GitHub repo to a HuggingFace Space.
+# Setup: Add a repository secret named `HF_TOKEN` with a HuggingFace Write token.
+# Get one at: https://huggingface.co/settings/tokens
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Configure git for HuggingFace
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          # Clone the HuggingFace Space (or create it if it doesn't exist)
+          # Replace U1sf0014 with your HuggingFace username and usf with your Space name
+          git clone https://U1sf0014:$HF_TOKEN@huggingface.co/spaces/U1sf0014/usf hf_space || {
+            # Space doesn't exist yet — create it via API
+            curl -X POST \
+              -H "Authorization: Bearer $HF_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"type":"space","name":"usf","sdk":"docker","private":false}' \
+              https://huggingface.co/api/repos/create
+            sleep 5
+            git clone https://U1sf0014:$HF_TOKEN@huggingface.co/spaces/U1sf0014/usf hf_space
+          }
+
+          # Copy all files from GitHub repo to HF Space (except .git and .github)
+          cd hf_space
+          rm -rf docs/ || true
+          cp -r ../app.py ../requirements.txt ../Dockerfile ../README.md ../LICENSE ./
+          cp -r ../docs ./docs 2>/dev/null || true
+          # Don't sync .gitignore — HF doesn't need it
+          # Don't sync .github — recursive
+
+          # Commit and push
+          git add .
+          git commit -m "Auto-sync from GitHub: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "Nothing to commit"
+          git push
