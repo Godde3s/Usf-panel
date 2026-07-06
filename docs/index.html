@@ -1,335 +1,1168 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" dir="ltr">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
-<meta name="theme-color" content="#0b0f1a">
-<meta name="description" content="Usf Panel — Deploy a premium VLESS tunnel on HuggingFace Spaces in 30 seconds. Free forever.">
-<title>Usf Panel — One-Click VLESS Deployment</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{--bg:#0b0f1a;--bg2:#111827;--card:rgba(17,24,39,0.7);--glass:rgba(255,255,255,0.04);
---accent:#6366f1;--accent2:#818cf8;--cyan:#06b6d4;--emerald:#10b981;--amber:#f59e0b;--rose:#f43f5e;
---text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;--text4:#64748b;
---border:rgba(255,255,255,0.06);--border2:rgba(99,102,241,0.15);
---radius:20px;--radius-sm:12px}
-html{scroll-behavior:smooth}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;font-size:16px;line-height:1.7;color:var(--text);background:var(--bg);overflow-x:hidden}
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+    <meta name="theme-color" content="#0b0f1a">
+    <meta name="description" content="Usf Panel — Deploy a premium VLESS tunnel on HuggingFace Spaces in 30 seconds. Free forever. | پنل Usf — استقرار تونل VLESS حرفه‌ای در ۳۰ ثانیه">
+    <title>Usf Panel — One-Click VLESS Deployment | استقرار آسان VLESS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent
+        }
+        :root {
+            --bg: #0b0f1a;
+            --bg2: #111827;
+            --card: rgba(17, 24, 39, 0.7);
+            --glass: rgba(255, 255, 255, 0.04);
+            --accent: #6366f1;
+            --accent2: #818cf8;
+            --cyan: #06b6d4;
+            --emerald: #10b981;
+            --amber: #f59e0b;
+            --rose: #f43f5e;
+            --text: #f1f5f9;
+            --text2: #cbd5e1;
+            --text3: #94a3b8;
+            --text4: #64748b;
+            --border: rgba(255, 255, 255, 0.06);
+            --border2: rgba(99, 102, 241, 0.15);
+            --radius: 20px;
+            --radius-sm: 12px
+        }
+        html {
+            scroll-behavior: smooth
+        }
+        body {
+            font-family: 'Inter', 'Vazirmatn', system-ui, -apple-system, sans-serif;
+            font-size: 16px;
+            line-height: 1.7;
+            color: var(--text);
+            background: var(--bg);
+            overflow-x: hidden
+        }
+        html[dir="rtl"] body {
+            font-family: 'Vazirmatn', 'Inter', system-ui, sans-serif;
+            letter-spacing: 0
+        }
 
-/* Background Effects */
-.bg-effects{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
-.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:.12}
-.orb-1{width:600px;height:600px;background:var(--accent);top:-200px;right:-100px;animation:drift 25s ease-in-out infinite}
-.orb-2{width:500px;height:500px;background:var(--cyan);bottom:-150px;left:-100px;animation:drift 25s ease-in-out infinite reverse}
-.orb-3{width:300px;height:300px;background:#8b5cf6;top:40%;left:40%;animation:drift 30s ease-in-out infinite 5s}
-.grid-bg{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.02) 1px,transparent 1px);background-size:60px 60px}
-@keyframes drift{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(40px,-30px) scale(1.05)}66%{transform:translate(-30px,20px) scale(.95)}}
+        .bg-effects {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            overflow: hidden
+        }
+        .orb {
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(120px);
+            opacity: .12
+        }
+        .orb-1 {
+            width: 600px;
+            height: 600px;
+            background: var(--accent);
+            top: -200px;
+            right: -100px;
+            animation: drift 25s ease-in-out infinite
+        }
+        .orb-2 {
+            width: 500px;
+            height: 500px;
+            background: var(--cyan);
+            bottom: -150px;
+            left: -100px;
+            animation: drift 25s ease-in-out infinite reverse
+        }
+        .orb-3 {
+            width: 300px;
+            height: 300px;
+            background: #8b5cf6;
+            top: 40%;
+            left: 40%;
+            animation: drift 30s ease-in-out infinite 5s
+        }
+        .grid-bg {
+            position: absolute;
+            inset: 0;
+            background-image: linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            background-size: 60px 60px
+        }
+        @keyframes drift {
+            0%,
+            100% {
+                transform: translate(0, 0) scale(1)
+            }
+            33% {
+                transform: translate(40px, -30px) scale(1.05)
+            }
+            66% {
+                transform: translate(-30px, 20px) scale(.95)
+            }
+        }
 
-/* Layout */
-.container{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:0 24px}
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 24px
+        }
 
-/* Nav */
-nav{position:fixed;top:0;left:0;right:0;z-index:50;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:rgba(11,15,26,0.8);border-bottom:1px solid var(--border);padding:0 24px}
-.nav-inner{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;height:64px}
-.nav-logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px}
-.nav-logo-icon{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:900;font-size:15px;color:#fff}
-.nav-links{display:flex;gap:8px}
-.nav-links a{color:var(--text3);text-decoration:none;font-size:14px;font-weight:500;padding:8px 14px;border-radius:10px;transition:all .2s}
-.nav-links a:hover{color:var(--text);background:var(--glass)}
-.nav-cta{background:linear-gradient(135deg,var(--accent),#4f46e5)!important;color:#fff!important;border:none!important;padding:8px 18px!important;border-radius:10px!important;font-weight:600!important}
-.nav-cta:hover{box-shadow:0 4px 20px rgba(99,102,241,0.3);transform:translateY(-1px)!important}
-.mobile-menu-btn{display:none;background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;padding:4px}
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 50;
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            background: rgba(11, 15, 26, 0.8);
+            border-bottom: 1px solid var(--border);
+            padding: 0 24px
+        }
+        .nav-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 64px;
+            gap: 12px
+        }
+        .nav-logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 800;
+            font-size: 18px;
+            flex-shrink: 0
+        }
+        .nav-logo-icon {
+            width: 34px;
+            height: 34px;
+            border-radius: 9px;
+            background: linear-gradient(135deg, var(--accent), var(--cyan));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 900;
+            font-size: 15px;
+            color: #fff;
+            flex-shrink: 0
+        }
+        .nav-right {
+            display: flex;
+            align-items: center;
+            gap: 8px
+        }
+        .nav-links {
+            display: flex;
+            gap: 6px;
+            align-items: center
+        }
+        .nav-links a {
+            color: var(--text3);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            padding: 8px 14px;
+            border-radius: 10px;
+            transition: all .2s;
+            white-space: nowrap
+        }
+        .nav-links a:hover {
+            color: var(--text);
+            background: var(--glass)
+        }
+        .nav-cta {
+            background: linear-gradient(135deg, var(--accent), #4f46e5) !important;
+            color: #fff !important;
+            border: none !important;
+            padding: 8px 18px !important;
+            border-radius: 10px !important;
+            font-weight: 600 !important
+        }
+        .nav-cta:hover {
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.3);
+            transform: translateY(-1px) !important
+        }
+        .lang-btn {
+            background: var(--glass);
+            border: 1px solid var(--border);
+            color: var(--text2);
+            font-size: 13px;
+            font-weight: 600;
+            padding: 8px 12px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all .2s;
+            font-family: inherit;
+            white-space: nowrap;
+            flex-shrink: 0
+        }
+        .lang-btn:hover {
+            border-color: var(--accent);
+            color: var(--accent2);
+            background: rgba(99, 102, 241, 0.08)
+        }
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: none;
+            color: var(--text);
+            font-size: 24px;
+            cursor: pointer;
+            padding: 4px;
+            flex-shrink: 0
+        }
 
-/* Hero */
-.hero{min-height:100vh;display:flex;align-items:center;padding-top:80px}
-.hero-grid{display:grid;grid-template-columns:1.1fr 0.9fr;gap:60px;align-items:center}
-.hero-badge{display:inline-flex;align-items:center;gap:8px;background:var(--glass);border:1px solid var(--border2);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent2);margin-bottom:24px}
-.hero-badge .dot{width:6px;height:6px;border-radius:50%;background:var(--emerald);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.hero h1{font-size:clamp(36px,5vw,56px);font-weight:900;line-height:1.1;margin-bottom:20px;letter-spacing:-0.03em}
-.hero h1 .gradient{background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.hero p{font-size:18px;color:var(--text2);line-height:1.7;margin-bottom:32px;max-width:500px}
-.hero-buttons{display:flex;gap:12px;flex-wrap:wrap}
-.btn-lg{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer;transition:all .25s;text-decoration:none;font-family:inherit;border:none}
-.btn-primary-lg{background:linear-gradient(135deg,var(--accent),#4f46e5);color:#fff;box-shadow:0 4px 20px rgba(99,102,241,0.25)}
-.btn-primary-lg:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(99,102,241,0.35)}
-.btn-outline-lg{background:transparent;border:1px solid var(--border2);color:var(--text2)}
-.btn-outline-lg:hover{border-color:var(--accent);color:var(--accent2);transform:translateY(-2px)}
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            padding-top: 80px
+        }
+        .hero-grid {
+            display: grid;
+            grid-template-columns: 1.1fr 0.9fr;
+            gap: 60px;
+            align-items: center
+        }
+        html[dir="rtl"] .hero-grid {
+            direction: rtl
+        }
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--glass);
+            border: 1px solid var(--border2);
+            border-radius: 20px;
+            padding: 6px 16px;
+            font-size: 13px;
+            color: var(--accent2);
+            margin-bottom: 24px
+        }
+        .hero-badge .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--emerald);
+            animation: pulse 2s infinite
+        }
+        @keyframes pulse {
+            0%,
+            100% {
+                opacity: 1
+            }
+            50% {
+                opacity: .3
+            }
+        }
+        .hero h1 {
+            font-size: clamp(36px, 5vw, 56px);
+            font-weight: 900;
+            line-height: 1.25;
+            margin-bottom: 20px;
+            letter-spacing: -0.03em
+        }
+        html[dir="rtl"] .hero h1 {
+            letter-spacing: 0;
+            line-height: 1.4
+        }
+        .hero h1 .gradient {
+            background: linear-gradient(135deg, var(--accent), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text
+        }
+        .hero p {
+            font-size: 18px;
+            color: var(--text2);
+            line-height: 1.7;
+            margin-bottom: 32px;
+            max-width: 500px
+        }
+        html[dir="rtl"] .hero p {
+            line-height: 1.9
+        }
+        .hero-buttons {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap
+        }
+        .btn-lg {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 28px;
+            border-radius: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all .25s;
+            text-decoration: none;
+            font-family: inherit;
+            border: none
+        }
+        .btn-primary-lg {
+            background: linear-gradient(135deg, var(--accent), #4f46e5);
+            color: #fff;
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.25)
+        }
+        .btn-primary-lg:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(99, 102, 241, 0.35)
+        }
+        .btn-outline-lg {
+            background: transparent;
+            border: 1px solid var(--border2);
+            color: var(--text2)
+        }
+        .btn-outline-lg:hover {
+            border-color: var(--accent);
+            color: var(--accent2);
+            transform: translateY(-2px)
+        }
 
-/* Hero Card */
-.hero-card{background:var(--card);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius);padding:28px;box-shadow:0 25px 60px rgba(0,0,0,0.3)}
-.hero-card h3{font-size:16px;font-weight:700;margin-bottom:20px;display:flex;align-items:center;gap:8px}
-.step{display:flex;gap:14px;align-items:flex-start;padding:12px 0}
-.step-num{width:28px;height:28px;min-width:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff}
-.step-text{font-size:14px;color:var(--text2)}
-.step-text strong{color:var(--text)}
+        .hero-card {
+            background: var(--card);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.3)
+        }
+        .hero-card h3 {
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px
+        }
+        .step {
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            padding: 12px 0
+        }
+        .step-num {
+            width: 28px;
+            height: 28px;
+            min-width: 28px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, var(--accent), var(--cyan));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+            color: #fff
+        }
+        .step-text {
+            font-size: 14px;
+            color: var(--text2);
+            line-height: 1.6
+        }
+        html[dir="rtl"] .step-text {
+            line-height: 1.8
+        }
+        .step-text strong {
+            color: var(--text)
+        }
 
-/* Stats Bar */
-.stats-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-radius:var(--radius);overflow:hidden;margin:-40px auto 0;position:relative;z-index:2;max-width:900px}
-.stat-item{background:var(--bg2);padding:28px 20px;text-align:center}
-.stat-num{font-size:32px;font-weight:900;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.stat-label{font-size:13px;color:var(--text3);margin-top:4px}
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            margin: -40px auto 0;
+            position: relative;
+            z-index: 2;
+            max-width: 900px
+        }
+        .stat-item {
+            background: var(--bg2);
+            padding: 28px 20px;
+            text-align: center
+        }
+        .stat-num {
+            font-size: 32px;
+            font-weight: 900;
+            background: linear-gradient(135deg, var(--accent), var(--cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text
+        }
+        .stat-label {
+            font-size: 13px;
+            color: var(--text3);
+            margin-top: 4px
+        }
 
-/* Features */
-.section{padding:100px 0}
-.section-tag{display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(99,102,241,0.1);color:var(--accent2);border:1px solid var(--border2);margin-bottom:16px}
-.section h2{font-size:clamp(28px,4vw,40px);font-weight:800;margin-bottom:16px;letter-spacing:-0.02em}
-.section p.desc{font-size:16px;color:var(--text2);max-width:600px;margin-bottom:48px}
-.features-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
-.feature-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;transition:all .3s}
-.feature-card:hover{border-color:var(--border2);transform:translateY(-4px);box-shadow:0 12px 40px rgba(0,0,0,0.2)}
-.feature-icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:16px}
-.fi-purple{background:rgba(99,102,241,0.12);color:var(--accent)}
-.fi-cyan{background:rgba(6,182,212,0.12);color:var(--cyan)}
-.fi-emerald{background:rgba(16,185,129,0.12);color:var(--emerald)}
-.fi-amber{background:rgba(245,158,11,0.12);color:var(--amber)}
-.fi-rose{background:rgba(244,63,94,0.12);color:var(--rose)}
-.fi-violet{background:rgba(139,92,246,0.12);color:#8b5cf6}
-.feature-card h3{font-size:16px;font-weight:700;margin-bottom:8px}
-.feature-card p{font-size:14px;color:var(--text3);line-height:1.6}
+        .section {
+            padding: 100px 0
+        }
+        .section-tag {
+            display: inline-block;
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--accent2);
+            border: 1px solid var(--border2);
+            margin-bottom: 16px
+        }
+        .section h2 {
+            font-size: clamp(28px, 4vw, 40px);
+            font-weight: 800;
+            margin-bottom: 16px;
+            letter-spacing: -0.02em
+        }
+        html[dir="rtl"] .section h2 {
+            letter-spacing: 0;
+            line-height: 1.4
+        }
+        .section p.desc {
+            font-size: 16px;
+            color: var(--text2);
+            max-width: 600px;
+            margin-bottom: 48px;
+            line-height: 1.7
+        }
+        html[dir="rtl"] .section p.desc {
+            line-height: 1.9
+        }
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px
+        }
+        .feature-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px;
+            transition: all .3s;
+            text-align: start
+        }
+        .feature-card:hover {
+            border-color: var(--border2);
+            transform: translateY(-4px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2)
+        }
+        .feature-icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            margin-bottom: 16px
+        }
+        .fi-purple {
+            background: rgba(99, 102, 241, 0.12);
+            color: var(--accent)
+        }
+        .fi-cyan {
+            background: rgba(6, 182, 212, 0.12);
+            color: var(--cyan)
+        }
+        .fi-emerald {
+            background: rgba(16, 185, 129, 0.12);
+            color: var(--emerald)
+        }
+        .fi-amber {
+            background: rgba(245, 158, 11, 0.12);
+            color: var(--amber)
+        }
+        .fi-rose {
+            background: rgba(244, 63, 94, 0.12);
+            color: var(--rose)
+        }
+        .fi-violet {
+            background: rgba(139, 92, 246, 0.12);
+            color: #8b5cf6
+        }
+        .feature-card h3 {
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 8px
+        }
+        .feature-card p {
+            font-size: 14px;
+            color: var(--text3);
+            line-height: 1.6
+        }
+        html[dir="rtl"] .feature-card p {
+            line-height: 1.8
+        }
 
-/* Clients Section */
-.clients-row{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
-.client-chip{padding:8px 18px;border-radius:12px;background:var(--glass);border:1px solid var(--border);font-size:13px;font-weight:600;color:var(--text2);transition:all .2s}
-.client-chip:hover{border-color:var(--accent);color:var(--accent2);transform:translateY(-1px)}
+        .clients-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center
+        }
+        .client-chip {
+            padding: 8px 18px;
+            border-radius: 12px;
+            background: var(--glass);
+            border: 1px solid var(--border);
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text2);
+            transition: all .2s
+        }
+        .client-chip:hover {
+            border-color: var(--accent);
+            color: var(--accent2);
+            transform: translateY(-1px)
+        }
 
-/* Deploy Section */
-.deploy-section{background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-.deploy-card{max-width:640px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:36px;backdrop-filter:blur(20px)}
-.form-group{margin-bottom:16px}
-.form-group label{display:block;font-size:13px;font-weight:600;color:var(--text2);margin-bottom:6px}
-.form-group input{width:100%;padding:12px 16px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .2s}
-.form-group input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,0.12)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.deploy-btn{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent),#4f46e5);color:#fff;border:none;border-radius:var(--radius-sm);font-size:15px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;margin-top:8px}
-.deploy-btn:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(99,102,241,0.3)}
-.deploy-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.deploy-status{margin-top:16px;padding:16px;border-radius:var(--radius-sm);font-size:13px;line-height:1.7;display:none}
-.deploy-status.success{display:block;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);color:var(--emerald)}
-.deploy-status.error{display:block;background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.2);color:var(--rose)}
-.deploy-status a{color:inherit;text-decoration:underline;font-weight:600}
+        .deploy-section {
+            background: var(--bg2);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border)
+        }
+        .deploy-card {
+            max-width: 640px;
+            margin: 0 auto;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 36px;
+            backdrop-filter: blur(20px);
+            text-align: start
+        }
+        .form-group {
+            margin-bottom: 16px
+        }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text2);
+            margin-bottom: 6px
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text);
+            font-size: 14px;
+            font-family: inherit;
+            outline: none;
+            transition: all .2s
+        }
+        .form-group input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12)
+        }
+        .form-help {
+            font-size: 12px;
+            color: var(--text3);
+            margin-top: 8px;
+            line-height: 1.7;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            background: rgba(245, 158, 11, 0.06);
+            border: 1px solid rgba(245, 158, 11, 0.18);
+            border-radius: 10px;
+            padding: 12px 14px
+        }
+        html[dir="rtl"] .form-help {
+            line-height: 1.9
+        }
+        .form-help .warn-icon {
+            font-size: 16px;
+            flex-shrink: 0;
+            margin-top: 1px
+        }
+        .form-help strong {
+            color: var(--amber);
+            font-weight: 600
+        }
+        .form-help code {
+            background: rgba(245, 158, 11, 0.15);
+            padding: 2px 7px;
+            border-radius: 5px;
+            font-size: 11px;
+            color: var(--amber);
+            font-weight: 600;
+            white-space: nowrap
+        }
+        .form-help a {
+            color: var(--accent2);
+            text-decoration: underline;
+            text-underline-offset: 2px;
+            font-weight: 500
+        }
+        .form-help a:hover {
+            color: var(--cyan)
+        }
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px
+        }
+        .deploy-btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, var(--accent), #4f46e5);
+            color: #fff;
+            border: none;
+            border-radius: var(--radius-sm);
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all .2s;
+            font-family: inherit;
+            margin-top: 8px
+        }
+        .deploy-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 30px rgba(99, 102, 241, 0.3)
+        }
+        .deploy-btn:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+            transform: none
+        }
+        .deploy-status {
+            margin-top: 16px;
+            padding: 16px;
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            line-height: 1.7;
+            display: none;
+            text-align: start
+        }
+        html[dir="rtl"] .deploy-status {
+            line-height: 1.9
+        }
+        .deploy-status.success {
+            display: block;
+            background: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: var(--emerald)
+        }
+        .deploy-status.error {
+            display: block;
+            background: rgba(244, 63, 94, 0.08);
+            border: 1px solid rgba(244, 63, 94, 0.2);
+            color: var(--rose)
+        }
+        .deploy-status a {
+            color: inherit;
+            text-decoration: underline;
+            font-weight: 600
+        }
 
-/* Footer */
-footer{padding:40px 0;border-top:1px solid var(--border);text-align:center}
-footer p{color:var(--text4);font-size:13px}
-footer a{color:var(--accent2);text-decoration:none}
-footer a:hover{text-decoration:underline}
+        footer {
+            padding: 40px 0;
+            border-top: 1px solid var(--border);
+            text-align: center
+        }
+        footer p {
+            color: var(--text4);
+            font-size: 13px
+        }
+        footer a {
+            color: var(--accent2);
+            text-decoration: none
+        }
+        footer a:hover {
+            text-decoration: underline
+        }
 
-/* Responsive */
-@media(max-width:900px){
-  .hero-grid{grid-template-columns:1fr;gap:40px}
-  .hero-card{order:-1}
-  .stats-bar{grid-template-columns:repeat(2,1fr)}
-}
-@media(max-width:640px){
-  .nav-links{display:none}
-  .nav-links.open{display:flex;flex-direction:column;position:absolute;top:64px;left:0;right:0;background:var(--bg2);border-bottom:1px solid var(--border);padding:12px;gap:4px}
-  .mobile-menu-btn{display:block}
-  .stats-bar{grid-template-columns:1fr 1fr}
-  .hero h1{font-size:32px}
-  .form-row{grid-template-columns:1fr}
-  .section{padding:60px 0}
-}
-</style>
+        @media(max-width:900px) {
+            .hero-grid {
+                grid-template-columns: 1fr;
+                gap: 40px
+            }
+            .hero-card {
+                order: -1
+            }
+            .stats-bar {
+                grid-template-columns: repeat(2, 1fr)
+            }
+            .nav-links {
+                gap: 2px
+            }
+            .nav-links a {
+                padding: 8px 10px;
+                font-size: 13px
+            }
+        }
+        @media(max-width:700px) {
+            .nav-links {
+                display: none
+            }
+            .nav-links.open {
+                display: flex;
+                flex-direction: column;
+                position: absolute;
+                top: 64px;
+                left: 0;
+                right: 0;
+                background: var(--bg2);
+                border-bottom: 1px solid var(--border);
+                padding: 12px;
+                gap: 4px;
+                z-index: 100
+            }
+            .nav-links.open a {
+                padding: 10px 14px;
+                width: 100%;
+                text-align: start
+            }
+            .mobile-menu-btn {
+                display: block
+            }
+            .nav-right {
+                gap: 6px
+            }
+            .lang-btn {
+                padding: 6px 10px;
+                font-size: 12px
+            }
+            .stats-bar {
+                grid-template-columns: 1fr 1fr
+            }
+            .hero h1 {
+                font-size: 28px
+            }
+            html[dir="rtl"] .hero h1 {
+                font-size: 26px
+            }
+            .form-row {
+                grid-template-columns: 1fr
+            }
+            .section {
+                padding: 60px 0
+            }
+            .deploy-card {
+                padding: 24px 18px
+            }
+        }
+        @media(max-width:400px) {
+            .nav-logo {
+                font-size: 15px;
+                gap: 6px
+            }
+            .nav-logo-icon {
+                width: 28px;
+                height: 28px;
+                font-size: 13px
+            }
+            .hero h1 {
+                font-size: 24px
+            }
+            html[dir="rtl"] .hero h1 {
+                font-size: 22px
+            }
+            .btn-lg {
+                padding: 12px 20px;
+                font-size: 14px
+            }
+            .hero-card {
+                padding: 20px 16px
+            }
+            .stat-num {
+                font-size: 24px
+            }
+        }
+    </style>
 </head>
 <body>
 
-<div class="bg-effects">
-  <div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div>
-  <div class="grid-bg"></div>
-</div>
-
-<nav>
-  <div class="nav-inner">
-    <div class="nav-logo">
-      <div class="nav-logo-icon">U</div>
-      Usf Panel
+    <div class="bg-effects">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+        <div class="grid-bg"></div>
     </div>
-    <div class="nav-links" id="navLinks">
-      <a href="#features">Features</a>
-      <a href="#clients">Clients</a>
-      <a href="#deploy">Deploy</a>
-      <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="nav-cta">GitHub</a>
-    </div>
-    <button class="mobile-menu-btn" onclick="document.getElementById('navLinks').classList.toggle('open')">&#9776;</button>
-  </div>
-</nav>
 
-<!-- Hero -->
-<section class="hero">
-  <div class="container">
-    <div class="hero-grid">
-      <div>
-        <div class="hero-badge"><span class="dot"></span> Free &amp; Open Source</div>
-        <h1>Deploy a <span class="gradient">Premium VLESS Tunnel</span> in 30 Seconds</h1>
-        <p>Turn a free HuggingFace Space into a fully-functional VLESS proxy with beautiful admin dashboard, traffic management, and multi-client support. No server needed.</p>
-        <div class="hero-buttons">
-          <a href="#deploy" class="btn-lg btn-primary-lg">Deploy Now</a>
-          <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="btn-lg btn-outline-lg">View Source</a>
+    <nav>
+        <div class="nav-inner">
+            <div class="nav-logo">
+                <div class="nav-logo-icon">U</div>
+                <span data-i18n="nav.brand">Usf Panel</span>
+            </div>
+            <div class="nav-right">
+                <div class="nav-links" id="navLinks">
+                    <a href="#features" data-i18n="nav.features">Features</a>
+                    <a href="#clients" data-i18n="nav.clients">Clients</a>
+                    <a href="#deploy" data-i18n="nav.deploy">Deploy</a>
+                    <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="nav-cta" data-i18n="nav.github">GitHub</a>
+                </div>
+                <button class="lang-btn" id="langToggle" aria-label="Switch language">🇮🇷 فارسی</button>
+                <button class="mobile-menu-btn" onclick="document.getElementById('navLinks').classList.toggle('open')" aria-label="Menu">&#9776;</button>
+            </div>
         </div>
-      </div>
-      <div class="hero-card">
-        <h3>&#9889; Quick Start</h3>
-        <div class="step"><div class="step-num">1</div><div class="step-text"><strong>Get a free HF token</strong> at huggingface.co/settings/tokens (write access)</div></div>
-        <div class="step"><div class="step-num">2</div><div class="step-text"><strong>Paste the token</strong> in the deploy form below, pick a name</div></div>
-        <div class="step"><div class="step-num">3</div><div class="step-text"><strong>Click Deploy</strong> — your panel is live in ~2 minutes</div></div>
-        <div class="step"><div class="step-num">4</div><div class="step-text"><strong>Login &amp; create links</strong> — share with any VLESS client</div></div>
-      </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="container">
+            <div class="hero-grid">
+                <div>
+                    <div class="hero-badge"><span class="dot"></span> <span data-i18n="hero.badge">Free &amp; Open Source</span></div>
+                    <h1 data-i18n-html="hero.title">Deploy a <span class="gradient">Premium VLESS Tunnel</span> in 30 Seconds</h1>
+                    <p data-i18n="hero.desc">Turn a free HuggingFace Space into a fully-functional VLESS proxy with beautiful admin dashboard, traffic management, and multi-client support. No server needed.</p>
+                    <div class="hero-buttons">
+                        <a href="#deploy" class="btn-lg btn-primary-lg" data-i18n="hero.deployBtn">Deploy Now</a>
+                        <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="btn-lg btn-outline-lg" data-i18n="hero.sourceBtn">View Source</a>
+                    </div>
+                </div>
+                <div class="hero-card">
+                    <h3 data-i18n="hero.quickStart">&#9889; Quick Start</h3>
+                    <div class="step"><div class="step-num">1</div><div class="step-text" data-i18n-html="hero.step1"><strong>Get a free HF token</strong> at huggingface.co/settings/tokens <strong>(type: Write)</strong></div></div>
+                    <div class="step"><div class="step-num">2</div><div class="step-text" data-i18n-html="hero.step2"><strong>Paste the token</strong> in the deploy form below, pick a name</div></div>
+                    <div class="step"><div class="step-num">3</div><div class="step-text" data-i18n-html="hero.step3"><strong>Click Deploy</strong> — your panel is live in ~2 minutes</div></div>
+                    <div class="step"><div class="step-num">4</div><div class="step-text" data-i18n-html="hero.step4"><strong>Login &amp; create links</strong> — share with any VLESS client</div></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats -->
+    <div class="container">
+        <div class="stats-bar">
+            <div class="stat-item"><div class="stat-num">10+</div><div class="stat-label" data-i18n="stats.clients">Clients Supported</div></div>
+            <div class="stat-item"><div class="stat-num">100%</div><div class="stat-label" data-i18n="stats.free">Free Forever</div></div>
+            <div class="stat-item"><div class="stat-num">2-4x</div><div class="stat-label" data-i18n="stats.speed">Speed Optimized</div></div>
+            <div class="stat-item"><div class="stat-num">30s</div><div class="stat-label" data-i18n="stats.deploy">Deploy Time</div></div>
+        </div>
     </div>
-  </div>
-</section>
 
-<!-- Stats -->
-<div class="container">
-  <div class="stats-bar">
-    <div class="stat-item"><div class="stat-num">10+</div><div class="stat-label">Clients Supported</div></div>
-    <div class="stat-item"><div class="stat-num">100%</div><div class="stat-label">Free Forever</div></div>
-    <div class="stat-item"><div class="stat-num">2-4x</div><div class="stat-label">Speed Optimized</div></div>
-    <div class="stat-item"><div class="stat-num">30s</div><div class="stat-label">Deploy Time</div></div>
-  </div>
-</div>
+    <!-- Features -->
+    <section class="section" id="features">
+        <div class="container">
+            <div class="section-tag" data-i18n="features.tag">Features</div>
+            <h2 data-i18n-html="features.title">Everything you need,<br>nothing you don't</h2>
+            <p class="desc" data-i18n="features.desc">A complete VLESS tunnel management panel with premium features, built as a single Python file.</p>
+            <div class="features-grid">
+                <div class="feature-card"><div class="feature-icon fi-purple">&#128274;</div><h3 data-i18n="features.f1title">Secure by Default</h3><p data-i18n="features.f1desc">TLS encryption via HuggingFace's edge, anti-fingerprint headers, rate limiting, and secure session cookies.</p></div>
+                <div class="feature-card"><div class="feature-icon fi-cyan">&#128202;</div><h3 data-i18n="features.f2title">Live Dashboard</h3><p data-i18n="features.f2desc">Real-time CPU, RAM, disk, network stats. Traffic charts, connection history, and hourly usage graphs.</p></div>
+                <div class="feature-card"><div class="feature-icon fi-emerald">&#128279;</div><h3 data-i18n="features.f3title">Multi-Client Links</h3><p data-i18n="features.f3desc">One-click copy links for V2RayN, V2RayNG, Streisand, Shadowrocket, Foxray, Nekoray, BS Client, Npv, Hiddify, Mahsang.</p></div>
+                <div class="feature-card"><div class="feature-icon fi-amber">&#128200;</div><h3 data-i18n="features.f4title">Traffic Management</h3><p data-i18n="features.f4desc">Per-link data quotas (GB/MB), expiry dates, max concurrent connections, and speed limits.</p></div>
+                <div class="feature-card"><div class="feature-icon fi-rose">&#127760;</div><h3 data-i18n="features.f5title">Clean IP Support</h3><p data-i18n="features.f5desc">Add custom IPs/domains that get automatically bundled in subscription links for anti-ban protection.</p></div>
+                <div class="feature-card"><div class="feature-icon fi-violet">&#9881;</div><h3 data-i18n="features.f6title">Panel Builder</h3><p data-i18n="features.f6desc">Let others create their own Usf Panel with just a few clicks — deploy directly to their HuggingFace account.</p></div>
+            </div>
+        </div>
+    </section>
 
-<!-- Features -->
-<section class="section" id="features">
-  <div class="container">
-    <div class="section-tag">Features</div>
-    <h2>Everything you need,<br>nothing you don't</h2>
-    <p class="desc">A complete VLESS tunnel management panel with premium features, built as a single Python file.</p>
-    <div class="features-grid">
-      <div class="feature-card"><div class="feature-icon fi-purple">&#128274;</div><h3>Secure by Default</h3><p>TLS encryption via HuggingFace's edge, anti-fingerprint headers, rate limiting, and secure session cookies.</p></div>
-      <div class="feature-card"><div class="feature-icon fi-cyan">&#128202;</div><h3>Live Dashboard</h3><p>Real-time CPU, RAM, disk, network stats. Traffic charts, connection history, and hourly usage graphs.</p></div>
-      <div class="feature-card"><div class="feature-icon fi-emerald">&#128279;</div><h3>Multi-Client Links</h3><p>One-click copy links for V2RayN, V2RayNG, Streisand, Shadowrocket, Foxray, Nekoray, BS Client, Npv, Hiddify, Mahsang.</p></div>
-      <div class="feature-card"><div class="feature-icon fi-amber">&#128200;</div><h3>Traffic Management</h3><p>Per-link data quotas (GB/MB), expiry dates, max concurrent connections, and speed limits.</p></div>
-      <div class="feature-card"><div class="feature-icon fi-rose">&#127760;</div><h3>Clean IP Support</h3><p>Add custom IPs/domains that get automatically bundled in subscription links for anti-ban protection.</p></div>
-      <div class="feature-card"><div class="feature-icon fi-violet">&#9881;</div><h3>Panel Builder</h3><p>Let others create their own Usf Panel with just a few clicks — deploy directly to their HuggingFace account.</p></div>
-    </div>
-  </div>
-</section>
+    <!-- Clients -->
+    <section class="section" id="clients" style="padding-top:0">
+        <div class="container" style="text-align:center">
+            <div class="section-tag" data-i18n="clients.tag">Compatibility</div>
+            <h2 data-i18n="clients.title">Works with all major clients</h2>
+            <p class="desc" style="margin-left:auto;margin-right:auto" data-i18n="clients.desc">Generate optimized VLESS configs for any client with one click.</p>
+            <div class="clients-row">
+                <div class="client-chip">V2RayN</div>
+                <div class="client-chip">V2RayNG</div>
+                <div class="client-chip">Streisand</div>
+                <div class="client-chip">Shadowrocket</div>
+                <div class="client-chip">Foxray</div>
+                <div class="client-chip">Nekoray</div>
+                <div class="client-chip">BS Client</div>
+                <div class="client-chip">Npv Tunnel</div>
+                <div class="client-chip">Hiddify</div>
+                <div class="client-chip">Mahsang</div>
+            </div>
+        </div>
+    </section>
 
-<!-- Clients -->
-<section class="section" id="clients" style="padding-top:0">
-  <div class="container" style="text-align:center">
-    <div class="section-tag">Compatibility</div>
-    <h2>Works with all major clients</h2>
-    <p class="desc" style="margin-left:auto;margin-right:auto">Generate optimized VLESS configs for any client with one click.</p>
-    <div class="clients-row">
-      <div class="client-chip">V2RayN</div>
-      <div class="client-chip">V2RayNG</div>
-      <div class="client-chip">Streisand</div>
-      <div class="client-chip">Shadowrocket</div>
-      <div class="client-chip">Foxray</div>
-      <div class="client-chip">Nekoray</div>
-      <div class="client-chip">BS Client</div>
-      <div class="client-chip">Npv Tunnel</div>
-      <div class="client-chip">Hiddify</div>
-      <div class="client-chip">Mahsang</div>
-    </div>
-  </div>
-</section>
+    <!-- Deploy -->
+    <section class="section deploy-section" id="deploy">
+        <div class="container">
+            <div style="text-align:center;margin-bottom:40px">
+                <div class="section-tag" data-i18n="deploy.tag">Deploy</div>
+                <h2 data-i18n="deploy.title">One-Click Deployment</h2>
+                <p class="desc" style="margin-left:auto;margin-right:auto" data-i18n="deploy.desc">No Docker, no command line, no technical knowledge needed.</p>
+            </div>
+            <div class="deploy-card">
+                <div class="form-group">
+                    <label><span data-i18n="deploy.tokenLabel">HuggingFace Token</span> <span style="color:var(--rose)">*</span></label>
+                    <input type="password" id="hfToken" placeholder="hf_xxxxxxxxxxxxxxxxxxxxx">
+                    <div class="form-help">
+                        <span class="warn-icon">&#9888;</span>
+                        <span data-i18n-html="deploy.tokenHelp">Token <strong>type</strong> must be set to <code>Write</code> (Read &amp; Write access). Create one at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a> — select <strong>"Write"</strong> as the token type, not just "Read".</span>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group"><label><span data-i18n="deploy.spaceLabel">Space Name</span> <span style="color:var(--rose)">*</span></label><input type="text" id="spaceName" placeholder="my-panel"></div>
+                    <div class="form-group"><label data-i18n="deploy.adminUserLabel">Admin Username</label><input type="text" id="adminUser" value="admin"></div>
+                </div>
+                <div class="form-group"><label data-i18n="deploy.adminPassLabel">Admin Password</label><input type="password" id="adminPass" value="admin" placeholder="min 4 characters"></div>
+                <button class="deploy-btn" id="deployBtn" onclick="deploy()" data-i18n="deploy.btn">Deploy My Panel</button>
+                <div class="deploy-status" id="deployStatus"></div>
+            </div>
+        </div>
+    </section>
 
-<!-- Deploy -->
-<section class="section deploy-section" id="deploy">
-  <div class="container">
-    <div style="text-align:center;margin-bottom:40px">
-      <div class="section-tag">Deploy</div>
-      <h2>One-Click Deployment</h2>
-      <p class="desc" style="margin-left:auto;margin-right:auto">No Docker, no command line, no technical knowledge needed.</p>
-    </div>
-    <div class="deploy-card">
-      <div class="form-group"><label>HuggingFace Token <span style="color:var(--rose)">*</span></label><input type="password" id="hfToken" placeholder="hf_xxxxxxxxxxxxxxxxxxxxx"></div>
-      <div class="form-row">
-        <div class="form-group"><label>Space Name <span style="color:var(--rose)">*</span></label><input type="text" id="spaceName" placeholder="my-panel"></div>
-        <div class="form-group"><label>Admin Username</label><input type="text" id="adminUser" value="admin"></div>
-      </div>
-      <div class="form-group"><label>Admin Password</label><input type="password" id="adminPass" value="admin" placeholder="min 4 characters"></div>
-      <button class="deploy-btn" id="deployBtn" onclick="deploy()">Deploy My Panel</button>
-      <div class="deploy-status" id="deployStatus"></div>
-    </div>
-  </div>
-</section>
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <p data-i18n="footer.line1">Usf Panel — Open Source VLESS Tunnel Manager</p>
+            <p style="margin-top:6px"><a href="https://github.com/godde3s/Usf-panel" target="_blank">GitHub</a> &middot; <a href="https://t.me/Zendanban_bot" target="_blank">Telegram</a></p>
+        </div>
+    </footer>
 
-<!-- Footer -->
-<footer>
-  <div class="container">
-    <p>Usf Panel &mdash; Open Source VLESS Tunnel Manager</p>
-    <p style="margin-top:6px"><a href="https://github.com/godde3s/Usf-panel" target="_blank">GitHub</a> &middot; <a href="https://t.me/Usf" target="_blank">Telegram</a></p>
-  </div>
-</footer>
+    <script>
+        (function() {
+            // Complete translations for English and Persian
+            const translations = {
+                en: {
+                    'nav.brand': 'Usf Panel',
+                    'nav.features': 'Features',
+                    'nav.clients': 'Clients',
+                    'nav.deploy': 'Deploy',
+                    'nav.github': 'GitHub',
+                    'hero.badge': 'Free & Open Source',
+                    'hero.title': 'Deploy a <span class="gradient">Premium VLESS Tunnel</span> in 30 Seconds',
+                    'hero.desc': 'Turn a free HuggingFace Space into a fully-functional VLESS proxy with beautiful admin dashboard, traffic management, and multi-client support. No server needed.',
+                    'hero.deployBtn': 'Deploy Now',
+                    'hero.sourceBtn': 'View Source',
+                    'hero.quickStart': '⚡ Quick Start',
+                    'hero.step1': '<strong>Get a free HF token</strong> at huggingface.co/settings/tokens <strong>(type: Write)</strong>',
+                    'hero.step2': '<strong>Paste the token</strong> in the deploy form below, pick a name',
+                    'hero.step3': '<strong>Click Deploy</strong> — your panel is live in ~2 minutes',
+                    'hero.step4': '<strong>Login & create links</strong> — share with any VLESS client',
+                    'stats.clients': 'Clients Supported',
+                    'stats.free': 'Free Forever',
+                    'stats.speed': 'Speed Optimized',
+                    'stats.deploy': 'Deploy Time',
+                    'features.tag': 'Features',
+                    'features.title': 'Everything you need,<br>nothing you don\'t',
+                    'features.desc': 'A complete VLESS tunnel management panel with premium features, built as a single Python file.',
+                    'features.f1title': 'Secure by Default',
+                    'features.f1desc': 'TLS encryption via HuggingFace\'s edge, anti-fingerprint headers, rate limiting, and secure session cookies.',
+                    'features.f2title': 'Live Dashboard',
+                    'features.f2desc': 'Real-time CPU, RAM, disk, network stats. Traffic charts, connection history, and hourly usage graphs.',
+                    'features.f3title': 'Multi-Client Links',
+                    'features.f3desc': 'One-click copy links for V2RayN, V2RayNG, Streisand, Shadowrocket, Foxray, Nekoray, BS Client, Npv, Hiddify, Mahsang.',
+                    'features.f4title': 'Traffic Management',
+                    'features.f4desc': 'Per-link data quotas (GB/MB), expiry dates, max concurrent connections, and speed limits.',
+                    'features.f5title': 'Clean IP Support',
+                    'features.f5desc': 'Add custom IPs/domains that get automatically bundled in subscription links for anti-ban protection.',
+                    'features.f6title': 'Panel Builder',
+                    'features.f6desc': 'Let others create their own Usf Panel with just a few clicks — deploy directly to their HuggingFace account.',
+                    'clients.tag': 'Compatibility',
+                    'clients.title': 'Works with all major clients',
+                    'clients.desc': 'Generate optimized VLESS configs for any client with one click.',
+                    'deploy.tag': 'Deploy',
+                    'deploy.title': 'One-Click Deployment',
+                    'deploy.desc': 'No Docker, no command line, no technical knowledge needed.',
+                    'deploy.tokenLabel': 'HuggingFace Token',
+                    'deploy.tokenHelp': 'Token <strong>type</strong> must be set to <code>Write</code> (Read & Write access). Create one at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a> — select <strong>"Write"</strong> as the token type, not just "Read".',
+                    'deploy.spaceLabel': 'Space Name',
+                    'deploy.adminUserLabel': 'Admin Username',
+                    'deploy.adminPassLabel': 'Admin Password',
+                    'deploy.btn': 'Deploy My Panel',
+                    'footer.line1': 'Usf Panel — Open Source VLESS Tunnel Manager',
+                    'status.tokenRequired': 'Token and Space name are required.',
+                    'status.invalidSpace': 'Invalid space name. Use lowercase letters, numbers, hyphens.',
+                    'status.invalidToken': 'Invalid token or no write access. Make sure your token type is set to "Write" (Read & Write).',
+                    'status.deploying': 'Deploying...',
+                    'status.success': '<strong>Panel deployed successfully!</strong><br><br>Space: <a href="https://huggingface.co/spaces/{repoId}" target="_blank">huggingface.co/spaces/{repoId}</a><br>App URL: <a href="https://{space}.hf.space" target="_blank">{space}.hf.space</a><br><br><strong>Username:</strong> {user}<br><strong>Password:</strong> {pass}<br>Wait ~2 minutes for the build, then visit your panel URL.',
+                    'status.errorPrefix': 'Error: ',
+                    'langToggle': '🇮🇷 فارسی'
+                },
+                fa: {
+                    'nav.brand': 'پنل Usf',
+                    'nav.features': 'امکانات',
+                    'nav.clients': 'کلاینت‌ها',
+                    'nav.deploy': 'نصب',
+                    'nav.github': 'گیت‌هاب',
+                    'hero.badge': 'رایگان و متن‌باز',
+                    'hero.title': 'یک <span class="gradient">تونل VLESS حرفه‌ای</span> را در ۳۰ ثانیه راه‌اندازی کنید',
+                    'hero.desc': 'یک فضای رایگان HuggingFace را به یک پروکسی VLESS کامل با داشبورد مدیریت زیبا، مدیریت ترافیک و پشتیبانی از چندین کلاینت تبدیل کنید. بدون نیاز به سرور.',
+                    'hero.deployBtn': 'همین حالا نصب کن',
+                    'hero.sourceBtn': 'مشاهده کد منبع',
+                    'hero.quickStart': '⚡ شروع سریع',
+                    'hero.step1': '<strong>یک توکن رایگان HF</strong> از huggingface.co/settings/tokens دریافت کنید <strong>(نوع: Write)</strong>',
+                    'hero.step2': '<strong>توکن را وارد کنید</strong> در فرم زیر، یک نام انتخاب کنید',
+                    'hero.step3': '<strong>دکمه نصب را بزنید</strong> — پنل شما حدود ۲ دقیقه دیگر آماده است',
+                    'hero.step4': '<strong>وارد شوید و لینک بسازید</strong> — با هر کلاینت VLESS به اشتراک بگذارید',
+                    'stats.clients': 'کلاینت پشتیبانی شده',
+                    'stats.free': 'رایگان برای همیشه',
+                    'stats.speed': 'بهینه‌سازی سرعت',
+                    'stats.deploy': 'زمان نصب',
+                    'features.tag': 'امکانات',
+                    'features.title': 'هر آنچه نیاز دارید،<br>هیچ چیز اضافه',
+                    'features.desc': 'یک پنل مدیریت کامل تونل VLESS با امکانات حرفه‌ای، ساخته شده در یک فایل پایتون.',
+                    'features.f1title': 'امنیت پیش‌فرض',
+                    'features.f1desc': 'رمزنگاری TLS از طریق لبه HuggingFace، هدرهای ضد اثرانگشت، محدودیت نرخ و کوکی‌های امن نشست.',
+                    'features.f2title': 'داشبورد زنده',
+                    'features.f2desc': 'آمار لحظه‌ای CPU، RAM، دیسک و شبکه. نمودارهای ترافیک، تاریخچه اتصال و نمودار مصرف ساعتی.',
+                    'features.f3title': 'لینک‌های چندکلاینته',
+                    'features.f3desc': 'کپی با یک کلیک برای V2RayN، V2RayNG، Streisand، Shadowrocket، Foxray، Nekoray، BS Client، Npv، Hiddify، Mahsang.',
+                    'features.f4title': 'مدیریت ترافیک',
+                    'features.f4desc': 'سهمیه داده برای هر لینک (گیگابایت/مگابایت)، تاریخ انقضا، حداکثر اتصالات همزمان و محدودیت سرعت.',
+                    'features.f5title': 'پشتیبانی از IP تمیز',
+                    'features.f5desc': 'IP/دامنه‌های سفارشی اضافه کنید که به طور خودکار در لینک‌های اشتراک برای محافظت از فیلترینگ قرار می‌گیرند.',
+                    'features.f6title': 'پنل‌ساز',
+                    'features.f6desc': 'به دیگران اجازه دهید پنل Usf خود را تنها با چند کلیک بسازند — مستقیماً روی حساب HuggingFace خود نصب کنند.',
+                    'clients.tag': 'سازگاری',
+                    'clients.title': 'با تمام کلاینت‌های اصلی کار می‌کند',
+                    'clients.desc': 'تنظیمات VLESS بهینه برای هر کلاینتی با یک کلیک تولید کنید.',
+                    'deploy.tag': 'نصب',
+                    'deploy.title': 'نصب با یک کلیک',
+                    'deploy.desc': 'بدون داکر، بدون خط فرمان، بدون نیاز به دانش فنی.',
+                    'deploy.tokenLabel': 'توکن HuggingFace',
+                    'deploy.tokenHelp': 'نوع توکن <strong>باید</strong> روی <code>Write</code> تنظیم شود (دسترسی خواندن و نوشتن). یک توکن در <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a> بسازید — نوع توکن را <strong>"Write"</strong> انتخاب کنید، نه فقط "Read".',
+                    'deploy.spaceLabel': 'نام فضا',
+                    'deploy.adminUserLabel': 'نام کاربری مدیر',
+                    'deploy.adminPassLabel': 'رمز عبور مدیر',
+                    'deploy.btn': 'نصب پنل من',
+                    'footer.line1': 'پنل Usf — مدیر تونل VLESS متن‌باز',
+                    'status.tokenRequired': 'توکن و نام فضا الزامی است.',
+                    'status.invalidSpace': 'نام فضا نامعتبر است. از حروف کوچک، اعداد و خط تیره استفاده کنید.',
+                    'status.invalidToken': 'توکن نامعتبر یا بدون دسترسی نوشتن. مطمئن شوید نوع توکن روی "Write" (خواندن و نوشتن) تنظیم شده است.',
+                    'status.deploying': 'در حال نصب...',
+                    'status.success': '<strong>پنل با موفقیت نصب شد!</strong><br><br>فضا: <a href="https://huggingface.co/spaces/{repoId}" target="_blank">huggingface.co/spaces/{repoId}</a><br>آدرس برنامه: <a href="https://{space}.hf.space" target="_blank">{space}.hf.space</a><br><br><strong>نام کاربری:</strong> {user}<br><strong>رمز عبور:</strong> {pass}<br>حدود ۲ دقیقه صبر کنید تا ساخت کامل شود، سپس به آدرس پنل بروید.',
+                    'status.errorPrefix': 'خطا: ',
+                    'langToggle': '🇬🇧 English'
+                }
+            };
 
-<script>
-async function deploy(){
-  const token=document.getElementById('hfToken').value.trim();
-  const space=document.getElementById('spaceName').value.trim().toLowerCase();
-  const user=document.getElementById('adminUser').value.trim()||'admin';
-  const pass=document.getElementById('adminPass').value||'admin';
-  const status=document.getElementById('deployStatus');
-  const btn=document.getElementById('deployBtn');
-  if(!token||!space){status.className='deploy-status error';status.textContent='Token and Space name are required.';status.style.display='block';return}
-  if(!/^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$/.test(space)){status.className='deploy-status error';status.textContent='Invalid space name. Use lowercase letters, numbers, hyphens.';status.style.display='block';return}
-  btn.disabled=true;btn.textContent='Deploying...';status.style.display='none';
+            let currentLang = localStorage.getItem('usf-lang') || 'en';
 
-  try{
-    // Step 1: Get username
-    const whoami=await fetch('https://huggingface.co/api/whoami-v2',{headers:{'Authorization':'Bearer '+token}});
-    if(!whoami.ok){throw new Error('Invalid token or no write access. Please check your HF token.')}
-    const me=await whoami.json();
-    const username=me.name||me.username;
+            // Function to apply translations and direction
+            function applyTranslations(lang) {
+                const t = translations[lang];
+                // Elements with plain text
+                document.querySelectorAll('[data-i18n]').forEach(el => {
+                    const key = el.getAttribute('data-i18n');
+                    if (t[key]) el.textContent = t[key];
+                });
+                // Elements with HTML content
+                document.querySelectorAll('[data-i18n-html]').forEach(el => {
+                    const key = el.getAttribute('data-i18n-html');
+                    if (t[key]) el.innerHTML = t[key];
+                });
+                // Language toggle button text
+                const langBtn = document.getElementById('langToggle');
+                if (langBtn) langBtn.textContent = t['langToggle'];
+                // Update document direction and language
+                document.documentElement.lang = lang === 'fa' ? 'fa' : 'en';
+                document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
+                localStorage.setItem('usf-lang', lang);
+                currentLang = lang;
+            }
 
-    // Step 2: Create repo
-    const repoId=username+'/'+space;
-    const createResp=await fetch('https://huggingface.co/api/repos/create',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({name:space,type:'space',private:false})});
+            // Toggle language and re-apply
+            window.toggleLanguage = function() {
+                const newLang = currentLang === 'en' ? 'fa' : 'en';
+                applyTranslations(newLang);
+                // Close mobile menu after switching
+                document.getElementById('navLinks').classList.remove('open');
+            };
 
-    // Step 3: Upload files
-    const secretKey=crypto.getRandomValues(new Uint8Array(32)).reduce((a,b)=>a+b.toString(16).padStart(2,'0'),'');
-    const dockerfile='FROM python:3.11-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY app.py .\nEXPOSE 7860\nENV ADMIN_USERNAME='+user+'\nENV ADMIN_PASSWORD='+pass+'\nENV SECRET_KEY='+secretKey+'\nCMD ["python","-c","import uvicorn;uvicorn.run(\'app:app\',host=\'0.0.0.0\',port=7860,log_level=\'info\',access_log=False)"]\n';
-    const reqs='fastapi>=0.115.0\nuvicorn>=0.30.0\nhttpx>=0.27.0\npsutil>=5.9.0\n';
-    const readme='---\ntitle: '+space+'\nsdk: docker\napp_port: 7860\n---\n';
+            // Apply the correct language on page load
+            document.addEventListener('DOMContentLoaded', function() {
+                applyTranslations(currentLang);
+            });
 
-    // Fetch app.py from GitHub
-    const appResp=await fetch('https://raw.githubusercontent.com/godde3s/Usf-panel/main/app.py');
-    const appCode=await appResp.text();
+            // Deploy function (same logic, uses current language for messages)
+            window.deploy = async function() {
+                const token = document.getElementById('hfToken').value.trim();
+                const space = document.getElementById('spaceName').value.trim().toLowerCase();
+                const user = document.getElementById('adminUser').value.trim() || 'admin';
+                const pass = document.getElementById('adminPass').value || 'admin';
+                const status = document.getElementById('deployStatus');
+                const btn = document.getElementById('deployBtn');
+                const t = translations[currentLang];
 
-    const boundary='----FormBoundary'+Math.random().toString(36).slice(2);
-    const files=[
-      {name:'app.py',content:appCode},
-      {name:'Dockerfile',content:dockerfile},
-      {name:'requirements.txt',content:reqs},
-      {name:'README.md',content:readme}
-    ];
-    let body='';
-    files.forEach(f=>{
-      body+='--'+boundary+'\r\nContent-Disposition: form-data; name="file"; filename="'+f.name+'"\r\nContent-Type: text/plain\r\n\r\n'+f.content+'\r\n';
-    });
-    body+='--'+boundary+'--\r\n';
+                if (!token || !space) {
+                    status.className = 'deploy-status error';
+                    status.textContent = t['status.tokenRequired'];
+                    status.style.display = 'block';
+                    return;
+                }
+                if (!/^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$/.test(space)) {
+                    status.className = 'deploy-status error';
+                    status.textContent = t['status.invalidSpace'];
+                    status.style.display = 'block';
+                    return;
+                }
+                btn.disabled = true;
+                btn.textContent = t['status.deploying'];
+                status.style.display = 'none';
 
-    // Upload each file separately
-    for(const f of files){
-      const fb='----FormBoundary'+Math.random().toString(36).slice(2);
-      const fbody='--'+fb+'\r\nContent-Disposition: form-data; name="file"; filename="'+f.name+'"\r\nContent-Type: text/plain\r\n\r\n'+f.content+'\r\n--'+fb+'--\r\n';
-      await fetch('https://huggingface.co/api/repos/'+encodeURIComponent(repoId)+'/upload/main/'+f.name,{
-        method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'multipart/form-data; boundary='+fb},body:fbody
-      });
-    }
+                try {
+                    const whoami = await fetch('https://huggingface.co/api/whoami-v2', { headers: { 'Authorization': 'Bearer ' + token } });
+                    if (!whoami.ok) { throw new Error(t['status.invalidToken']); }
+                    const me = await whoami.json();
+                    const username = me.name || me.username;
+                    const repoId = username + '/' + space;
+                    await fetch('https://huggingface.co/api/repos/create', {
+                        method: 'POST',
+                        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: space, type: 'space', private: false })
+                    });
+                    const secretKey = crypto.getRandomValues(new Uint8Array(32)).reduce((a, b) => a + b.toString(16).padStart(2, '0'), '');
+                    const dockerfile = 'FROM python:3.11-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY app.py .\nEXPOSE 7860\nENV ADMIN_USERNAME=' + user + '\nENV ADMIN_PASSWORD=' + pass + '\nENV SECRET_KEY=' + secretKey + '\nCMD ["python","-c","import uvicorn;uvicorn.run(\'app:app\',host=\'0.0.0.0\',port=7860,log_level=\'info\',access_log=False)"]\n';
+                    const reqs = 'fastapi>=0.115.0\nuvicorn>=0.30.0\nhttpx>=0.27.0\npsutil>=5.9.0\n';
+                    const readme = '---\ntitle: ' + space + '\nsdk: docker\napp_port: 7860\n---\n';
+                    const appResp = await fetch('https://raw.githubusercontent.com/godde3s/Usf-panel/main/app.py');
+                    const appCode = await appResp.text();
+                    const files = [
+                        { name: 'app.py', content: appCode },
+                        { name: 'Dockerfile', content: dockerfile },
+                        { name: 'requirements.txt', content: reqs },
+                        { name: 'README.md', content: readme }
+                    ];
+                    for (const f of files) {
+                        const fb = '----FormBoundary' + Math.random().toString(36).slice(2);
+                        const fbody = '--' + fb + '\r\nContent-Disposition: form-data; name="file"; filename="' + f.name + '"\r\nContent-Type: text/plain\r\n\r\n' + f.content + '\r\n--' + fb + '--\r\n';
+                        await fetch('https://huggingface.co/api/repos/' + encodeURIComponent(repoId) + '/upload/main/' + f.name, {
+                            method: 'POST',
+                            headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'multipart/form-data; boundary=' + fb },
+                            body: fbody
+                        });
+                    }
+                    status.className = 'deploy-status success';
+                    status.innerHTML = t['status.success']
+                        .replace(/{repoId}/g, repoId)
+                        .replace(/{space}/g, space)
+                        .replace(/{user}/g, user)
+                        .replace(/{pass}/g, pass);
+                    status.style.display = 'block';
+                } catch (e) {
+                    status.className = 'deploy-status error';
+                    status.textContent = t['status.errorPrefix'] + e.message;
+                    status.style.display = 'block';
+                }
+                btn.disabled = false;
+                btn.textContent = t['deploy.btn'];
+            };
 
-    status.className='deploy-status success';
-    status.innerHTML='<strong>Panel deployed successfully!</strong><br><br>'+
-      'Space: <a href="https://huggingface.co/spaces/'+repoId+'" target="_blank">huggingface.co/spaces/'+repoId+'</a><br>'+
-      'App URL: <a href="https://'+space+'.hf.space" target="_blank">'+space+'.hf.space</a><br><br>'+
-      '<strong>Username:</strong> '+user+'<br><strong>Password:</strong> '+pass+'<br>'+
-      'Wait ~2 minutes for the build, then visit your panel URL.';
-    status.style.display='block';
-  }catch(e){
-    status.className='deploy-status error';
-    status.textContent='Error: '+e.message;
-    status.style.display='block';
-  }
-  btn.disabled=false;btn.textContent='Deploy My Panel';
-}
-
-// Close mobile menu on link click
-document.querySelectorAll('.nav-links a').forEach(a=>a.addEventListener('click',()=>document.getElementById('navLinks').classList.remove('open')));
-</script>
-</body></html>
+            // Close mobile menu on link click
+            document.querySelectorAll('.nav-links a').forEach(a => a.addEventListener('click', () => {
+                document.getElementById('navLinks').classList.remove('open');
+            }));
+        })();
+    </script>
+</body>
+</html>
