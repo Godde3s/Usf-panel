@@ -6,7 +6,8 @@ name: Sync to HuggingFace Space
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -56,7 +57,7 @@ jobs:
 
           api = HfApi(token=token)
 
-          # Create the Space if it doesn't exist
+          # Create the Space if it does not exist
           try:
               api.create_repo(
                   repo_id=repo_id,
@@ -79,10 +80,8 @@ jobs:
                       return False
               return True
 
-          # Walk the workspace and collect files
           files_to_upload = []
           for root, dirs, files in os.walk("."):
-              # Skip excluded dirs
               dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
               for f in files:
                   if f.endswith(".pyc"):
@@ -94,7 +93,7 @@ jobs:
 
           print(f"Uploading {len(files_to_upload)} files...")
           for full, rel in files_to_upload:
-              print(f"  → {rel}")
+              print(f"  -> {rel}")
               try:
                   api.upload_file(
                       path_or_fileobj=full,
@@ -106,11 +105,11 @@ jobs:
               except Exception as e:
                   print(f"    WARNING: {e}")
 
-          # Write a HF-specific README.md with proper YAML frontmatter
+          # Write HF-specific README.md with proper YAML frontmatter
           print("Writing HF-specific README.md...")
           hf_readme = """---
 title: Usf Panel
-emoji: 🔺
+emoji: \U0001F53A
 colorFrom: yellow
 colorTo: indigo
 sdk: docker
@@ -119,7 +118,7 @@ pinned: true
 license: mit
 ---
 
-# 🔺 Usf Panel
+# Usf Panel
 
 Premium VLESS Tunnel & Subscription Manager
 
@@ -127,7 +126,7 @@ Auto-synced from https://github.com/Godde3s/Usf-panel
 
 ## Login
 - Username: admin
-- Password: (set via ADMIN_PASSWORD secret — default: admin)
+- Password: (set via ADMIN_PASSWORD secret - default: admin)
 
 Change the password immediately after first login!
 
@@ -135,7 +134,6 @@ Change the password immediately after first login!
 Full docs: https://github.com/Godde3s/Usf-panel
 One-click deploy page: https://godde3s.github.io/Usf-panel
 """
-          import io
           api.upload_file(
               path_or_fileobj=hf_readme.encode(),
               path_in_repo="README.md",
@@ -143,7 +141,7 @@ One-click deploy page: https://godde3s.github.io/Usf-panel
               repo_type="space",
               token=token,
           )
-          print("  ✓ README.md (HF metadata)")
+          print("  README.md (HF metadata) uploaded")
 
           # Set secrets (idempotent)
           print("Setting secrets...")
@@ -154,16 +152,16 @@ One-click deploy page: https://godde3s.github.io/Usf-panel
           ]:
               try:
                   api.add_space_secret(repo_id=repo_id, key=key, value=value, token=token)
-                  print(f"  ✓ {key}")
+                  print(f"  OK {key}")
               except Exception as e:
-                  print(f"  ⚠ {key}: {e}")
+                  print(f"  WARN {key}: {e}")
 
           # Restart the Space to pick up changes
           try:
               api.restart_space(repo_id=repo_id, token=token)
-              print("✓ Space restart triggered")
+              print("Space restart triggered")
           except Exception as e:
-              print(f"⚠ Restart warning: {e}")
+              print(f"Restart warning: {e}")
 
-          print(f"\n✅ Sync complete! Space URL: https://{username}-{space_name}.hf.space")
+          print(f"\nSync complete! Space URL: https://{username}-{space_name}.hf.space")
           EOF
