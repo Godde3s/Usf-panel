@@ -399,11 +399,18 @@ async def ws_tunnel(ws: WebSocket, uid: str):
         if payload:
             writer.write(payload)
             await writer.drain()
-        # Bidirectional relay
+        # Bidirectional relay — clean shutdown, no abrupt cancel
         t1 = asyncio.create_task(relay_ws_tcp(ws, writer, cid, uid))
         t2 = asyncio.create_task(relay_tcp_ws(ws, reader, cid, uid))
         done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending: t.cancel()
+        # Close the other direction so the remaining task finishes naturally
+        if t1 in done:
+            try: writer.close()
+            except: pass
+        if t2 in done:
+            try: await ws.close(code=1000, reason="relay done")
+            except: pass
+        await asyncio.gather(*pending, return_exceptions=True)
     except WebSocketDisconnect:
         logger.info(f"WS disconnect: {cip}")
     except Exception as e:
