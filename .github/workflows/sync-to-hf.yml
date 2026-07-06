@@ -69,12 +69,13 @@ jobs:
           except Exception as e:
               print(f"create_repo warning: {e}")
 
-          # Upload all files (excluding .github, .git, __pycache__)
+          # Upload all files (excluding .github, .git, __pycache__, README.md, LICENSE, docs/)
           import fnmatch
-          EXCLUDE = [".git", ".github", "__pycache__", "*.pyc", "docs/screenshots/landing-*"]
-          def should_include(path):
-              for pat in EXCLUDE:
-                  if fnmatch.fnmatch(path, pat) or path.startswith(pat.rstrip("*")):
+          EXCLUDE_DIRS = [".git", ".github", "__pycache__", "docs"]
+          EXCLUDE_FILES = ["README.md", "LICENSE", "*.pyc", ".gitignore", ".gitattributes", ".nojekyll"]
+          def should_include(rel_path):
+              for pat in EXCLUDE_FILES:
+                  if fnmatch.fnmatch(rel_path, pat):
                       return False
               return True
 
@@ -82,7 +83,7 @@ jobs:
           files_to_upload = []
           for root, dirs, files in os.walk("."):
               # Skip excluded dirs
-              dirs[:] = [d for d in dirs if d not in [".git", ".github", "__pycache__"]]
+              dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
               for f in files:
                   if f.endswith(".pyc"):
                       continue
@@ -104,6 +105,45 @@ jobs:
                   )
               except Exception as e:
                   print(f"    WARNING: {e}")
+
+          # Write a HF-specific README.md with proper YAML frontmatter
+          print("Writing HF-specific README.md...")
+          hf_readme = """---
+title: Usf Panel
+emoji: 🔺
+colorFrom: yellow
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: true
+license: mit
+---
+
+# 🔺 Usf Panel
+
+Premium VLESS Tunnel & Subscription Manager
+
+Auto-synced from https://github.com/Godde3s/Usf-panel
+
+## Login
+- Username: admin
+- Password: (set via ADMIN_PASSWORD secret — default: admin)
+
+Change the password immediately after first login!
+
+## Documentation
+Full docs: https://github.com/Godde3s/Usf-panel
+One-click deploy page: https://godde3s.github.io/Usf-panel
+"""
+          import io
+          api.upload_file(
+              path_or_fileobj=hf_readme.encode(),
+              path_in_repo="README.md",
+              repo_id=repo_id,
+              repo_type="space",
+              token=token,
+          )
+          print("  ✓ README.md (HF metadata)")
 
           # Set secrets (idempotent)
           print("Setting secrets...")
