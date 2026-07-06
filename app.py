@@ -3,7 +3,6 @@ import json
 import os
 import hashlib
 import secrets
-import hmac
 import time
 import re
 import socket
@@ -47,11 +46,9 @@ app = FastAPI(title="Usf", docs_url=None, redoc_url=None)
 CONFIG = {
     "port": int(os.environ.get("PORT", 7860)),
     "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
-    # HMAC key for signing WS paths (anti-enumeration). Random per-process if unset.
-    "ws_hmac": os.environ.get("WS_HMAC_KEY", secrets.token_hex(32)),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.0.0")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.0.1")
 CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
@@ -318,16 +315,7 @@ def generate_uuid(seed: str | None = None) -> str:
 def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> str:
     domain = CUSTOM_DOMAIN if CUSTOM_DOMAIN else get_domain()
     addr = address if address else domain
-    # ─── Anti-enumeration: HMAC-signed WS path ───────────────────────────────
-    # Path becomes /ws/{uuid}/{hmac_token} where hmac_token is derived from
-    # the uuid + a server-side secret. Clients can't enumerate valid links
-    # without knowing the HMAC key.
-    path_token = hmac.new(
-        CONFIG["ws_hmac"].encode(),
-        uuid.encode(),
-        hashlib.sha256
-    ).hexdigest()[:16]
-    path = f"/ws/{uuid}/{path_token}"
+    path = f"/ws/{uuid}"
     params = {
         "encryption": "none",
         "security": "tls",
@@ -337,11 +325,6 @@ def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> 
         "sni": domain,
         "fp": "chrome",
         "alpn": "http/1.1",
-        # Speed: enable client-side mux.cool multiplexing (8 concurrent streams)
-        "mux": "1",
-        "muxConcurrency": "8",
-        "muxXudpConcurrency": "16",
-        "muxPacketEncoding": "xudp",
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
@@ -1118,27 +1101,13 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
     except: pass
 
 @app.websocket("/ws/{uuid}")
-@app.websocket("/ws/{uuid}/{path_token}")
-async def websocket_tunnel(websocket: WebSocket, uuid: str, path_token: str = ""):
+async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
-    # ─── Anti-enumeration: verify HMAC path token ─────────────────────────────
-    # If a path_token was provided, it must match the HMAC of the uuid.
-    # If no token was provided (legacy client), we still accept for backwards compat
-    # but log it. This prevents attackers from enumerating /ws/{uuid} paths.
-    expected_token = hmac.new(
-        CONFIG["ws_hmac"].encode(),
-        uuid.encode(),
-        hashlib.sha256
-    ).hexdigest()[:16]
-    if path_token and not hmac.compare_digest(path_token, expected_token):
-        await websocket.accept()
-        await websocket.close(code=1008, reason="invalid path token")
-        return
-    # Speed: enable permessage-deflate compression (10-30% bandwidth saving on text-heavy flows)
-    try:
-        await websocket.accept(headers={"Sec-WebSocket-Extensions": "permessage-deflate"})
-    except Exception:
-        await websocket.accept()
+    # Simple accept — let uvicorn auto-negotiate compression with the client.
+    # Forcing a Sec-WebSocket-Extensions header here would tell the client
+    # "I'm compressing" while we actually send uncompressed frames, which
+    # breaks VLESS clients that strictly follow the RFC.
+    await websocket.accept()
     writer = None
     conn_id = None
     client_ip = get_client_ip(websocket)

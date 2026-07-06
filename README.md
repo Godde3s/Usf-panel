@@ -6,11 +6,16 @@
 
 **Single-file FastAPI app · Deploy on HuggingFace Spaces · Free forever**
 
+[![🚀 One-Click Deploy](https://img.shields.io/badge/🚀_One_Click_Deploy-Landing_Page-gold?style=for-the-badge)](https://godde3s.github.io/Usf-panel)
 [![Deploy on HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Spaces-blue)](https://huggingface.co/spaces)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Speed: uvloop](https://img.shields.io/badge/Speed-uvloop%20%2B%20orjson-green.svg)](#-speed-optimizations)
+
+### 🚀 Try it now — no technical knowledge needed!
+
+👉 **Visit our [Landing Page](https://godde3s.github.io/Usf-panel)** — just enter your HuggingFace token and your panel is ready in 30 seconds.
 
 </div>
 
@@ -18,14 +23,40 @@
 
 ## 📖 Table of Contents
 
+- [🚀 One-Click Deploy (Landing Page)](#-one-click-deploy-landing-page)
 - [English Documentation](#-english-documentation)
 - [مستندات فارسی](#-مستندات-فارسی)
 - [Features](#-features)
 - [Speed Optimizations](#-speed-optimizations)
 - [Anti-IP-Leak & Anti-Ban](#-anti-ip-leak--anti-ban)
 - [Deployment](#-deployment)
+- [Troubleshooting](#-troubleshooting)
 - [Screenshots](#-screenshots)
 - [License](#-license)
+
+---
+
+## 🚀 One-Click Deploy (Landing Page)
+
+The easiest way to deploy Usf Panel — **no command line, no Docker, no technical knowledge**:
+
+### 👉 [godde3s.github.io/Usf-panel](https://godde3s.github.io/Usf-panel)
+
+**How it works:**
+
+1. Open the landing page in your browser
+2. Get a free HuggingFace Write token (3-minute walk-through on the page)
+3. Paste the token, pick a name and password
+4. Click "Deploy" — the page does the rest:
+   - Creates the Space on HuggingFace
+   - Uploads all files (app.py, requirements.txt, Dockerfile)
+   - Sets your admin password and secret keys
+   - Waits for the build to complete
+5. Get your panel URL + login credentials + quick-start guide
+
+Everything runs in your browser — your token never touches our servers.
+
+---
 
 ---
 
@@ -289,6 +320,85 @@ docker run -p 7860:7860 -e ADMIN_PASSWORD=your_password usf-panel
 ## 📸 Screenshots
 
  Screenshots are in the [`docs/screenshots/`](docs/screenshots/) folder.
+
+---
+
+## 🔧 Troubleshooting
+
+### "Configs won't connect" / "Client shows connection failed"
+
+This is almost always caused by one of these:
+
+#### 1. Old VLESS link with non-standard parameters (v1.0.0 issue — FIXED in v1.0.1)
+
+**Symptom:** You created links with v1.0.0 (which had HMAC-signed WS paths and `mux` URL params). After a Space restart, those links stopped working.
+
+**Fix:** Re-generate the link from the dashboard:
+1. Login to your panel
+2. Go to **Inbounds** → find your link
+3. Click the **copy** button (c) to get the new VLESS URL
+4. Re-import it into your client
+
+The new URL uses the **standard VLESS format** (`/ws/{uuid}` path, no mux params) and will survive Space restarts.
+
+#### 2. Space is paused or sleeping
+
+**Symptom:** Connection times out, panel URL doesn't load.
+
+**Fix:**
+- Visit `https://your-space-url.hf.space/health` — if it returns JSON, the Space is up.
+- If it returns 502/503, your Space is paused. Visit `https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME` and click **Restart**.
+- HuggingFace free tier allows only **1 Space running at a time**. If you have other Spaces, pause them.
+
+#### 3. Client doesn't support the VLESS URL format
+
+**Recommended clients** (in order of compatibility):
+
+| Client | Platform | Notes |
+|--------|----------|-------|
+| V2RayN 6.x+ | Windows | Best compatibility |
+| V2RayNG 1.8+ | Android | Best compatibility |
+| Streisand 1.6+ | iOS | Use "Import from URL" |
+| Shadowrocket 2.2.40+ | iOS | Use "Subscribe" |
+| Foxray | macOS | Use "Add Subscription" |
+| Nekoray | Linux/Windows | Full support |
+
+#### 4. ISP blocking WebSocket
+
+**Symptom:** Connects for 1-2 seconds, then disconnects. Works on mobile data but not WiFi.
+
+**Fix:** Try a different **Clean IP** (add one via the dashboard → Clean IP page). Default `amazonaws.com` is sometimes blocked.
+
+#### 5. Wrong port in client
+
+**Symptom:** "Connection refused" immediately.
+
+**Fix:** The VLESS URL always uses port **443** (HuggingFace's HTTPS edge). Don't change it to 7860.
+
+### "502 Bad Gateway" on the panel
+
+- The Space is still building. Wait 2-3 minutes.
+- If it persists for >5 minutes, check the **Logs** tab in your Space settings.
+
+### "Too many login attempts"
+
+- You've hit the rate limit (5 attempts per 60 seconds).
+- Wait 1 minute and try again.
+- If you forgot your password, set the `ADMIN_PASSWORD` secret again in HuggingFace Space settings (this overrides the saved hash).
+
+### Data lost after restart
+
+- HuggingFace free tier has **ephemeral disk** — files outside `/tmp` may not persist.
+- Usf Panel stores its SQLite database at `/tmp/usf.db`, which **does persist** across restarts within the 48-hour window.
+- **However**, if the Space is rebuilt (e.g., you push new files), the database is wiped.
+- **Always backup** via Settings → Backup before redeploying.
+
+### Speed is slow
+
+- See [Speed Optimization Guide](docs/SPEED_OPTIMIZATION.md).
+- Try a different clean IP.
+- Make sure your client is using `mux` (set in client settings, not in the URL).
+- Check if your ISP throttles WebSocket traffic.
 
 ---
 
