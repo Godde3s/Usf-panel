@@ -111,7 +111,7 @@ jobs:
           fm = chr(45)*3  # "---" without literal dashes in source
           hf_readme = fm + chr(10)
           hf_readme += "title: Usf Panel" + chr(10)
-          hf_readme += "emoji: " + chr(128938) + chr(10)  # triangle emoji
+          hf_readme += "emoji: " + chr(128314) + chr(10)  # triangle emoji
           hf_readme += "colorFrom: yellow" + chr(10)
           hf_readme += "colorTo: indigo" + chr(10)
           hf_readme += "sdk: docker" + chr(10)
