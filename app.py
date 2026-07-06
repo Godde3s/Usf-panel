@@ -48,7 +48,7 @@ CONFIG = {
     "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.1.0")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v2.0.0")
 CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
@@ -281,6 +281,8 @@ async def startup():
         _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
 
     logger.info(f"Usf started on port {CONFIG['port']} | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
+    # Ensure a default link exists (moved here from WS handler to avoid per-connection lock contention)
+    await ensure_default_link()
     asyncio.create_task(keep_alive())
     # Periodic auto-save (every 30s) — ensures traffic counters survive restarts
     asyncio.create_task(periodic_save())
@@ -326,7 +328,9 @@ def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> 
         "fp": "chrome",
         "alpn": "http/1.1",
     }
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    # URL-encode ALL values including slashes — strict clients like Hiddify
+    # require path=%2Fws%2Fuuid and alpn=http%2F1.1
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
 
 def uptime_seconds() -> int:
@@ -1155,11 +1159,8 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
-    await ensure_default_link()
-    # Simple accept — let uvicorn auto-negotiate compression with the client.
-    # Forcing a Sec-WebSocket-Extensions header here would tell the client
-    # "I'm compressing" while we actually send uncompressed frames, which
-    # breaks VLESS clients that strictly follow the RFC.
+    # NOTE: ensure_default_link() removed from here — was called on every
+    # WS connection, causing lock contention and latency. Now called at startup.
     await websocket.accept()
     writer = None
     conn_id = None
@@ -1180,9 +1181,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                 current = count_connections_for_link(uuid)
                 if current >= max_conn:
                     await websocket.close(code=1008, reason="connection limit reached"); return
-        first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
+        # Increased timeout from 15s to 30s — some clients (Hiddify) are slow
+        # to send the first VLESS header through HF's proxy chain.
+        first_msg = await asyncio.wait_for(websocket.receive(), timeout=30.0)
         if first_msg["type"] == "websocket.disconnect": return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode("latin-1")
         if not first_chunk: return
         command, address, port, initial_payload = await parse_vless_header(first_chunk)
         conn_id = secrets.token_urlsafe(8)
@@ -1194,7 +1197,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         connections[conn_id]["bytes"] += size
         hourly_traffic[datetime.now().strftime("%H:00")] += size
         await add_usage(uuid, size)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=15.0)
         # ─── Speed: TCP_NODELAY disables Nagle's algorithm = lower latency for small packets
         try:
             sock = writer.get_extra_info('socket')
@@ -1257,13 +1260,13 @@ async def subscription_status(uuid: str):
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,sans-serif}
 body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.box{background:rgba(20,27,45,0.65);backdrop-filter:blur(20px);border:1px solid rgba(245,197,66,0.18);
+.box{background:rgba(20,27,45,0.65);backdrop-filter:blur(20px);border:1px solid rgba(59,130,246,0.18);
 border-radius:24px;padding:48px 36px;text-align:center;max-width:420px;width:100%;
 box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
 .icon{font-size:48px;margin-bottom:14px}
-h1{color:#f5c542;font-size:20px;margin-bottom:8px;font-weight:700}
+h1{color:#3B82F6;font-size:20px;margin-bottom:8px;font-weight:700}
 p{color:#94a3b8;font-size:14px;line-height:1.7}
-a{color:#f5c542;text-decoration:none;font-size:13px;margin-top:14px;display:inline-block;border-bottom:1px dashed rgba(245,197,66,0.4)}
+a{color:#3B82F6;text-decoration:none;font-size:13px;margin-top:14px;display:inline-block;border-bottom:1px dashed rgba(59,130,246,0.4)}
 </style></head><body>
 <div class="box"><div class="icon">⚠️</div><h1>لینک نامعتبر است</h1>
 <p>این اشتراک وجود ندارد یا حذف شده است.<br>لطفاً با مدیر سرویس تماس بگیرید.</p>
@@ -1308,36 +1311,36 @@ a{color:#f5c542;text-decoration:none;font-size:13px;margin-top:14px;display:inli
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#0a0e1a" id="meta-theme">
-<title>اشتراک Usf · __LABEL__</title>
+<meta name="theme-color" content="#0A0F1A" id="meta-theme">
+<title>Usf · __LABEL__</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
-  --bg:#080b14;
-  --bg-grad-1:rgba(245,197,66,0.13);
+  --bg:#0A0F1A;
+  --bg-grad-1:rgba(59,130,246,0.13);
   --bg-grad-2:rgba(99,102,241,0.10);
   --card:rgba(20,27,45,0.55);
   --card-2:rgba(255,255,255,0.025);
   --glass:rgba(255,255,255,0.04);
-  --accent:#f5c542;
-  --accent-2:#ffd76b;
-  --accent-soft:rgba(245,197,66,0.12);
-  --accent-glow:rgba(245,197,66,0.35);
+  --accent:#3B82F6;
+  --accent-2:#60A5FA;
+  --accent-soft:rgba(59,130,246,0.12);
+  --accent-glow:rgba(59,130,246,0.35);
   --text:#f8fafc;
   --text-2:#cbd5e1;
   --text-3:#94a3b8;
   --text-4:#64748b;
-  --border:rgba(245,197,66,0.18);
+  --border:rgba(59,130,246,0.18);
   --border-soft:rgba(255,255,255,0.06);
   --success:#22c55e;
   --success-soft:rgba(34,197,94,0.12);
   --danger:#ef4444;
   --warn:#f59e0b;
-  --shadow-card:0 30px 60px -15px rgba(0,0,0,0.7),0 0 0 1px rgba(255,255,255,0.04) inset,0 0 80px rgba(245,197,66,0.05);
+  --shadow-card:0 30px 60px -15px rgba(0,0,0,0.7),0 0 0 1px rgba(255,255,255,0.04) inset,0 0 80px rgba(59,130,246,0.05);
 }
 html[data-theme="light"]{
   --bg:#f5f7fb;
-  --bg-grad-1:rgba(245,197,66,0.18);
+  --bg-grad-1:rgba(59,130,246,0.18);
   --bg-grad-2:rgba(99,102,241,0.10);
   --card:rgba(255,255,255,0.75);
   --card-2:rgba(255,255,255,0.5);
@@ -1346,9 +1349,9 @@ html[data-theme="light"]{
   --text-2:#334155;
   --text-3:#64748b;
   --text-4:#94a3b8;
-  --border:rgba(245,197,66,0.3);
+  --border:rgba(59,130,246,0.35);
   --border-soft:rgba(0,0,0,0.06);
-  --shadow-card:0 30px 60px -15px rgba(99,102,241,0.18),0 0 0 1px rgba(0,0,0,0.02) inset,0 0 80px rgba(245,197,66,0.10);
+  --shadow-card:0 30px 60px -15px rgba(99,102,241,0.18),0 0 0 1px rgba(0,0,0,0.02) inset,0 0 80px rgba(59,130,246,0.10);
 }
 html,body{height:100%}
 body{
@@ -1379,7 +1382,7 @@ body{
 @keyframes cardIn{from{opacity:0;transform:translateY(24px) scale(.96)}to{opacity:1;transform:none}}
 .card::before{
   content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,transparent,var(--accent) 30%,#ffd76b 50%,var(--accent) 70%,transparent);
+  background:linear-gradient(90deg,transparent,var(--accent) 30%,#60A5FA 50%,var(--accent) 70%,transparent);
   opacity:.7;pointer-events:none;
 }
 .card::after{
@@ -1407,10 +1410,10 @@ html[data-theme="light"] .theme-toggle .moon{display:none}
 /* Header */
 .header{text-align:center;margin-bottom:24px;position:relative;z-index:1}
 .logo-wrap{position:relative;width:80px;height:80px;margin:0 auto 12px}
-.logo-ring{position:absolute;inset:-4px;border-radius:50%;background:conic-gradient(from 0deg,var(--accent),var(--accent-2),#22c55e,var(--accent));animation:spin 8s linear infinite;filter:blur(6px);opacity:.55}
+.logo-ring{position:absolute;inset:-4px;border-radius:50%;background:conic-gradient(from 0deg,var(--accent),var(--accent-2),#8B5CF6,var(--accent));animation:spin 8s linear infinite;filter:blur(6px);opacity:.55}
 .logo{
   position:relative;width:80px;height:80px;border-radius:50%;
-  background:linear-gradient(135deg,var(--accent),#e6b422);
+  background:linear-gradient(135deg,var(--accent),#2563EB);
   display:flex;align-items:center;justify-content:center;
   color:#0a0e1a;font-size:36px;font-weight:800;
   box-shadow:0 12px 30px var(--accent-glow),inset 0 -4px 12px rgba(0,0,0,0.15);
@@ -1427,7 +1430,7 @@ html[data-theme="light"] .theme-toggle .moon{display:none}
 /* Sub URL section — the headline */
 .sub-section{
   margin:20px 0;padding:18px;
-  background:linear-gradient(135deg,var(--accent-soft),rgba(245,197,66,0.02));
+  background:linear-gradient(135deg,var(--accent-soft),rgba(59,130,246,0.02));
   border:1px solid var(--border);border-radius:18px;
   position:relative;z-index:1;
 }
@@ -1450,11 +1453,11 @@ html[data-theme="light"] .theme-toggle .moon{display:none}
   background:rgba(0,0,0,0.35);padding:12px 14px;border-radius:12px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   direction:ltr;transition:all .2s;
-  border:1px solid rgba(245,197,66,0.15);
+  border:1px solid rgba(59,130,246,0.15);
   display:flex;align-items:center;gap:8px;
 }
 html[data-theme="light"] .sub-link{background:rgba(255,255,255,0.6)}
-.sub-link:hover{background:rgba(245,197,66,0.12);border-color:rgba(245,197,66,0.4)}
+.sub-link:hover{background:rgba(59,130,246,0.12);border-color:rgba(59,130,246,0.4)}
 .sub-link:active{transform:scale(.98)}
 .sub-link .ext-icon{flex-shrink:0;opacity:.7}
 .btn{
@@ -1540,7 +1543,7 @@ html[data-theme="light"] .gauge-track{stroke:rgba(0,0,0,0.06)}
 html[data-theme="light"] .config-box{background:rgba(0,0,0,0.04)}
 .config-box::-webkit-scrollbar{width:5px}
 .config-box::-webkit-scrollbar-track{background:transparent}
-.config-box::-webkit-scrollbar-thumb{background:rgba(245,197,66,0.3);border-radius:3px}
+.config-box::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.35);border-radius:3px}
 
 /* Footer */
 .footer{
@@ -1617,14 +1620,15 @@ html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
     <div class="logo-wrap">
       <div class="logo-ring"></div>
       <div class="logo">
-        <svg width="44" height="44" viewBox="0 0 56 56">
-          <path d="M16 14 L16 36 Q16 44 24 44 L32 44 Q40 44 40 36 L40 14"
-                stroke="currentColor" stroke-width="5.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <svg width="40" height="40" viewBox="0 0 48 48" fill="none">
+          <path d="M24 4 L42 14 L42 34 L24 44 L6 34 L6 14 Z" stroke="currentColor" stroke-width="3" fill="none" stroke-linejoin="round"/>
+          <path d="M24 14 L34 20 L34 28 L24 34 L14 28 L14 20 Z" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linejoin="round" opacity="0.5"/>
+          <circle cx="24" cy="24" r="4" fill="currentColor"/>
         </svg>
       </div>
     </div>
     <div class="title">Usf</div>
-    <div class="label-chip"><span class="pin">&#128204;</span> __LABEL__</div>
+    <div class="label-chip">__LABEL__</div>
   </div>
 
   <div class="sub-section">
@@ -1661,8 +1665,8 @@ html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
       <svg class="gauge-svg" viewBox="0 0 160 160">
         <defs>
           <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stop-color="#22c55e"/>
-            <stop offset="50%" stop-color="#f5c542"/>
+            <stop offset="0%" stop-color="#3B82F6"/>
+            <stop offset="50%" stop-color="#8B5CF6"/>
             <stop offset="100%" stop-color="#ef4444"/>
           </linearGradient>
         </defs>
@@ -1721,7 +1725,7 @@ html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
   </div>
 
   <div class="footer">
-    <span class="badge">Usf v__VERSION__</span>
+    <span class="badge">v__VERSION__</span>
     <span class="status-pill">
       <span class="status-dot __STATUS_CLASS__"></span>
       __STATUS_TEXT__
@@ -1917,12 +1921,12 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <title>Usf - Welcome</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1b2a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
-#login{background:#151f31;border-radius:2rem;padding:3rem 2rem 2.5rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0A0F1A;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+#login{background:#111827;border-radius:2rem;padding:3rem 2rem 2.5rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
 @keyframes charge{0%{transform:translateY(2rem);opacity:0}100%{transform:translateY(0);opacity:1}}
 .setting-section{position:absolute;top:16px;right:16px}
-.ant-btn-circle{border-radius:50%;width:38px;height:38px;padding:0;border:none;background:#1e8a7a;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center}
-.ant-btn-circle:hover{background:#00a896}
+.ant-btn-circle{border-radius:50%;width:38px;height:38px;padding:0;border:none;background:#3B82F6;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.ant-btn-circle:hover{background:#60A5FA}
 .title{font-size:2.2rem;font-weight:700;text-align:center;margin-bottom:2rem;color:#b0bec5;letter-spacing:1px}
 .words-wrapper{display:inline-block;position:relative;text-align:center;width:100%}
 .words-wrapper b{display:inline-block;position:absolute;left:0;top:0;width:100%;opacity:0}
@@ -1934,14 +1938,14 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .headline.zoom .words-wrapper{perspective:300px}
 .fields{display:flex;flex-direction:column;gap:14px;margin-bottom:1.5rem}
 .ant-input-affix-wrapper{display:flex;align-items:center;background:#1e2d42;border:1.5px solid #1e2d42;border-radius:30px;padding:0 16px;height:52px;transition:border-color .3s}
-.ant-input-affix-wrapper:focus-within{border-color:#008771;box-shadow:0 0 0 2px rgba(0,135,113,.15)}
+.ant-input-affix-wrapper:focus-within{border-color:#3B82F6;box-shadow:0 0 0 2px rgba(59,130,246,.15)}
 .ant-input-prefix{display:flex;align-items:center;margin-right:10px;color:#4a6080}
 .ant-input{flex:1;background:transparent;border:none;outline:none;color:#fff;font-size:14px;height:100%;padding:0}
 .ant-input::placeholder{color:#4a6080}
 .ant-input-suffix{display:flex;align-items:center;color:#4a6080;cursor:pointer;padding-left:8px}
 .ant-input-suffix:hover{color:#fff}
 .wave-btn-bg{border-radius:30px;overflow:hidden;position:relative}
-.wave-btn-bg-cl{background:linear-gradient(135deg,#007a68,#008771,#005565);background-size:200% 200%;transition:.3s}
+.wave-btn-bg-cl{background:linear-gradient(135deg,#2563EB,#3B82F6,#1E3A5F);background-size:200% 200%;transition:.3s}
 .wave-btn-bg-cl:hover{background-position:right center}
 .ant-btn-primary-login{font-size:15px;font-weight:600;color:#fff;background:transparent;border:none;height:50px;width:100%;cursor:pointer;letter-spacing:.5px}
 .err-msg{color:#ef4444;text-align:center;font-size:13px;padding:8px;background:rgba(239,68,68,0.1);border-radius:8px;display:none;margin-top:8px}
@@ -2028,11 +2032,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>Usf - Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a1222;color:rgba(255,255,255,0.75);min-height:100vh}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0A0F1A;color:rgba(255,255,255,0.75);min-height:100vh}
 ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:3px}
 .ant-layout{display:flex;height:100vh}
 .ant-layout-has-sider{flex-direction:row}
-.ant-layout-sider{background:#111929;height:100%;display:flex;flex-direction:column;border-right:1px solid #1a1a1a;position:fixed;left:0;top:0;bottom:0;width:200px;z-index:100;transition:transform .3s}
+.ant-layout-sider{background:#0F172A;height:100%;display:flex;flex-direction:column;border-right:1px solid #1a1a1a;position:fixed;left:0;top:0;bottom:0;width:200px;z-index:100;transition:transform .3s}
 .ant-layout-sider-children{flex:1;display:flex;flex-direction:column;padding:8px;overflow-y:auto}
 .brand-title{padding:14px 12px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #1a1a1a;margin-bottom:6px}
 .brand-title svg{flex-shrink:0}
@@ -2040,20 +2044,20 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .brand-title .version{font-size:10px;color:#555;font-weight:400;margin-left:2px}
 .ant-menu{list-style:none;padding:0;margin:0;background:transparent}
 .ant-menu-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:#888;font-size:13px;cursor:pointer;transition:all .15s;border:none;background:none;width:100%;text-align:left;margin:1px 0}
-.ant-menu-item:hover{background:rgba(0,135,113,0.08);color:#fff}
-.ant-menu-item-selected{background:rgba(0,135,113,0.12);color:#008771;font-weight:600}
+.ant-menu-item:hover{background:rgba(59,130,246,0.08);color:#fff}
+.ant-menu-item-selected{background:rgba(59,130,246,0.12);color:#3B82F6;font-weight:600}
 .nav-badge{margin-left:auto;background:#1a1a1a;color:#555;font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
 .nav-section{font-size:10px;font-weight:700;color:#444;text-transform:uppercase;letter-spacing:0.08em;padding:12px 12px 4px}
 .ant-layout-sider-footer{padding:10px;border-top:1px solid #1a1a1a}
 .logout-btn{width:100%;padding:7px;border:1px solid #1a1a1a;border-radius:7px;background:none;color:#555;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
 .logout-btn:hover{background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.2);color:#ef4444}
-.ant-layout-sider-trigger{height:44px;background:#111929;color:rgba(255,255,255,0.45);display:flex;align-items:center;justify-content:center;cursor:pointer;border-top:1px solid #1a1a1a;font-size:12px;gap:8px;transition:all .2s}
+.ant-layout-sider-trigger{height:44px;background:#0F172A;color:rgba(255,255,255,0.45);display:flex;align-items:center;justify-content:center;cursor:pointer;border-top:1px solid #1a1a1a;font-size:12px;gap:8px;transition:all .2s}
 .ant-layout-sider-trigger:hover{color:#fff}
 #content-layout{flex:1;margin-left:200px;overflow-y:auto;padding:20px 20px 48px}
 .page{display:none;animation:pageIn .3s ease}
 .page.active{display:block}
 @keyframes pageIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.ant-card{background:#151f31;border:1px solid #1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}
+.ant-card{background:#111827;border:1px solid #1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}
 .ant-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .ant-card-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid #1a1a1a;margin-bottom:12px}
 .ant-card-head-title{font-size:14px;font-weight:600;color:rgba(255,255,255,0.85)}
@@ -2065,7 +2069,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .ant-statistic-content{font-size:16px;color:rgba(255,255,255,0.85);display:flex;align-items:center;gap:6px}
 .ant-statistic-content-prefix{color:rgba(255,255,255,0.35)}
 .ant-tag{display:inline-flex;align-items:center;padding:2px 10px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;margin:2px}
-.ant-tag-green{background:rgba(0,135,113,0.15);color:#008771;border:1px solid rgba(0,135,113,0.2)}
+.ant-tag-green{background:rgba(59,130,246,0.15);color:#3B82F6;border:1px solid rgba(59,130,246,0.2)}
 .ant-tag-orange{background:rgba(255,160,49,0.15);color:#ffa031;border:1px solid rgba(255,160,49,0.2)}
 .ant-tag-purple{background:rgba(217,136,205,0.15);color:#d988cd;border:1px solid rgba(217,136,205,0.2)}
 .ant-tag-red{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.15)}
@@ -2076,10 +2080,10 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .ant-badge-status-processing{animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.4}}
 .ant-btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all .15s}
-.ant-btn-primary{background:#008771;color:#fff}
-.ant-btn-primary:hover{background:#006b5a}
+.ant-btn-primary{background:#3B82F6;color:#fff}
+.ant-btn-primary:hover{background:#1D4ED8}
 .ant-btn-secondary{background:#1a1a1a;color:#888;border:1px solid #2a2a2a}
-.ant-btn-secondary:hover{border-color:#008771;color:#008771}
+.ant-btn-secondary:hover{border-color:#3B82F6;color:#3B82F6}
 .ant-btn-danger{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.12)}
 .ant-btn-danger:hover{background:rgba(239,68,68,0.2)}
 .ant-btn-sm{padding:4px 10px;font-size:11px}
@@ -2090,7 +2094,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .ant-table th{text-align:left;font-size:11px;font-weight:600;color:#555;padding:10px 12px;text-transform:uppercase;border-bottom:1px solid #1a1a1a;background:#111}
 .ant-table td{padding:10px 12px;border-bottom:1px solid #1a1a1a;vertical-align:middle;color:#ccc}
 .ant-table tr:last-child td{border-bottom:none}
-.ant-table tbody tr:hover td{background:rgba(0,135,113,0.04)}
+.ant-table tbody tr:hover td{background:rgba(59,130,246,0.04)}
 .toggle{width:34px;height:18px;border-radius:10px;background:#2a2a2a;position:relative;cursor:pointer;transition:all .3s;border:1px solid #333;flex-shrink:0}
 .toggle.on{background:#22c55e;border-color:#22c55e;box-shadow:0 0 12px rgba(34,197,94,0.3)}
 .toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:#888;top:2px;left:2px;transition:all .3s}
@@ -2100,30 +2104,30 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .usage-pill .bar{flex:1;height:4px;background:#2a2a2a;border-radius:2px;min-width:50px}
 .usage-pill .fill{height:100%;border-radius:2px;transition:width .3s}
 .usage-pill .limit{color:#555}
-.btn-copy{background:rgba(0,135,113,0.1);color:#008771;border:1px solid rgba(0,135,113,0.15);font-family:inherit;font-size:11px;font-weight:600;border-radius:8px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:all .15s}
-.btn-copy:hover{background:#008771;color:#fff}
+.btn-copy{background:rgba(59,130,246,0.1);color:#3B82F6;border:1px solid rgba(59,130,246,0.15);font-family:inherit;font-size:11px;font-weight:600;border-radius:8px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:all .15s}
+.btn-copy:hover{background:#3B82F6;color:#fff}
 .search-box{flex:1;min-width:160px;position:relative}
 .search-box input{width:100%;padding:8px 12px 8px 32px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;color:#fff;font-size:12px;outline:none;transition:all .2s;font-family:inherit}
-.search-box input:focus{border-color:#008771}
+.search-box input:focus{border-color:#3B82F6}
 .search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#555}
 .filter-chips{display:flex;gap:3px;padding:3px 5px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px}
 .chip{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;color:#666;cursor:pointer;border:none;background:none;transition:all .2s;font-family:inherit}
-.chip.active{background:#008771;color:#fff}
+.chip.active{background:#3B82F6;color:#fff}
 .chip:hover:not(.active){background:#2a2a2a;color:#fff}
 .inbounds-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:#151f31;color:#fff;border:1px solid #1a1a1a;border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s;z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:#111827;color:#fff;border:1px solid #1a1a1a;border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s;z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .toast.error{border-color:rgba(239,68,68,0.3);color:#ef4444}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
 .modal-overlay.show{display:flex}
-.modal{background:#151f31;border:1px solid #1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:440px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.modal{background:#111827;border:1px solid #1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:440px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
 .modal-title{font-size:15px;font-weight:700;margin-bottom:16px;color:rgba(255,255,255,0.85)}
 .modal-close{position:absolute;top:12px;right:14px;background:#1a1a1a;border:1px solid #2a2a2a;color:#666;width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .2s}
 .modal-close:hover{background:rgba(239,68,68,0.1);color:#ef4444}
 .form-group{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
 .form-label{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.04em}
 .form-input,.form-select{padding:8px 12px;border-radius:8px;border:1px solid #2a2a2a;font-family:inherit;font-size:13px;outline:none;color:#fff;background:#1a1a1a;transition:all .2s;width:100%}
-.form-input:focus,.form-select:focus{border-color:#008771;box-shadow:0 0 0 3px rgba(0,135,113,0.1)}
+.form-input:focus,.form-select:focus{border-color:#3B82F6;box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
 .form-select option{background:#1a1a1a;color:#fff}
 .form-row{display:flex;gap:8px}
 .form-row .form-group{margin-bottom:0;flex:1}
@@ -2132,8 +2136,8 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .status-key{font-size:12px;color:#888;display:flex;align-items:center;gap:8px}
 .status-val{font-size:12px;color:#ccc;font-weight:600}
 .empty-state{text-align:center;padding:40px;color:#555}
-.mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:#111929;border-bottom:1px solid #1a1a1a;z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
-.menu-toggle{width:32px;height:32px;border-radius:8px;border:1px solid #1a1a1a;background:#151f31;color:#888;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:#0F172A;border-bottom:1px solid #1a1a1a;z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
+.menu-toggle{width:32px;height:32px;border-radius:8px;border:1px solid #1a1a1a;background:#111827;color:#888;display:flex;align-items:center;justify-content:center;cursor:pointer}
 .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
 .sidebar-overlay.show{display:block}
 @media(max-width:768px){
@@ -2157,7 +2161,7 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sa
 .split-row{display:flex;align-items:stretch}
 .split-col{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 6px;background:none;border:none;color:rgba(255,255,255,0.7);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
 .split-col + .split-col{border-left:1px solid #1a2536}
-button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
+button.split-col:hover{color:#60A5FA;background:rgba(96,165,250,0.06)}
 .split-col svg{flex-shrink:0;opacity:.85}
 .tag-row{display:flex;flex-wrap:wrap;gap:6px;padding-top:2px}
 .tag-row .ant-tag{font-size:11px;text-transform:none;font-weight:600;padding:3px 11px;border-radius:6px}
@@ -2167,7 +2171,7 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
 .eye-btn:hover{color:#fff}
 .ip-val{font-family:monospace;font-size:13px;color:rgba(255,255,255,0.85);transition:filter .2s}
 .ip-val.ip-hidden{filter:blur(6px);user-select:none}
-.spd-up{color:#2bd4a0}.spd-down{color:#3b9dff}
+.spd-up{color:#60A5FA}.spd-down{color:#3b9dff}
 .data-stat{display:flex;align-items:center;gap:6px}
 .data-stat svg{color:rgba(255,255,255,0.4)}
 .log-box{background:#0b1220;border:1px solid #1a2536;border-radius:8px;padding:12px;font-family:monospace;font-size:11.5px;color:#9fb3c8;max-height:50vh;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.6}
@@ -2186,13 +2190,13 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
 <aside class="ant-layout-sider" id="sidebar">
   <div class="ant-layout-sider-children">
     <div class="brand-title">
-      <svg width="28" height="28" viewBox="0 0 56 56" fill="none">
-        <rect width="56" height="56" rx="14" fill="url(#lg)"/>
-        <path d="M16 16 L16 36 Q16 44 24 44 L32 44 Q40 44 40 36 L40 16"
-              stroke="#fff" stroke-width="5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#f5c542"/><stop offset="1" stop-color="#e6b422"/></linearGradient></defs>
+      <svg width="28" height="28" viewBox="0 0 48 48" fill="none">
+        <rect width="48" height="48" rx="12" fill="url(#lg)"/>
+        <path d="M24 6 L40 15 L40 33 L24 42 L8 33 L8 15 Z" stroke="#fff" stroke-width="2.5" fill="none" stroke-linejoin="round"/>
+        <circle cx="24" cy="24" r="3.5" fill="#fff"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="48" y2="48"><stop stop-color="#3B82F6"/><stop offset="1" stop-color="#2563EB"/></linearGradient></defs>
       </svg>
-      <span>Usf <span class="version">v1.1.0</span></span>
+      <span>Usf <span class="version">v2.0</span></span>
     </div>
     <div class="nav-section">Main</div>
     <ul class="ant-menu">
@@ -2243,7 +2247,7 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
     <div class="ant-card">
       <svg width="0" height="0" style="position:absolute"><defs>
         <linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
-          <stop offset="0" stop-color="#0e9f6e"/><stop offset="1" stop-color="#2bd4a0"/>
+          <stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#60A5FA"/>
         </linearGradient></defs></svg>
       <div class="gauge-row">
         <div class="gauge">
@@ -2538,7 +2542,7 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
           <button class="ant-btn ant-btn-primary" onclick="saveDomain()">Save</button>
         </div>
       </div>
-      <div style="padding:10px;background:rgba(0,135,113,0.06);border:1px solid rgba(0,135,113,0.15);border-radius:8px;font-size:11px;color:#888;line-height:1.6;margin-top:4px">
+      <div style="padding:10px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:11px;color:#888;line-height:1.6;margin-top:4px">
         Set a custom domain to use in VLESS configs instead of the default Render/HuggingFace domain. Point your domain via CNAME or A record to this service.
       </div>
     </div>
@@ -2891,7 +2895,7 @@ function renderInbounds(links) {
     const u = l.used_bytes, lim = l.limit_bytes;
     const uF = fmtBytes(u), lF = fmtLimit(lim);
     const pct = lim > 0 ? Math.min(100, (u/lim)*100) : 0;
-    const col = pct>90?'#ef4444':pct>70?'#fbbf24':'#008771';
+    const col = pct>90?'#ef4444':pct>70?'#fbbf24':'#3B82F6';
     const i = idx--;
     const maxC = l.max_connections || 0;
     const curC = l.current_connections || 0;
@@ -2921,7 +2925,7 @@ function renderInbounds(links) {
           <button class="ant-btn ant-btn-secondary ant-btn-sm" onclick="showEditModal('${l.uuid}')" style="padding:4px 8px;color:#fbbf24;border-color:rgba(251,191,36,0.2);background:rgba(251,191,36,0.06)" title="ویرایش">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
           </button>
-          <a class="btn-copy" href="/sub/${l.uuid}" target="_blank" style="background:rgba(245,197,66,0.08);color:#f5c542;border-color:rgba(245,197,66,0.15);text-decoration:none" title="باز کردن صفحه ساب">
+          <a class="btn-copy" href="/sub/${l.uuid}" target="_blank" style="background:rgba(59,130,246,0.08);color:#3B82F6;border-color:rgba(59,130,246,0.15);text-decoration:none" title="باز کردن صفحه ساب">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
           </a>
           <button class="btn-copy" onclick="copySubUrl('${l.uuid}')" style="background:rgba(34,197,94,0.08);color:#22c55e;border-color:rgba(34,197,94,0.15)" title="کپی لینک ساب">
@@ -3087,7 +3091,7 @@ async function loadDomain() {
     const dcb = document.getElementById('domain-clear-btn');
     if (currentDomain) {
       dv.textContent = currentDomain;
-      dv.style.color = '#008771';
+      dv.style.color = '#3B82F6';
       if (dcb) dcb.style.display = '';
     } else {
       dv.textContent = renderDomain + ' (default)';
