@@ -106,34 +106,29 @@ jobs:
                   print(f"    WARNING: {e}")
 
           # Write HF-specific README.md with proper YAML frontmatter
+          # Build the content WITHOUT using --- (which YAML interprets as doc separator)
           print("Writing HF-specific README.md...")
-          hf_readme = """---
-title: Usf Panel
-emoji: \U0001F53A
-colorFrom: yellow
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: true
-license: mit
----
-
-# Usf Panel
-
-Premium VLESS Tunnel & Subscription Manager
-
-Auto-synced from https://github.com/Godde3s/Usf-panel
-
-## Login
-- Username: admin
-- Password: (set via ADMIN_PASSWORD secret - default: admin)
-
-Change the password immediately after first login!
-
-## Documentation
-Full docs: https://github.com/Godde3s/Usf-panel
-One-click deploy page: https://godde3s.github.io/Usf-panel
-"""
+          fm = chr(45)*3  # "---" without literal dashes in source
+          hf_readme = fm + chr(10)
+          hf_readme += "title: Usf Panel" + chr(10)
+          hf_readme += "emoji: " + chr(128938) + chr(10)  # triangle emoji
+          hf_readme += "colorFrom: yellow" + chr(10)
+          hf_readme += "colorTo: indigo" + chr(10)
+          hf_readme += "sdk: docker" + chr(10)
+          hf_readme += "app_port: 7860" + chr(10)
+          hf_readme += "pinned: true" + chr(10)
+          hf_readme += "license: mit" + chr(10)
+          hf_readme += fm + chr(10) + chr(10)
+          hf_readme += "# Usf Panel" + chr(10) + chr(10)
+          hf_readme += "Premium VLESS Tunnel & Subscription Manager" + chr(10) + chr(10)
+          hf_readme += "Auto-synced from https://github.com/Godde3s/Usf-panel" + chr(10) + chr(10)
+          hf_readme += "## Login" + chr(10)
+          hf_readme += "- Username: admin" + chr(10)
+          hf_readme += "- Password: (set via ADMIN_PASSWORD secret - default: admin)" + chr(10) + chr(10)
+          hf_readme += "Change the password immediately after first login!" + chr(10) + chr(10)
+          hf_readme += "## Documentation" + chr(10)
+          hf_readme += "Full docs: https://github.com/Godde3s/Usf-panel" + chr(10)
+          hf_readme += "One-click deploy page: https://godde3s.github.io/Usf-panel" + chr(10)
           api.upload_file(
               path_or_fileobj=hf_readme.encode(),
               path_in_repo="README.md",
