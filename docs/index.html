@@ -1,955 +1,335 @@
 <!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#0a0e1a">
-<meta name="description" content="Usf Panel — VLESS Tunnel حرفه‌ای در ۳۰ ثانیه، رایگان روی HuggingFace Spaces">
-<title>🔺 Usf Panel — استقرار یک‌کلیکی</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f1a">
+<meta name="description" content="Usf Panel — Deploy a premium VLESS tunnel on HuggingFace Spaces in 30 seconds. Free forever.">
+<title>Usf Panel — One-Click VLESS Deployment</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{
-  --bg:#0a0e1a;
-  --card:rgba(20,27,45,0.55);
-  --glass:rgba(255,255,255,0.04);
-  --accent:#f5c542;
-  --accent-2:#ffd76b;
-  --accent-soft:rgba(245,197,66,0.12);
-  --accent-glow:rgba(245,197,66,0.35);
-  --text:#f8fafc;
-  --text-2:#cbd5e1;
-  --text-3:#94a3b8;
-  --text-4:#64748b;
-  --border:rgba(245,197,66,0.18);
-  --border-soft:rgba(255,255,255,0.06);
-  --success:#22c55e;
-  --success-soft:rgba(34,197,94,0.12);
-  --danger:#ef4444;
-  --danger-soft:rgba(239,68,68,0.12);
-  --warn:#f59e0b;
-  --info:#3b82f6;
-  --radius:16px;
-  --radius-lg:24px;
-}
+:root{--bg:#0b0f1a;--bg2:#111827;--card:rgba(17,24,39,0.7);--glass:rgba(255,255,255,0.04);
+--accent:#6366f1;--accent2:#818cf8;--cyan:#06b6d4;--emerald:#10b981;--amber:#f59e0b;--rose:#f43f5e;
+--text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;--text4:#64748b;
+--border:rgba(255,255,255,0.06);--border2:rgba(99,102,241,0.15);
+--radius:20px;--radius-sm:12px}
 html{scroll-behavior:smooth}
-body{
-  font-family:'Vazirmatn','Segoe UI',Tahoma,sans-serif;
-  font-size:16px;line-height:1.65;color:var(--text);background:var(--bg);
-  min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased;
-}
-/* Background orbs */
-.orbs{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
-.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:.3;animation:float 20s ease-in-out infinite}
-.orb-1{background:rgba(245,197,66,.5);width:400px;height:400px;top:-100px;right:-100px}
-.orb-2{background:rgba(99,102,241,.4);width:500px;height:500px;bottom:-150px;left:-150px;animation-delay:-7s}
-.orb-3{background:rgba(34,197,94,.3);width:300px;height:300px;top:50%;left:50%;animation-delay:-14s}
-@keyframes float{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-30px) scale(1.1)}66%{transform:translate(-20px,20px) scale(.95)}}
-.container{max-width:760px;margin:0 auto;padding:20px;position:relative;z-index:1}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;font-size:16px;line-height:1.7;color:var(--text);background:var(--bg);overflow-x:hidden}
+
+/* Background Effects */
+.bg-effects{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:.12}
+.orb-1{width:600px;height:600px;background:var(--accent);top:-200px;right:-100px;animation:drift 25s ease-in-out infinite}
+.orb-2{width:500px;height:500px;background:var(--cyan);bottom:-150px;left:-100px;animation:drift 25s ease-in-out infinite reverse}
+.orb-3{width:300px;height:300px;background:#8b5cf6;top:40%;left:40%;animation:drift 30s ease-in-out infinite 5s}
+.grid-bg{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.02) 1px,transparent 1px);background-size:60px 60px}
+@keyframes drift{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(40px,-30px) scale(1.05)}66%{transform:translate(-30px,20px) scale(.95)}}
+
+/* Layout */
+.container{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:0 24px}
+
+/* Nav */
+nav{position:fixed;top:0;left:0;right:0;z-index:50;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:rgba(11,15,26,0.8);border-bottom:1px solid var(--border);padding:0 24px}
+.nav-inner{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;height:64px}
+.nav-logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px}
+.nav-logo-icon{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:900;font-size:15px;color:#fff}
+.nav-links{display:flex;gap:8px}
+.nav-links a{color:var(--text3);text-decoration:none;font-size:14px;font-weight:500;padding:8px 14px;border-radius:10px;transition:all .2s}
+.nav-links a:hover{color:var(--text);background:var(--glass)}
+.nav-cta{background:linear-gradient(135deg,var(--accent),#4f46e5)!important;color:#fff!important;border:none!important;padding:8px 18px!important;border-radius:10px!important;font-weight:600!important}
+.nav-cta:hover{box-shadow:0 4px 20px rgba(99,102,241,0.3);transform:translateY(-1px)!important}
+.mobile-menu-btn{display:none;background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;padding:4px}
 
 /* Hero */
-.hero{text-align:center;padding:50px 10px 30px}
-.hero .logo{font-size:64px;margin-bottom:12px;display:inline-block;animation:logoPulse 3s ease-in-out infinite}
-@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 20px var(--accent-glow))}50%{filter:drop-shadow(0 0 40px var(--accent-glow))}}
-.hero h1{font-size:42px;font-weight:800;background:linear-gradient(135deg,var(--text),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:6px;letter-spacing:-1px}
-.hero .subtitle{font-size:18px;color:var(--text-2);margin-bottom:12px;font-weight:500}
-.hero .desc{font-size:14px;color:var(--text-3);max-width:500px;margin:0 auto 24px}
-.hero .badges{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
-.badge{padding:4px 12px;border-radius:999px;font-size:11px;font-weight:600;background:var(--glass);border:1px solid var(--border-soft);color:var(--text-3)}
-.badge.gold{background:var(--accent-soft);border-color:var(--border);color:var(--accent)}
-.badge.green{background:var(--success-soft);border-color:rgba(34,197,94,.2);color:var(--success)}
+.hero{min-height:100vh;display:flex;align-items:center;padding-top:80px}
+.hero-grid{display:grid;grid-template-columns:1.1fr 0.9fr;gap:60px;align-items:center}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;background:var(--glass);border:1px solid var(--border2);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent2);margin-bottom:24px}
+.hero-badge .dot{width:6px;height:6px;border-radius:50%;background:var(--emerald);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hero h1{font-size:clamp(36px,5vw,56px);font-weight:900;line-height:1.1;margin-bottom:20px;letter-spacing:-0.03em}
+.hero h1 .gradient{background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:18px;color:var(--text2);line-height:1.7;margin-bottom:32px;max-width:500px}
+.hero-buttons{display:flex;gap:12px;flex-wrap:wrap}
+.btn-lg{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;border-radius:14px;font-size:15px;font-weight:600;cursor:pointer;transition:all .25s;text-decoration:none;font-family:inherit;border:none}
+.btn-primary-lg{background:linear-gradient(135deg,var(--accent),#4f46e5);color:#fff;box-shadow:0 4px 20px rgba(99,102,241,0.25)}
+.btn-primary-lg:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(99,102,241,0.35)}
+.btn-outline-lg{background:transparent;border:1px solid var(--border2);color:var(--text2)}
+.btn-outline-lg:hover{border-color:var(--accent);color:var(--accent2);transform:translateY(-2px)}
 
-/* Progress bar */
-.progress-wrap{margin:30px 0 20px;padding:0 10px}
-.progress-track{height:6px;background:rgba(255,255,255,.05);border-radius:999px;overflow:hidden;position:relative}
-.progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent-2));border-radius:999px;transition:width .6s cubic-bezier(.4,0,.2,1);box-shadow:0 0 12px var(--accent-glow)}
-.progress-steps{display:flex;justify-content:space-between;margin-top:10px;font-size:11px;color:var(--text-4)}
-.progress-steps span{transition:color .3s}
-.progress-steps span.active{color:var(--accent);font-weight:700}
-.progress-steps span.done{color:var(--success)}
+/* Hero Card */
+.hero-card{background:var(--card);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius);padding:28px;box-shadow:0 25px 60px rgba(0,0,0,0.3)}
+.hero-card h3{font-size:16px;font-weight:700;margin-bottom:20px;display:flex;align-items:center;gap:8px}
+.step{display:flex;gap:14px;align-items:flex-start;padding:12px 0}
+.step-num{width:28px;height:28px;min-width:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff}
+.step-text{font-size:14px;color:var(--text2)}
+.step-text strong{color:var(--text)}
 
-/* Wizard card */
-.wizard{
-  background:var(--card);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);
-  border:1px solid var(--border);border-radius:var(--radius-lg);padding:32px 28px;
-  box-shadow:0 30px 60px -15px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.04) inset;
-  position:relative;overflow:hidden;min-height:380px;
-}
-.wizard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.6}
-.step{display:none;animation:stepIn .5s cubic-bezier(.16,1,.3,1)}
-.step.active{display:block}
-@keyframes stepIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.step h2{font-size:22px;font-weight:700;margin-bottom:8px;color:var(--text)}
-.step .step-desc{font-size:14px;color:var(--text-3);margin-bottom:20px;line-height:1.7}
-
-/* Form elements */
-.form-group{margin-bottom:16px}
-.form-label{font-size:13px;font-weight:600;color:var(--text-2);margin-bottom:6px;display:block}
-.form-input{
-  width:100%;padding:13px 16px;background:rgba(0,0,0,.35);border:1px solid var(--border-soft);
-  border-radius:12px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .2s;
-  direction:ltr;text-align:left;
-}
-.form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(245,197,66,.1)}
-.form-input::placeholder{color:var(--text-4)}
-.form-hint{font-size:12px;color:var(--text-4);margin-top:5px}
-
-/* Instructions box */
-.instructions{
-  background:var(--glass);border:1px solid var(--border-soft);border-radius:12px;
-  padding:16px 18px;margin-bottom:18px;
-}
-.instructions ol{padding-right:20px;margin-top:8px}
-.instructions li{font-size:13px;color:var(--text-2);margin-bottom:6px;line-height:1.7}
-.instructions a{color:var(--accent);text-decoration:none;border-bottom:1px dashed rgba(245,197,66,.4)}
-.instructions a:hover{color:var(--accent-2)}
-.instructions .ext-link{display:inline-flex;align-items:center;gap:4px}
-
-/* Buttons */
-.btn{
-  border:none;font-family:inherit;font-weight:700;border-radius:12px;cursor:pointer;
-  transition:all .2s;display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  font-size:15px;padding:13px 24px;width:100%;
-}
-.btn-primary{background:var(--accent);color:#0a0e1a}
-.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
-.btn-primary:active{transform:translateY(0)}
-.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.btn-secondary{background:var(--glass);color:var(--text-2);border:1px solid var(--border-soft)}
-.btn-secondary:hover{background:rgba(255,255,255,.06);color:var(--text)}
-.btn-danger{background:var(--danger-soft);color:var(--danger);border:1px solid rgba(239,68,68,.2)}
-.btn-row{display:flex;gap:10px;margin-top:12px}
-.btn-row .btn{width:auto;flex:1}
-
-/* Deploy log */
-.deploy-log{
-  background:rgba(0,0,0,.35);border:1px solid var(--border-soft);border-radius:12px;
-  padding:16px 18px;font-family:'Courier New',monospace;font-size:12px;line-height:2;
-  max-height:280px;overflow-y:auto;margin-bottom:16px;direction:ltr;text-align:left;
-}
-.deploy-log::-webkit-scrollbar{width:4px}
-.deploy-log::-webkit-scrollbar-thumb{background:rgba(245,197,66,.3);border-radius:2px}
-.log-line{color:var(--text-3);padding:2px 0;animation:logIn .3s ease}
-.log-line.ok{color:var(--success)}
-.log-line.err{color:var(--danger)}
-.log-line.info{color:var(--info)}
-.log-line.warn{color:var(--warn)}
-@keyframes logIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
-
-/* Spinner */
-.spinner{
-  width:40px;height:40px;border:3px solid rgba(245,197,66,.15);border-top-color:var(--accent);
-  border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-.center{text-align:center}
-
-/* Result card */
-.result-card{
-  background:linear-gradient(135deg,var(--success-soft),rgba(34,197,94,.02));
-  border:1px solid rgba(34,197,94,.2);border-radius:16px;padding:20px;margin-bottom:16px;
-}
-.result-card .check{font-size:36px;text-align:center;margin-bottom:8px}
-.result-card h3{font-size:16px;font-weight:700;color:var(--success);margin-bottom:12px;text-align:center}
-.result-url{
-  display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.35);border:1px solid var(--border-soft);
-  border-radius:10px;padding:10px 12px;margin-bottom:12px;
-}
-.result-url a{flex:1;color:var(--accent);text-decoration:none;font-family:'Courier New',monospace;font-size:12px;word-break:break-all;direction:ltr;text-align:left}
-.result-url a:hover{color:var(--accent-2)}
-.copy-btn{
-  background:var(--accent);color:#0a0e1a;border:none;padding:7px 12px;border-radius:8px;
-  font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap;font-family:inherit;
-}
-.copy-btn:hover{background:var(--accent-2)}
-.login-info{
-  display:flex;gap:12px;justify-content:center;flex-wrap:wrap;
-}
-.login-info .cred{
-  background:rgba(0,0,0,.3);padding:8px 14px;border-radius:8px;font-size:13px;
-  border:1px solid var(--border-soft);
-}
-.login-info .cred span{color:var(--text-4);margin-left:4px}
-.login-info .cred b{color:var(--text);font-family:'Courier New',monospace;direction:ltr}
-
-/* Quick start */
-.quick-start{margin-top:16px}
-.quick-start h4{font-size:14px;font-weight:700;margin-bottom:10px;color:var(--text-2)}
-.quick-start ol{padding-right:20px}
-.quick-start li{font-size:13px;color:var(--text-3);margin-bottom:8px;line-height:1.7}
-.quick-start a{color:var(--accent);text-decoration:none}
-
-/* Error box */
-.error-box{
-  background:var(--danger-soft);border:1px solid rgba(239,68,68,.25);border-radius:12px;
-  padding:14px 16px;margin-bottom:16px;font-size:13px;color:var(--danger);line-height:1.7;
-  display:none;
-}
-.error-box.show{display:block;animation:shake .4s}
-@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+/* Stats Bar */
+.stats-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-radius:var(--radius);overflow:hidden;margin:-40px auto 0;position:relative;z-index:2;max-width:900px}
+.stat-item{background:var(--bg2);padding:28px 20px;text-align:center}
+.stat-num{font-size:32px;font-weight:900;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.stat-label{font-size:13px;color:var(--text3);margin-top:4px}
 
 /* Features */
-.features{margin:50px 0 30px}
-.features h2{font-size:24px;font-weight:700;text-align:center;margin-bottom:24px;color:var(--text)}
-.features-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
-.feature{
-  background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--border-soft);border-radius:14px;padding:18px 16px;transition:all .2s;
-}
-.feature:hover{border-color:var(--border);transform:translateY(-2px)}
-.feature .icon{font-size:28px;margin-bottom:8px}
-.feature h3{font-size:14px;font-weight:700;margin-bottom:4px;color:var(--text)}
-.feature p{font-size:12px;color:var(--text-3);line-height:1.6}
+.section{padding:100px 0}
+.section-tag{display:inline-block;padding:4px 14px;border-radius:20px;font-size:12px;font-weight:600;background:rgba(99,102,241,0.1);color:var(--accent2);border:1px solid var(--border2);margin-bottom:16px}
+.section h2{font-size:clamp(28px,4vw,40px);font-weight:800;margin-bottom:16px;letter-spacing:-0.02em}
+.section p.desc{font-size:16px;color:var(--text2);max-width:600px;margin-bottom:48px}
+.features-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.feature-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:28px;transition:all .3s}
+.feature-card:hover{border-color:var(--border2);transform:translateY(-4px);box-shadow:0 12px 40px rgba(0,0,0,0.2)}
+.feature-icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:16px}
+.fi-purple{background:rgba(99,102,241,0.12);color:var(--accent)}
+.fi-cyan{background:rgba(6,182,212,0.12);color:var(--cyan)}
+.fi-emerald{background:rgba(16,185,129,0.12);color:var(--emerald)}
+.fi-amber{background:rgba(245,158,11,0.12);color:var(--amber)}
+.fi-rose{background:rgba(244,63,94,0.12);color:var(--rose)}
+.fi-violet{background:rgba(139,92,246,0.12);color:#8b5cf6}
+.feature-card h3{font-size:16px;font-weight:700;margin-bottom:8px}
+.feature-card p{font-size:14px;color:var(--text3);line-height:1.6}
 
-/* How it works */
-.how-it-works{margin:40px 0;text-align:center}
-.how-it-works h2{font-size:24px;font-weight:700;margin-bottom:24px}
-.steps-flow{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
-.flow-step{
-  background:var(--glass);border:1px solid var(--border-soft);border-radius:14px;
-  padding:14px 18px;min-width:120px;text-align:center;
-}
-.flow-step .num{width:28px;height:28px;background:var(--accent);color:#0a0e1a;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;margin:0 auto 8px}
-.flow-step .title{font-size:12px;font-weight:600;color:var(--text-2)}
-.flow-arrow{color:var(--text-4);font-size:20px}
+/* Clients Section */
+.clients-row{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+.client-chip{padding:8px 18px;border-radius:12px;background:var(--glass);border:1px solid var(--border);font-size:13px;font-weight:600;color:var(--text2);transition:all .2s}
+.client-chip:hover{border-color:var(--accent);color:var(--accent2);transform:translateY(-1px)}
 
-/* FAQ */
-.faq{margin:40px 0}
-.faq h2{font-size:24px;font-weight:700;text-align:center;margin-bottom:20px}
-.faq-item{
-  background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--border-soft);border-radius:12px;margin-bottom:8px;overflow:hidden;
-}
-.faq-item summary{
-  padding:14px 18px;font-size:14px;font-weight:600;color:var(--text-2);cursor:pointer;
-  list-style:none;display:flex;justify-content:space-between;align-items:center;
-}
-.faq-item summary::-webkit-details-marker{display:none}
-.faq-item summary::after{content:'+';font-size:20px;color:var(--accent);transition:transform .2s}
-.faq-item[open] summary::after{transform:rotate(45deg)}
-.faq-item p{padding:0 18px 14px;font-size:13px;color:var(--text-3);line-height:1.7}
-.faq-item p a{color:var(--accent);text-decoration:none}
+/* Deploy Section */
+.deploy-section{background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.deploy-card{max-width:640px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:36px;backdrop-filter:blur(20px)}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:13px;font-weight:600;color:var(--text2);margin-bottom:6px}
+.form-group input{width:100%;padding:12px 16px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .2s}
+.form-group input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,0.12)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.deploy-btn{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent),#4f46e5);color:#fff;border:none;border-radius:var(--radius-sm);font-size:15px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;margin-top:8px}
+.deploy-btn:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(99,102,241,0.3)}
+.deploy-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.deploy-status{margin-top:16px;padding:16px;border-radius:var(--radius-sm);font-size:13px;line-height:1.7;display:none}
+.deploy-status.success{display:block;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);color:var(--emerald)}
+.deploy-status.error{display:block;background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.2);color:var(--rose)}
+.deploy-status a{color:inherit;text-decoration:underline;font-weight:600}
 
 /* Footer */
-footer{text-align:center;padding:30px 10px 20px;border-top:1px solid var(--border-soft);margin-top:40px}
-footer .links{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:12px}
-footer a{color:var(--text-3);text-decoration:none;font-size:13px;transition:color .2s}
-footer a:hover{color:var(--accent)}
-footer .copyright{font-size:11px;color:var(--text-4)}
-
-/* Toast */
-.toast{
-  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);
-  background:rgba(20,27,45,.95);backdrop-filter:blur(12px);color:#fff;
-  padding:12px 22px;border-radius:999px;font-size:13px;font-weight:500;
-  border:1px solid var(--border);box-shadow:0 14px 36px rgba(0,0,0,.5);
-  opacity:0;transition:all .35s;z-index:1000;pointer-events:none;
-}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-
-/* Loading overlay */
-.loading-overlay{
-  position:fixed;inset:0;background:var(--bg);z-index:9999;display:flex;
-  align-items:center;justify-content:center;flex-direction:column;gap:16px;
-  transition:opacity .5s;
-}
-.loading-overlay.hide{opacity:0;pointer-events:none}
-.loading-overlay .spinner{width:50px;height:50px;border-width:4px}
-.loading-overlay p{color:var(--text-3);font-size:14px}
+footer{padding:40px 0;border-top:1px solid var(--border);text-align:center}
+footer p{color:var(--text4);font-size:13px}
+footer a{color:var(--accent2);text-decoration:none}
+footer a:hover{text-decoration:underline}
 
 /* Responsive */
-@media(max-width:600px){
-  .hero{padding:30px 10px 20px}
-  .hero h1{font-size:32px}
-  .hero .subtitle{font-size:16px}
-  .hero .logo{font-size:52px}
-  .wizard{padding:24px 18px}
-  .step h2{font-size:18px}
-  .features-grid{grid-template-columns:1fr}
-  .flow-arrow{transform:rotate(90deg)}
-  .container{padding:14px}
-  .btn{font-size:14px;padding:12px 18px}
+@media(max-width:900px){
+  .hero-grid{grid-template-columns:1fr;gap:40px}
+  .hero-card{order:-1}
+  .stats-bar{grid-template-columns:repeat(2,1fr)}
 }
-@media(max-width:380px){
-  .hero h1{font-size:26px}
-  .features-grid{gap:8px}
-  .feature{padding:14px 12px}
+@media(max-width:640px){
+  .nav-links{display:none}
+  .nav-links.open{display:flex;flex-direction:column;position:absolute;top:64px;left:0;right:0;background:var(--bg2);border-bottom:1px solid var(--border);padding:12px;gap:4px}
+  .mobile-menu-btn{display:block}
+  .stats-bar{grid-template-columns:1fr 1fr}
+  .hero h1{font-size:32px}
+  .form-row{grid-template-columns:1fr}
+  .section{padding:60px 0}
 }
 </style>
 </head>
 <body>
 
-<!-- Loading overlay -->
-<div class="loading-overlay" id="loadingOverlay">
-  <div class="spinner"></div>
-  <p>در حال بارگذاری Usf Panel...</p>
+<div class="bg-effects">
+  <div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div>
+  <div class="grid-bg"></div>
 </div>
 
-<!-- Background orbs -->
-<div class="orbs">
-  <div class="orb orb-1"></div>
-  <div class="orb orb-2"></div>
-  <div class="orb orb-3"></div>
-</div>
+<nav>
+  <div class="nav-inner">
+    <div class="nav-logo">
+      <div class="nav-logo-icon">U</div>
+      Usf Panel
+    </div>
+    <div class="nav-links" id="navLinks">
+      <a href="#features">Features</a>
+      <a href="#clients">Clients</a>
+      <a href="#deploy">Deploy</a>
+      <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="nav-cta">GitHub</a>
+    </div>
+    <button class="mobile-menu-btn" onclick="document.getElementById('navLinks').classList.toggle('open')">&#9776;</button>
+  </div>
+</nav>
 
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <div class="hero-grid">
+      <div>
+        <div class="hero-badge"><span class="dot"></span> Free &amp; Open Source</div>
+        <h1>Deploy a <span class="gradient">Premium VLESS Tunnel</span> in 30 Seconds</h1>
+        <p>Turn a free HuggingFace Space into a fully-functional VLESS proxy with beautiful admin dashboard, traffic management, and multi-client support. No server needed.</p>
+        <div class="hero-buttons">
+          <a href="#deploy" class="btn-lg btn-primary-lg">Deploy Now</a>
+          <a href="https://github.com/godde3s/Usf-panel" target="_blank" class="btn-lg btn-outline-lg">View Source</a>
+        </div>
+      </div>
+      <div class="hero-card">
+        <h3>&#9889; Quick Start</h3>
+        <div class="step"><div class="step-num">1</div><div class="step-text"><strong>Get a free HF token</strong> at huggingface.co/settings/tokens (write access)</div></div>
+        <div class="step"><div class="step-num">2</div><div class="step-text"><strong>Paste the token</strong> in the deploy form below, pick a name</div></div>
+        <div class="step"><div class="step-num">3</div><div class="step-text"><strong>Click Deploy</strong> — your panel is live in ~2 minutes</div></div>
+        <div class="step"><div class="step-num">4</div><div class="step-text"><strong>Login &amp; create links</strong> — share with any VLESS client</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Stats -->
 <div class="container">
-
-  <!-- Hero -->
-  <header class="hero">
-    <div class="logo">🔺</div>
-    <h1>Usf Panel</h1>
-    <p class="subtitle">VLESS Tunnel حرفه‌ای در ۳۰ ثانیه — کاملاً رایگان</p>
-    <p class="desc">بدون نیاز به سرور، بدون نیاز به دانش فنی. فقط یک توکن HuggingFace بدهید و پنل شما آماده می‌شود.</p>
-    <div class="badges">
-      <span class="badge gold">⚡ ۲-۴ برابر سرعت</span>
-      <span class="badge green">🛡️ ضد نشت IP</span>
-      <span class="badge">📱 ریسپانسیو</span>
-      <span class="badge">🎨 Glassmorphism</span>
-    </div>
-  </header>
-
-  <!-- Progress -->
-  <div class="progress-wrap">
-    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-    <div class="progress-steps">
-      <span id="ps1" class="active">۱. توکن</span>
-      <span id="ps2">۲. تنظیمات</span>
-      <span id="ps3">۳. استقرار</span>
-      <span id="ps4">۴. آماده</span>
-    </div>
+  <div class="stats-bar">
+    <div class="stat-item"><div class="stat-num">10+</div><div class="stat-label">Clients Supported</div></div>
+    <div class="stat-item"><div class="stat-num">100%</div><div class="stat-label">Free Forever</div></div>
+    <div class="stat-item"><div class="stat-num">2-4x</div><div class="stat-label">Speed Optimized</div></div>
+    <div class="stat-item"><div class="stat-num">30s</div><div class="stat-label">Deploy Time</div></div>
   </div>
-
-  <!-- Wizard -->
-  <div class="wizard">
-
-    <!-- Step 1: Token -->
-    <section class="step active" id="step1">
-      <h2>🔑 توکن HuggingFace خود را وارد کنید</h2>
-      <p class="step-desc">برای ساخت Space رایگان، به یک توکن HuggingFace با دسترسی <b>Write</b> نیاز دارید. ساخت توکن کاملاً رایگان و کمتر از ۳۰ ثانیه است.</p>
-
-      <div class="instructions">
-        <ol>
-          <li>به صفحه <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener" class="ext-link">HuggingFace Tokens <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a> بروید</li>
-          <li>روی دکمه <b>«New token»</b> کلیک کنید</li>
-          <li>نام توکن: <code>Usf Deploy</code> (یا هر نامی)</li>
-          <li>نوع توکن: <b style="color:var(--success)">Write</b> ← بسیار مهم!</li>
-          <li>روی <b>«Create token»</b> کلیک کنید و توکن را کپی کنید</li>
-        </ol>
-      </div>
-
-      <div class="error-box" id="error1"></div>
-
-      <div class="form-group">
-        <label class="form-label">توکن HuggingFace</label>
-        <input type="text" class="form-input" id="tokenInput" placeholder="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false">
-        <div class="form-hint">توکن با <code>hf_</code> شروع می‌شود و حدود ۳۷ کاراکتر است.</div>
-      </div>
-
-      <button class="btn btn-primary" id="btnValidate" onclick="validateToken()">
-        <span>تایید توکن و ادامه</span>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-      </button>
-    </section>
-
-    <!-- Step 2: Settings -->
-    <section class="step" id="step2">
-      <h2>⚙️ تنظیمات پنل</h2>
-      <p class="step-desc">نام Space و رمز عبور مدیر را مشخص کنید. این تنظیمات بعداً قابل تغییر خواهند بود.</p>
-
-      <div class="form-group">
-        <label class="form-label">نام کاربری HuggingFace شما</label>
-        <input type="text" class="form-input" id="hfUsername" readonly style="opacity:.6;cursor:not-allowed">
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">نام Space (انگلیسی، بدون فاصله)</label>
-        <input type="text" class="form-input" id="spaceName" value="usf" placeholder="usf" pattern="[a-z0-9\-]+" autocomplete="off">
-        <div class="form-hint">آدرس نهایی پنل شما: <code id="urlPreview">https://username-usf.hf.space</code></div>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">رمز عبور مدیر</label>
-        <input type="text" class="form-input" id="adminPassword" value="admin" placeholder="admin" autocomplete="off">
-        <div class="form-hint">⚠️ پیش‌فرض <code>admin</code> است. حتماً بعد از اولین ورود تغییرش دهید!</div>
-      </div>
-
-      <div class="error-box" id="error2"></div>
-
-      <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goToStep(1)">← بازگشت</button>
-        <button class="btn btn-primary" id="btnDeploy" onclick="startDeploy()">
-          🚀 استقرار پنل
-        </button>
-      </div>
-    </section>
-
-    <!-- Step 3: Deploying -->
-    <section class="step" id="step3">
-      <h2>🚀 در حال استقرار...</h2>
-      <p class="step-desc">لطفاً صبر کنید. این فرآیند حدود ۲-۳ دقیقه طول می‌کشد. صفحه را نبندید.</p>
-
-      <div class="center" style="margin-bottom:16px">
-        <div class="spinner"></div>
-      </div>
-
-      <div class="deploy-log" id="deployLog"></div>
-
-      <div class="error-box" id="error3"></div>
-    </section>
-
-    <!-- Step 4: Done -->
-    <section class="step" id="step4">
-      <div class="result-card">
-        <div class="check">✅</div>
-        <h3>پنل شما با موفقیت ساخته شد!</h3>
-
-        <div class="result-url">
-          <a href="#" id="panelUrl" target="_blank" rel="noopener">—</a>
-          <button class="copy-btn" onclick="copyUrl()">کپی</button>
-        </div>
-
-        <div class="login-info">
-          <div class="cred"><span>👤</span> <b>admin</b></div>
-          <div class="cred"><span>🔑</span> <b id="finalPassword">admin</b></div>
-        </div>
-      </div>
-
-      <div class="quick-start">
-        <h4>📚 شروع سریع:</h4>
-        <ol>
-          <li>روی لینک بالا کلیک کنید تا پنل باز شود</li>
-          <li>با <code>admin</code> و رمزی که تنظیم کردید وارد شوید</li>
-          <li><b>فوراً رمز را تغییر دهید:</b> Settings → Change Password</li>
-          <li>یک Inbound جدید بسازید: Inbounds → Add Inbound</li>
-          <li>لینک <code>/status/{uuid}</code> را به کاربران خود بدهید</li>
-          <li>کاربران لینک Sub را در کلاینت VLESS خود وارد می‌کنند</li>
-        </ol>
-      </div>
-
-      <div class="btn-row">
-        <button class="btn btn-secondary" onclick="goToStep(1)">🔄 استقرار پنل جدید</button>
-        <a class="btn btn-primary" id="openPanelBtn" href="#" target="_blank" rel="noopener">باز کردن پنل →</a>
-      </div>
-    </section>
-
-  </div>
-
-  <!-- Features -->
-  <section class="features">
-    <h2>✨ چرا Usf Panel؟</h2>
-    <div class="features-grid">
-      <div class="feature">
-        <div class="icon">⚡</div>
-        <h3>سرعت ۲-۴ برابر</h3>
-        <p>uvloop + orjson + httptools + بافر 512KB + TCP_NODELAY + فشرده‌سازی WebSocket</p>
-      </div>
-      <div class="feature">
-        <div class="icon">🛡️</div>
-        <h3>ضد نشت IP</h3>
-        <p>HMAC-signed paths، پاک‌سازی هدرها، rate limiting، uTLS Chrome fingerprint</p>
-      </div>
-      <div class="feature">
-        <div class="icon">🎨</div>
-        <h3>طراحی حرفه‌ای</h3>
-        <p>Glassmorphism، گیج SVG متحرک، شمارش معکوس زنده، تم تاریک/روشن</p>
-      </div>
-      <div class="feature">
-        <div class="icon">💾</div>
-        <h3>پایداری داده</h3>
-        <p>SQLite persistence — داده‌ها بعد از restart های HuggingFace حفظ می‌شوند</p>
-      </div>
-      <div class="feature">
-        <div class="icon">📱</div>
-        <h3>۶ کلاینت Deep-Link</h3>
-        <p>V2RayN، V2RayNG، Streisand، Shadowrocket، Foxray — یک کلیک کافی است</p>
-      </div>
-      <div class="feature">
-        <div class="icon">🆓</div>
-        <h3>کاملاً رایگان</h3>
-        <p>روی HuggingFace Spaces رایگان، بدون نیاز به سرور یا دامنه</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- How it works -->
-  <section class="how-it-works">
-    <h2>🔧 نحوه کار</h2>
-    <div class="steps-flow">
-      <div class="flow-step">
-        <div class="num">۱</div>
-        <div class="title">توکن HF<br>می‌گیرید</div>
-      </div>
-      <div class="flow-arrow">←</div>
-      <div class="flow-step">
-        <div class="num">۲</div>
-        <div class="title">ما Space<br>می‌سازیم</div>
-      </div>
-      <div class="flow-arrow">←</div>
-      <div class="flow-step">
-        <div class="num">۳</div>
-        <div class="title">فایل‌ها<br>آپلود می‌شود</div>
-      </div>
-      <div class="flow-arrow">←</div>
-      <div class="flow-step">
-        <div class="num">۴</div>
-        <div class="title">پنل شما<br>آماده است</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- FAQ -->
-  <section class="faq">
-    <h2>❓ سوالات متداول</h2>
-
-    <details class="faq-item">
-      <summary>آیا واقعاً رایگان است؟</summary>
-      <p>بله! HuggingFace Spaces یک لایه رایگان با 16GB RAM و 2 vCPU ارائه می‌دهد که برای استفاده شخصی کاملاً کافی است. هیچ کارت اعتباری نیاز نیست.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>آیا توکن من امن است؟</summary>
-      <p>بله. توکن شما فقط در مرورگر شما استفاده می‌شود و به هیچ سروری ارسال نمی‌شود. تمام ارتباطات مستقیماً بین مرورگر شما و API های HuggingFace انجام می‌شود. بعد از استقرار، توکن را از <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">صفحه تنظیمات</a> می‌توانید حذف کنید.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>اگر Space از قبل وجود داشته باشد چه؟</summary>
-      <p>اگر Space با همان نام از قبل وجود داشته باشد، فایل‌ها به‌روزرسانی می‌شوند و تنظیمات دوباره اعمال می‌گردند. داده‌های قبلی شما (لینک‌ها، ترافیک) حفظ می‌شوند.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>خطای "سهمیه تکمیل شده" چه означает؟</summary>
-      <p>HuggingFace در لایه رایگان فقط اجازه می‌دهد یک Space همزمان روشن باشد. اگر Space های دیگری دارید، از <a href="https://huggingface.co/settings" target="_blank" rel="noopener">صفحه Spaces</a> آن‌ها را pause کنید و دوباره تلاش کنید.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>پنل بعد از مدتی خاموش می‌شود؟</summary>
-      <p>HuggingFace Spaces رایگان هر ۴۸ ساعت یا در صورت بی‌فعالیتی restart می‌شود. اما Usf Panel از SQLite استفاده می‌کند، بنابراین تمام داده‌های شما (لینک‌ها، ترافیک، تنظیمات) حفظ می‌شوند. Space به‌صورت خودکار دوباره روشن می‌شود.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>چگونه سرعت را بیشتر کنم؟</summary>
-      <p>راهنمای کامل بهینه‌سازی سرعت در <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/SPEED_OPTIMIZATION.md" target="_blank" rel="noopener">GitHub</a> موجود است. نکات کلیدی: mux را در کلاینت فعال کنید، IPv6 را غیرفعال کنید، DNS را از طریق پروکسی هدایت کنید.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>چگونه از نشت IP جلوگیری کنم؟</summary>
-      <p>راهنمای کامل ضد نشت در <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/ANTI_LEAK.md" target="_blank" rel="noopener">GitHub</a> موجود است. مهم‌ترین موارد: IPv6 را در کلاینت ببندید، WebRTC را در مرورگر غیرفعال کنید، DNS را از طریق پروکسی هدایت کنید.</p>
-    </details>
-
-    <details class="faq-item">
-      <summary>کدام کلاینت‌ها پشتیبانی می‌شوند؟</summary>
-      <p>تمام کلاینت‌های VLESS: V2RayN (ویندوز)، V2RayNG (اندروید)، Streisand (iOS)، Shadowrocket (iOS)، Foxray (مک)، Nekoray (لینوکس/ویندوز). صفحه status دکمه‌های deep-link برای ۶ کلاینت محبوب دارد.</p>
-    </details>
-  </section>
-
-  <!-- Footer -->
-  <footer>
-    <div class="links">
-      <a href="https://github.com/Godde3s/Usf-panel" target="_blank" rel="noopener">📂 GitHub</a>
-      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/DEPLOY.md" target="_blank" rel="noopener">📖 مستندات</a>
-      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/SPEED_OPTIMIZATION.md" target="_blank" rel="noopener">⚡ بهینه‌سازی سرعت</a>
-      <a href="https://github.com/Godde3s/Usf-panel/blob/main/docs/ANTI_LEAK.md" target="_blank" rel="noopener">🛡️ ضد نشت</a>
-      <a href="https://huggingface.co/spaces/U1sf0014/usf" target="_blank" rel="noopener">🧪 دمو زنده</a>
-    </div>
-    <div class="copyright">© 2026 Usf Panel — MIT License</div>
-  </footer>
-
 </div>
 
-<!-- Toast -->
-<div class="toast" id="toast"></div>
+<!-- Features -->
+<section class="section" id="features">
+  <div class="container">
+    <div class="section-tag">Features</div>
+    <h2>Everything you need,<br>nothing you don't</h2>
+    <p class="desc">A complete VLESS tunnel management panel with premium features, built as a single Python file.</p>
+    <div class="features-grid">
+      <div class="feature-card"><div class="feature-icon fi-purple">&#128274;</div><h3>Secure by Default</h3><p>TLS encryption via HuggingFace's edge, anti-fingerprint headers, rate limiting, and secure session cookies.</p></div>
+      <div class="feature-card"><div class="feature-icon fi-cyan">&#128202;</div><h3>Live Dashboard</h3><p>Real-time CPU, RAM, disk, network stats. Traffic charts, connection history, and hourly usage graphs.</p></div>
+      <div class="feature-card"><div class="feature-icon fi-emerald">&#128279;</div><h3>Multi-Client Links</h3><p>One-click copy links for V2RayN, V2RayNG, Streisand, Shadowrocket, Foxray, Nekoray, BS Client, Npv, Hiddify, Mahsang.</p></div>
+      <div class="feature-card"><div class="feature-icon fi-amber">&#128200;</div><h3>Traffic Management</h3><p>Per-link data quotas (GB/MB), expiry dates, max concurrent connections, and speed limits.</p></div>
+      <div class="feature-card"><div class="feature-icon fi-rose">&#127760;</div><h3>Clean IP Support</h3><p>Add custom IPs/domains that get automatically bundled in subscription links for anti-ban protection.</p></div>
+      <div class="feature-card"><div class="feature-icon fi-violet">&#9881;</div><h3>Panel Builder</h3><p>Let others create their own Usf Panel with just a few clicks — deploy directly to their HuggingFace account.</p></div>
+    </div>
+  </div>
+</section>
 
-<script type="module">
-import { whoami, createRepo, commit } from "https://esm.sh/@huggingface/hub@0.15.1";
+<!-- Clients -->
+<section class="section" id="clients" style="padding-top:0">
+  <div class="container" style="text-align:center">
+    <div class="section-tag">Compatibility</div>
+    <h2>Works with all major clients</h2>
+    <p class="desc" style="margin-left:auto;margin-right:auto">Generate optimized VLESS configs for any client with one click.</p>
+    <div class="clients-row">
+      <div class="client-chip">V2RayN</div>
+      <div class="client-chip">V2RayNG</div>
+      <div class="client-chip">Streisand</div>
+      <div class="client-chip">Shadowrocket</div>
+      <div class="client-chip">Foxray</div>
+      <div class="client-chip">Nekoray</div>
+      <div class="client-chip">BS Client</div>
+      <div class="client-chip">Npv Tunnel</div>
+      <div class="client-chip">Hiddify</div>
+      <div class="client-chip">Mahsang</div>
+    </div>
+  </div>
+</section>
 
-// ─── State ──────────────────────────────────────────────────────────────────
-const state = {
-  accessToken: null,
-  username: null,
-  spaceName: "usf",
-  password: "admin",
-  spaceId: null,
-};
+<!-- Deploy -->
+<section class="section deploy-section" id="deploy">
+  <div class="container">
+    <div style="text-align:center;margin-bottom:40px">
+      <div class="section-tag">Deploy</div>
+      <h2>One-Click Deployment</h2>
+      <p class="desc" style="margin-left:auto;margin-right:auto">No Docker, no command line, no technical knowledge needed.</p>
+    </div>
+    <div class="deploy-card">
+      <div class="form-group"><label>HuggingFace Token <span style="color:var(--rose)">*</span></label><input type="password" id="hfToken" placeholder="hf_xxxxxxxxxxxxxxxxxxxxx"></div>
+      <div class="form-row">
+        <div class="form-group"><label>Space Name <span style="color:var(--rose)">*</span></label><input type="text" id="spaceName" placeholder="my-panel"></div>
+        <div class="form-group"><label>Admin Username</label><input type="text" id="adminUser" value="admin"></div>
+      </div>
+      <div class="form-group"><label>Admin Password</label><input type="password" id="adminPass" value="admin" placeholder="min 4 characters"></div>
+      <button class="deploy-btn" id="deployBtn" onclick="deploy()">Deploy My Panel</button>
+      <div class="deploy-status" id="deployStatus"></div>
+    </div>
+  </div>
+</section>
 
-// ─── DOM helpers ────────────────────────────────────────────────────────────
-const $ = (id) => document.getElementById(id);
-const steps = ["step1", "step2", "step3", "step4"];
-const psSteps = ["ps1", "ps2", "ps3", "ps4"];
+<!-- Footer -->
+<footer>
+  <div class="container">
+    <p>Usf Panel &mdash; Open Source VLESS Tunnel Manager</p>
+    <p style="margin-top:6px"><a href="https://github.com/godde3s/Usf-panel" target="_blank">GitHub</a> &middot; <a href="https://t.me/Usf" target="_blank">Telegram</a></p>
+  </div>
+</footer>
 
-function goToStep(n) {
-  steps.forEach((s, i) => {
-    $(s).classList.toggle("active", i === n - 1);
-  });
-  psSteps.forEach((p, i) => {
-    const el = $(p);
-    el.classList.remove("active", "done");
-    if (i < n - 1) el.classList.add("done");
-    else if (i === n - 1) el.classList.add("active");
-  });
-  // Progress bar
-  const pct = ((n - 1) / 3) * 100;
-  $("progressFill").style.width = pct + "%";
-  // Hide all error boxes
-  ["error1", "error2", "error3"].forEach(e => $(e).classList.remove("show"));
-  // Scroll to top of wizard
-  $("progressFill").parentElement.parentElement.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-function showError(boxId, msg) {
-  const box = $(boxId);
-  box.textContent = msg;
-  box.classList.add("show");
-}
-
-function showToast(msg) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  setTimeout(() => t.classList.remove("show"), 2500);
-}
-
-function logMsg(msg, type = "") {
-  const log = $("deployLog");
-  const line = document.createElement("div");
-  line.className = "log-line " + type;
-  const time = new Date().toLocaleTimeString("fa-IR");
-  const prefix = type === "ok" ? "✓" : type === "err" ? "✗" : type === "warn" ? "⚠" : type === "info" ? "ℹ" : "→";
-  line.textContent = `[${time}] ${prefix} ${msg}`;
-  log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
-}
-
-// ─── Step 1: Validate token ─────────────────────────────────────────────────
-window.validateToken = async function() {
-  const token = $("tokenInput").value.trim();
-  const btn = $("btnValidate");
-
-  if (!token || !token.startsWith("hf_")) {
-    showError("error1", "توکن نامعتبر است. توکن باید با «hf_» شروع شود.");
-    return;
-  }
-
-  btn.disabled = true;
-  btn.innerHTML = '<div class="spinner" style="width:18px;height:18px;border-width:2px"></div> در حال بررسی...';
-
-  try {
-    const info = await whoami({ credentials: { accessToken: token } });
-    if (!info || !info.name) throw new Error("پاسخ نامعتبر از سرور");
-
-    state.accessToken = token;
-    state.username = info.name;
-
-    // Move to step 2
-    $("hfUsername").value = info.name;
-    updateUrlPreview();
-    goToStep(2);
-  } catch (e) {
-    let msg = "توکن نامعتبر است.";
-    if (e.message && e.message.includes("401")) {
-      msg = "توکن نامعتبر یا منقضی است. لطفاً یک توکن جدید با دسترسی «Write» بسازید.";
-    } else if (e.message && e.message.includes("403")) {
-      msg = "توکن دسترسی کافی ندارد. مطمئن شوید توکن از نوع «Write» است.";
-    } else if (e.message) {
-      msg = "خطا: " + e.message;
-    }
-    showError("error1", msg);
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = '<span>تایید توکن و ادامه</span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7"/></svg>';
-  }
-};
-
-// Update URL preview when space name changes
-$("spaceName").addEventListener("input", updateUrlPreview);
-function updateUrlPreview() {
-  const name = $("spaceName").value.trim() || "usf";
-  const username = state.username || "username";
-  $("urlPreview").textContent = `https://${username}-${name}.hf.space`;
-}
-
-// ─── Step 2: Start deploy ───────────────────────────────────────────────────
-window.startDeploy = async function() {
-  state.spaceName = $("spaceName").value.trim().toLowerCase() || "usf";
-  state.password = $("adminPassword").value.trim() || "admin";
-
-  // Validate space name
-  if (!/^[a-z0-9\-]+$/.test(state.spaceName)) {
-    showError("error2", "نام Space فقط می‌تواند شامل حروف کوچک انگلیسی، اعداد و خط تیره باشد.");
-    return;
-  }
-
-  goToStep(3);
-  $("deployLog").innerHTML = "";
-
-  try {
-    // ─── 1. Create Space ────────────────────────────────────────────────────
-    logMsg("در حال ایجاد Space...", "info");
-    try {
-      await createRepo({
-        repo: { type: "space", name: state.spaceName },
-        credentials: { accessToken: state.accessToken },
-        sdk: "docker",
-        private: false,
-      });
-      logMsg(`Space «${state.username}/${state.spaceName}» ایجاد شد`, "ok");
-    } catch (e) {
-      if (e.message && (e.message.includes("409") || e.message.includes("already") || e.message.includes("exists"))) {
-        logMsg("Space از قبل وجود دارد — فایل‌ها به‌روزرسانی می‌شوند", "warn");
-      } else if (e.message && e.message.includes("quota")) {
-        throw new Error("سهمیه Space های شما تکمیل شده است. لطفاً Space های دیگر خود را از huggingface.co/settings pause کنید و دوباره تلاش کنید.");
-      } else {
-        throw e;
-      }
-    }
-
-    // ─── 2. Download files from GitHub ──────────────────────────────────────
-    logMsg("در حال دانلود فایل‌های پنل از GitHub...", "info");
-    const fileUrls = {
-      "app.py": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/app.py",
-      "requirements.txt": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/requirements.txt",
-      "Dockerfile": "https://raw.githubusercontent.com/Godde3s/Usf-panel/main/Dockerfile",
-    };
-
-    const operations = [];
-    for (const [path, url] of Object.entries(fileUrls)) {
-      logMsg(`دانلود ${path}...`, "info");
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`خطا در دانلود ${path}: HTTP ${res.status}`);
-      const content = await res.text();
-      operations.push({
-        operation: "add",
-        path: path,
-        content: new Blob([content], { type: "text/plain" }),
-      });
-      logMsg(`${path} (${(content.length / 1024).toFixed(1)} KB) آماده شد`, "ok");
-    }
-
-    // ─── 3. Generate README.md with HF metadata ─────────────────────────────
-    const readmeContent = `---
-title: Usf Panel
-emoji: 🔺
-colorFrom: yellow
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: true
-license: mit
----
-
-# 🔺 Usf Panel
-
-Premium VLESS Tunnel & Subscription Manager
-
-Auto-deployed from https://godde3s.github.io/Usf-panel
-
-## Login
-- Username: admin
-- Password: (set during deployment)
-
-Change the password immediately after first login!
-`;
-    operations.push({
-      operation: "add",
-      path: "README.md",
-      content: new Blob([readmeContent], { type: "text/plain" }),
-    });
-    logMsg("README.md تولید شد", "ok");
-
-    // ─── 4. Upload all files in one commit ───────────────────────────────────
-    logMsg("در حال آپلود فایل‌ها به HuggingFace...", "info");
-    await commit({
-      repo: { type: "space", name: `${state.username}/${state.spaceName}` },
-      credentials: { accessToken: state.accessToken },
-      title: "△ Usf Panel v1.0.0 — auto-deploy",
-      operations,
-    });
-    logMsg("تمام فایل‌ها با موفقیت آپلود شدند", "ok");
-
-    // ─── 5. Set secrets ──────────────────────────────────────────────────────
-    logMsg("در حال تنظیم رمز عبور و کلیدهای امنیتی...", "info");
-    const secretKey = generateSecretKey();
-    await setSecret("ADMIN_USERNAME", "admin");
-    await setSecret("ADMIN_PASSWORD", state.password);
-    await setSecret("SECRET_KEY", secretKey);
-    logMsg("تنظیمات امنیتی اعمال شد", "ok");
-
-    // ─── 6. Restart Space (to pick up secrets) ───────────────────────────────
-    logMsg("در حال راه‌اندازی مجدد Space...", "info");
-    try {
-      await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}/restart`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${state.accessToken}` },
-      });
-      logMsg("راه‌اندازی مجدد ارسال شد", "ok");
-    } catch (e) {
-      logMsg("هشدار: restart خودکار ناموفق بود (ممکن است نیاز به restart دستی باشد)", "warn");
-    }
-
-    // ─── 7. Wait for build ───────────────────────────────────────────────────
-    logMsg("در حال انتظار برای build... (این مرحله ۲-۳ دقیقه طول می‌کشد)", "info");
-    await waitForBuild();
-
-    // ─── 8. Done! ────────────────────────────────────────────────────────────
-    logMsg("پنل با موفقیت ساخته شد! 🎉", "ok");
-
-    // Show result
-    const panelUrl = `https://${state.username}-${state.spaceName}.hf.space`;
-    $("panelUrl").href = panelUrl;
-    $("panelUrl").textContent = panelUrl;
-    $("openPanelBtn").href = panelUrl;
-    $("finalPassword").textContent = state.password;
-
-    // Update progress to 100%
-    $("progressFill").style.width = "100%";
-
-    goToStep(4);
-    showToast("✅ پنل شما آماده است!");
-  } catch (e) {
-    logMsg("خطا: " + (e.message || e), "err");
-    showError("error3", "❌ " + (e.message || "خطای ناشناخته. لطفاً دوباره تلاش کنید."));
-  }
-};
-
-async function setSecret(key, value) {
-  const res = await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}/secrets`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${state.accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ key, value }),
-  });
-  if (!res.ok) throw new Error(`خطا در تنظیم ${key}`);
-}
-
-function generateSecretKey() {
-  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let key = "";
-  for (let i = 0; i < 64; i++) {
-    key += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return key;
-}
-
-async function waitForBuild() {
-  const maxAttempts = 72; // 6 minutes max (5s * 72)
-  let lastStage = "";
-
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const res = await fetch(`https://huggingface.co/api/spaces/${state.username}/${state.spaceName}`, {
-        headers: { Authorization: `Bearer ${state.accessToken}` },
-      });
-      if (!res.ok) {
-        await sleep(5000);
-        continue;
-      }
-      const data = await res.json();
-      const stage = (data.runtime || {}).stage || "UNKNOWN";
-
-      if (stage !== lastStage) {
-        const stageText = translateStage(stage);
-        logMsg(`وضعیت build: ${stageText}`, "info");
-        lastStage = stage;
-      }
-
-      if (stage === "RUNNING") {
-        logMsg("Space در حال اجراست!", "ok");
-        return;
-      }
-      if (stage === "PAUSED") {
-        throw new Error("Space متوقف شد. ممکن است سهمیه شما تکمیل شده باشد. Space های دیگر خود را pause کنید.");
-      }
-      if (stage === "ERROR" || stage === "RUNNING_ERROR") {
-        throw new Error("Build ناموفق بود. لاگ‌ها را در HuggingFace بررسی کنید.");
-      }
-
-      await sleep(5000);
-    } catch (e) {
-      if (e.message && (e.message.includes("متوقف") || e.message.includes("ناموفق"))) {
-        throw e;
-      }
-      // Network error, retry
-      await sleep(5000);
-    }
-  }
-  throw new Error("زمان انتظار برای build به پایان رسید. ممکن است Space هنوز در حال build باشد — چند دقیقه بعد دوباره بررسی کنید.");
-}
-
-function translateStage(stage) {
-  const map = {
-    "BUILDING": "در حال build...",
-    "RUNNING": "در حال اجرا",
-    "PAUSED": "متوقف شده",
-    "ERROR": "خطا",
-    "RUNNING_ERROR": "خطا در اجرا",
-    "NO_APP_FILE": "فایل اپ پیدا نشد",
-    "UNKNOWN": "نامشخص",
-  };
-  return map[stage] || stage;
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-// ─── Copy URL ───────────────────────────────────────────────────────────────
-window.copyUrl = function() {
-  const url = $("panelUrl").href;
-  navigator.clipboard.writeText(url).then(() => {
-    showToast("✅ لینک کپی شد!");
-  }).catch(() => {
-    showToast("کپی ناموفق بود", true);
-  });
-};
-
-// ─── Enter key support ──────────────────────────────────────────────────────
-$("tokenInput").addEventListener("keypress", (e) => {
-  if (e.key === "Enter") validateToken();
-});
-
-// ─── Hide loading overlay ───────────────────────────────────────────────────
-// Hide overlay as soon as the module script executes (don't wait for 'load'
-// event which waits for all resources including the esm.sh fetch).
-function hideOverlay() {
-  const ov = $("loadingOverlay");
-  if (ov) {
-    ov.classList.add("hide");
-    setTimeout(() => ov.remove(), 500);
-  }
-}
-hideOverlay();
-
-// Make goToStep accessible globally
-window.goToStep = goToStep;
-</script>
-
-<!-- Inline script: hide overlay immediately + placeholder functions -->
 <script>
-(function() {
-  function hide() {
-    var ov = document.getElementById("loadingOverlay");
-    if (ov) { ov.classList.add("hide"); setTimeout(function(){ ov.remove(); }, 500); }
-  }
-  if (document.readyState !== "loading") hide();
-  else document.addEventListener("DOMContentLoaded", hide);
-  setTimeout(hide, 3000);
+async function deploy(){
+  const token=document.getElementById('hfToken').value.trim();
+  const space=document.getElementById('spaceName').value.trim().toLowerCase();
+  const user=document.getElementById('adminUser').value.trim()||'admin';
+  const pass=document.getElementById('adminPass').value||'admin';
+  const status=document.getElementById('deployStatus');
+  const btn=document.getElementById('deployBtn');
+  if(!token||!space){status.className='deploy-status error';status.textContent='Token and Space name are required.';status.style.display='block';return}
+  if(!/^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$/.test(space)){status.className='deploy-status error';status.textContent='Invalid space name. Use lowercase letters, numbers, hyphens.';status.style.display='block';return}
+  btn.disabled=true;btn.textContent='Deploying...';status.style.display='none';
 
-  // Placeholder functions — overwritten when the ES module loads from esm.sh
-  // This prevents "function not defined" errors if user clicks before module loads.
-  var msg = "کمی صبر کنید، در حال بارگذاری ماژول‌ها...";
-  function placeholder() {
-    var t = document.getElementById("toast");
-    if (t) { t.textContent = msg; t.classList.add("show"); setTimeout(function(){ t.classList.remove("show"); }, 2500); }
-    else alert(msg);
+  try{
+    // Step 1: Get username
+    const whoami=await fetch('https://huggingface.co/api/whoami-v2',{headers:{'Authorization':'Bearer '+token}});
+    if(!whoami.ok){throw new Error('Invalid token or no write access. Please check your HF token.')}
+    const me=await whoami.json();
+    const username=me.name||me.username;
+
+    // Step 2: Create repo
+    const repoId=username+'/'+space;
+    const createResp=await fetch('https://huggingface.co/api/repos/create',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({name:space,type:'space',private:false})});
+
+    // Step 3: Upload files
+    const secretKey=crypto.getRandomValues(new Uint8Array(32)).reduce((a,b)=>a+b.toString(16).padStart(2,'0'),'');
+    const dockerfile='FROM python:3.11-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY app.py .\nEXPOSE 7860\nENV ADMIN_USERNAME='+user+'\nENV ADMIN_PASSWORD='+pass+'\nENV SECRET_KEY='+secretKey+'\nCMD ["python","-c","import uvicorn;uvicorn.run(\'app:app\',host=\'0.0.0.0\',port=7860,log_level=\'info\',access_log=False)"]\n';
+    const reqs='fastapi>=0.115.0\nuvicorn>=0.30.0\nhttpx>=0.27.0\npsutil>=5.9.0\n';
+    const readme='---\ntitle: '+space+'\nsdk: docker\napp_port: 7860\n---\n';
+
+    // Fetch app.py from GitHub
+    const appResp=await fetch('https://raw.githubusercontent.com/godde3s/Usf-panel/main/app.py');
+    const appCode=await appResp.text();
+
+    const boundary='----FormBoundary'+Math.random().toString(36).slice(2);
+    const files=[
+      {name:'app.py',content:appCode},
+      {name:'Dockerfile',content:dockerfile},
+      {name:'requirements.txt',content:reqs},
+      {name:'README.md',content:readme}
+    ];
+    let body='';
+    files.forEach(f=>{
+      body+='--'+boundary+'\r\nContent-Disposition: form-data; name="file"; filename="'+f.name+'"\r\nContent-Type: text/plain\r\n\r\n'+f.content+'\r\n';
+    });
+    body+='--'+boundary+'--\r\n';
+
+    // Upload each file separately
+    for(const f of files){
+      const fb='----FormBoundary'+Math.random().toString(36).slice(2);
+      const fbody='--'+fb+'\r\nContent-Disposition: form-data; name="file"; filename="'+f.name+'"\r\nContent-Type: text/plain\r\n\r\n'+f.content+'\r\n--'+fb+'--\r\n';
+      await fetch('https://huggingface.co/api/repos/'+encodeURIComponent(repoId)+'/upload/main/'+f.name,{
+        method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'multipart/form-data; boundary='+fb},body:fbody
+      });
+    }
+
+    status.className='deploy-status success';
+    status.innerHTML='<strong>Panel deployed successfully!</strong><br><br>'+
+      'Space: <a href="https://huggingface.co/spaces/'+repoId+'" target="_blank">huggingface.co/spaces/'+repoId+'</a><br>'+
+      'App URL: <a href="https://'+space+'.hf.space" target="_blank">'+space+'.hf.space</a><br><br>'+
+      '<strong>Username:</strong> '+user+'<br><strong>Password:</strong> '+pass+'<br>'+
+      'Wait ~2 minutes for the build, then visit your panel URL.';
+    status.style.display='block';
+  }catch(e){
+    status.className='deploy-status error';
+    status.textContent='Error: '+e.message;
+    status.style.display='block';
   }
-  window.validateToken = placeholder;
-  window.startDeploy = placeholder;
-  window.copyUrl = placeholder;
-  window.goToStep = placeholder;
-})();
+  btn.disabled=false;btn.textContent='Deploy My Panel';
+}
+
+// Close mobile menu on link click
+document.querySelectorAll('.nav-links a').forEach(a=>a.addEventListener('click',()=>document.getElementById('navLinks').classList.remove('open')));
 </script>
-</body>
-</html>
+</body></html>

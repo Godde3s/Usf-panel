@@ -1,5 +1,5 @@
-#  USF Panel v2.0.0 — Backend Core
-#  (Imports through WebSocket Tunnel)
+#  USF Panel v3.0.0 — Complete Single-File App
+#  Compatible with HuggingFace Spaces (port 7860, python:3.11-slim)
 # ============================================================
 
 import asyncio
@@ -16,83 +16,62 @@ import uuid
 import threading
 import psutil
 import base64
+import contextlib
+import logging
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from collections import deque, defaultdict
 from html import escape as _hesc
-
-# ─── Speed optimizations (uvloop + orjson + httptools) ─────────────────────
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    _HAS_UVLOOP = True
-except ImportError:
-    _HAS_UVLOOP = False
-
-try:
-    import orjson
-    _HAS_ORJSON = True
-except ImportError:
-    orjson = None
-    _HAS_ORJSON = False
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
-import logging
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Usf-Gateway")
-logger.info(f"Usf v2.0.0 starting | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
+logger = logging.getLogger("Usf")
+logger.info("Usf v3.0.0 starting")
 
 app = FastAPI(title="Usf", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 7860)),
-    "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
+    "secret": os.environ.get("SECRET_KEY", "usf-default-secret-key-change-me"),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v2.0.0")
-CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v3.0.0")
+CORE_VERSION = os.environ.get("CORE_VERSION", "v3.0.0")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
 SERVICE_RUNNING = True
 SERVICE_STARTED_AT = time.time()
 
-# ─── SQLite persistence (survives HF Space restarts) ─────────────────────────
+# ─── SQLite ───────────────────────────────────────────────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/tmp/usf.db")
 _DB_LOCK = threading.Lock()
 
 def db_init():
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS kv (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-            """)
+            conn.execute("""CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
             conn.commit()
-        logger.info(f"SQLite initialized at {DB_PATH}")
+        logger.info(f"SQLite OK: {DB_PATH}")
     except Exception as e:
-        logger.warning(f"SQLite init failed: {e} (running in-memory only)")
+        logger.warning(f"SQLite init error: {e}")
 
-def db_set(key: str, value: str):
+def db_set(key, value):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
-                (key, value, datetime.now().isoformat())
-            )
+            conn.execute("INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?,?,?)",
+                         (key, value, datetime.now().isoformat()))
             conn.commit()
     except Exception as e:
-        logger.warning(f"db_set({key}) failed: {e}")
+        logger.warning(f"db_set({key}) err: {e}")
 
-def db_get(key: str, default=None):
+def db_get(key, default=None):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
@@ -100,7 +79,7 @@ def db_get(key: str, default=None):
     except Exception:
         return default
 
-def db_delete(key: str):
+def db_delete(key):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM kv WHERE key=?", (key,))
@@ -108,86 +87,45 @@ def db_delete(key: str):
     except Exception:
         pass
 
-# ─── Rate limiting ────────────────────────────────────────────────────────────
-RATE_LIMIT = defaultdict(lambda: deque(maxlen=20))
-RATE_LIMIT_LOCK = asyncio.Lock()
-
-async def rate_limit_check(ip: str, max_requests: int = 10, window_sec: int = 60) -> bool:
-    now = time.time()
-    async with RATE_LIMIT_LOCK:
-        dq = RATE_LIMIT[ip]
-        while dq and now - dq[0] > window_sec:
-            dq.popleft()
-        if len(dq) >= max_requests:
-            return False
-        dq.append(now)
-        return True
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─── Anti-fingerprinting middleware ──────────────────────────────────────────
-@app.middleware("http")
-async def sanitize_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
-    for h in ("server", "x-powered-by", "via", "x-aspnet-version", "x-forwarded-host"):
-        if h in response.headers:
-            del response.headers[h]
-    response.headers["server"] = "Usf"
-    response.headers["x-content-type-options"] = "nosniff"
-    response.headers["x-frame-options"] = "SAMEORIGIN"
-    response.headers["referrer-policy"] = "no-referrer"
-    response.headers["x-xss-protection"] = "1; mode=block"
-    if request.url.scheme == "https":
-        response.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
-    return response
-
-# ─── State ───────────────────────────────────────────────────────────────────
-connections: dict = {}
-connection_sockets: dict = {}
-link_ip_map: dict = defaultdict(set)
+# ─── State (locks created in lifespan) ───────────────────────────────────────
+connections = {}
+connection_sockets = {}
+link_ip_map = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
-error_logs: deque = deque(maxlen=100)
-hourly_traffic: dict = defaultdict(int)
-connection_history: deque = deque(maxlen=500)
-http_client: httpx.AsyncClient | None = None
-
+error_logs = deque(maxlen=200)
+hourly_traffic = defaultdict(int)
+connection_history = deque(maxlen=1000)
+http_client = None
 _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
 
-LINKS: dict = {}
-LINKS_LOCK = asyncio.Lock()
+LINKS = {}
+LINKS_LOCK = None
+CUSTOM_ADDRESSES = ["amazonaws.com"]
+CUSTOM_ADDRESSES_LOCK = None
+CUSTOM_DOMAIN = ""
+CUSTOM_DOMAIN_LOCK = None
 
-CUSTOM_ADDRESSES: list = ["amazonaws.com"]
-CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
+SESSIONS = {}
+SESSIONS_LOCK = None
+RATE_LIMITS = {}
+RATE_LIMIT_LOCK = None
 
-CUSTOM_DOMAIN: str = ""
-CUSTOM_DOMAIN_LOCK = asyncio.Lock()
-
-SESSION_COOKIE = "Usf_session"
+SESSION_COOKIE = "usf_sess"
 SESSION_TTL = 60 * 60 * 24 * 7
 
-def hash_password(pw: str) -> str:
+AUTH = {}
+
+def hash_password(pw):
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {
-    "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin")),
-    "username": os.environ.get("ADMIN_USERNAME", "admin"),
-}
-SESSIONS: dict = {}
-SESSIONS_LOCK = asyncio.Lock()
-
-async def create_session() -> str:
+# ─── Auth ────────────────────────────────────────────────────────────────────
+async def create_session():
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
     return token
 
-async def is_valid_session(token: str | None) -> bool:
+async def is_valid_session(token):
     if not token:
         return False
     async with SESSIONS_LOCK:
@@ -197,7 +135,7 @@ async def is_valid_session(token: str | None) -> bool:
             return False
         return True
 
-async def destroy_session(token: str | None):
+async def destroy_session(token):
     if token:
         async with SESSIONS_LOCK:
             SESSIONS.pop(token, None)
@@ -208,172 +146,155 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-async def keep_alive():
-    while True:
-        await asyncio.sleep(600)
-        try:
-            domain = get_domain()
-            if domain and domain != "localhost":
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.get(f"https://{domain}/health")
-                logger.info("Keep-alive ping sent")
-        except Exception:
-            pass
+# ─── Rate Limit ──────────────────────────────────────────────────────────────
+async def rate_limit_check(ip, max_req=10, window=60):
+    now = time.time()
+    async with RATE_LIMIT_LOCK:
+        data = RATE_LIMITS.get(ip, [])
+        data = [t for t in data if now - t < window]
+        if len(data) >= max_req:
+            RATE_LIMITS[ip] = data
+            return False
+        data.append(now)
+        RATE_LIMITS[ip] = data
+        return True
 
-async def periodic_save():
-    while True:
-        await asyncio.sleep(30)
-        try:
-            async with LINKS_LOCK:
-                links_snapshot = json.dumps(LINKS, ensure_ascii=False)
-            db_set("links", links_snapshot)
-            async with CUSTOM_ADDRESSES_LOCK:
-                addrs_snapshot = json.dumps(CUSTOM_ADDRESSES)
-            db_set("addresses", addrs_snapshot)
-            async with CUSTOM_DOMAIN_LOCK:
-                db_set("domain", CUSTOM_DOMAIN)
-            db_set("auth_hash", AUTH["password_hash"])
-        except Exception as e:
-            logger.warning(f"periodic_save failed: {e}")
+# ─── Middleware ──────────────────────────────────────────────────────────────
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
-@app.on_event("startup")
-async def startup():
-    global http_client, _net_baseline, CUSTOM_DOMAIN, CUSTOM_ADDRESSES, AUTH
-    db_init()
-    saved_links = db_get("links")
-    if saved_links:
-        try:
-            parsed = json.loads(saved_links)
-            async with LINKS_LOCK:
-                LINKS.update(parsed)
-            logger.info(f"Loaded {len(parsed)} links from SQLite")
-        except Exception as e:
-            logger.warning(f"Failed to load links: {e}")
-    saved_addrs = db_get("addresses")
-    if saved_addrs:
-        try:
-            async with CUSTOM_ADDRESSES_LOCK:
-                CUSTOM_ADDRESSES = json.loads(saved_addrs)
-        except Exception:
-            pass
-    saved_domain = db_get("domain")
-    if saved_domain is not None:
-        CUSTOM_DOMAIN = saved_domain
-    saved_pw = db_get("auth_hash")
-    if saved_pw:
-        AUTH["password_hash"] = saved_pw
+@app.middleware("http")
+async def anti_fingerprint(request, call_next):
+    resp = await call_next(request)
+    for h in ("server", "x-powered-by", "via", "x-aspnet-version", "x-forwarded-host"):
+        if h in resp.headers:
+            del resp.headers[h]
+    resp.headers["server"] = "Usf"
+    resp.headers["x-content-type-options"] = "nosniff"
+    resp.headers["x-frame-options"] = "SAMEORIGIN"
+    resp.headers["referrer-policy"] = "no-referrer"
+    if request.url.scheme == "https":
+        resp.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
+    return resp
 
-    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
-    timeout = httpx.Timeout(30.0, connect=10.0)
-    http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+def get_domain():
+    return os.environ.get("SPACE_HOST", "localhost").replace("https://","").replace("http://","")
 
-    try:
-        nc = psutil.net_io_counters()
-        _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": time.time()}
-    except Exception:
-        _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
-
-    logger.info(f"Usf v2.0.0 started on port {CONFIG['port']}")
-    asyncio.create_task(keep_alive())
-    asyncio.create_task(periodic_save())
-
-@app.on_event("shutdown")
-async def shutdown():
-    try:
-        async with LINKS_LOCK:
-            links_snapshot = json.dumps(LINKS, ensure_ascii=False)
-        db_set("links", links_snapshot)
-        async with CUSTOM_ADDRESSES_LOCK:
-            db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
-        async with CUSTOM_DOMAIN_LOCK:
-            db_set("domain", CUSTOM_DOMAIN)
-        db_set("auth_hash", AUTH["password_hash"])
-        logger.info("State saved before shutdown")
-    except Exception as e:
-        logger.warning(f"Shutdown save failed: {e}")
-    if http_client:
-        await http_client.aclose()
-
-# ─── Helper Functions ────────────────────────────────────────────────────────
-
-def get_domain() -> str:
-    return os.environ.get("SPACE_HOST", "localhost").replace("https://", "").replace("http://", "")
-
-def generate_uuid(seed: str | None = None) -> str:
+def generate_uuid(seed=None):
     if seed is None:
         return str(uuid.uuid4())
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> str:
-    domain = CUSTOM_DOMAIN if CUSTOM_DOMAIN else get_domain()
-    addr = address if address else domain
-    path = f"/ws/{uuid}"
+def generate_vless_link(uid, remark="Usf", address=None):
+    domain = CUSTOM_DOMAIN or get_domain()
+    addr = address or domain
     params = {
-        "encryption": "none",
-        "security": "tls",
-        "type": "ws",
-        "host": domain,
-        "path": path,
-        "sni": domain,
-        "fp": "chrome",
-        "alpn": "h2,http/1.1",
+        "encryption": "none", "security": "tls", "type": "ws",
+        "flow": "xtls-rprx-vision", "host": domain,
+        "path": f"/ws/{uid}", "sni": domain,
+        "fp": "chrome", "alpn": "h2,http/1.1",
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
+    return f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
 
-def uptime_seconds() -> int:
+def generate_all_client_links(uid, label, address=None):
+    domain = CUSTOM_DOMAIN or get_domain()
+    addr = address or domain
+    base = generate_vless_link(uid, remark=label, address=addr)
+    sub_url = f"https://{domain}/sub/{uid}"
+
+    # Npv Tunnel: npv://uuid@host:port?params#remark
+    npv_params = {
+        "type": "ws", "security": "tls", "host": domain,
+        "path": f"/ws/{uid}", "sni": domain,
+        "fp": "chrome", "alpn": "h2,http/1.1", "flow": "xtls-rprx-vision",
+    }
+    npv_q = "&".join(f"{k}={quote(str(v))}" for k, v in npv_params.items())
+    npv_link = f"npv://{uid}@{addr}:443?{npv_q}#{quote(label)}"
+
+    # Hiddify: hiddify://import/base64json
+    hiddify_config = json.dumps({
+        "server_address": addr, "server_port": 443, "remark": label,
+        "config_type": "vless", "uuid": uid, "network": "ws",
+        "security": "tls", "sni": domain, "fp": "chrome",
+        "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
+        "flow": "xtls-rprx-vision",
+    }, separators=(",", ":"))
+    hiddify_b64 = base64.b64encode(hiddify_config.encode()).decode()
+    hiddify_link = f"hiddify://import/{hiddify_b64}"
+
+    # Mahsang: mahsa://base64json
+    mahsang_config = json.dumps({
+        "server_address": addr, "server_port": 443, "remark": label,
+        "config_type": "vless", "id": uid, "network": "ws",
+        "security": "tls", "sni": domain, "fp": "chrome",
+        "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
+        "flow": "xtls-rprx-vision",
+    }, separators=(",", ":"))
+    mahsang_b64 = base64.b64encode(mahsang_config.encode()).decode()
+    mahsang_link = f"mahsa://{mahsang_b64}"
+
+    return {
+        "V2RayN": base,
+        "V2RayNG": base,
+        "Streisand": base,
+        "Shadowrocket": base,
+        "Foxray": base,
+        "Nekoray": base,
+        "BS Client": base,
+        "Npv Tunnel": npv_link,
+        "Hiddify": hiddify_link,
+        "Mahsang": mahsang_link,
+        "Subscription": sub_url,
+    }
+
+def uptime_seconds():
     return int(time.time() - stats["start_time"])
 
-def uptime() -> str:
-    secs = uptime_seconds()
-    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def uptime():
+    s = uptime_seconds()
+    return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
-def os_uptime_str() -> str:
+def os_uptime_str():
     try:
-        secs = int(time.time() - psutil.boot_time())
-        d = secs // 86400
-        h = (secs % 86400) // 3600
-        m = (secs % 3600) // 60
-        if d > 0:
-            return f"{d}d {h}h {m}m"
-        elif h > 0:
-            return f"{h}h {m}m"
-        else:
-            return f"{m}m"
+        s = int(time.time() - psutil.boot_time())
+        d, s = divmod(s, 86400)
+        h, s = divmod(s, 3600)
+        m = s // 60
+        if d > 0: return f"{d}d {h}h {m}m"
+        if h > 0: return f"{h}h {m}m"
+        return f"{m}m"
     except Exception:
         return "N/A"
 
-def parse_size_to_bytes(value: float, unit: str) -> int:
+def parse_size_to_bytes(val, unit):
     unit = unit.upper()
-    if unit == "GB": return int(value * 1024 * 1024 * 1024)
-    if unit == "MB": return int(value * 1024 * 1024)
-    if unit == "KB": return int(value * 1024)
-    return int(value)
+    if unit == "GB": return int(val * 1073741824)
+    if unit == "MB": return int(val * 1048576)
+    if unit == "KB": return int(val * 1024)
+    return int(val)
 
-def compute_expiry(expiry_days) -> str:
+def compute_expiry(days):
     try:
-        days = float(expiry_days or 0)
+        d = float(days or 0)
     except (TypeError, ValueError):
-        days = 0
-    if days <= 0:
-        return ""
-    return (datetime.now() + timedelta(days=days)).isoformat()
+        d = 0
+    if d <= 0: return ""
+    return (datetime.now() + timedelta(days=d)).isoformat()
 
-def is_expired(link) -> bool:
+def is_expired(link):
     exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp:
-        return False
+    if not exp: return False
     try:
         return datetime.now() >= datetime.fromisoformat(exp)
     except (TypeError, ValueError):
         return False
 
-def expiry_epoch(link) -> int:
+def expiry_epoch(link):
     exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp:
-        return 0
+    if not exp: return 0
     try:
         return int(datetime.fromisoformat(exp).timestamp())
     except (TypeError, ValueError):
@@ -386,50 +307,43 @@ async def ensure_default_link():
             LINKS[uid] = {
                 "label": "Default", "limit_bytes": 0, "used_bytes": 0,
                 "max_connections": 0, "created_at": datetime.now().isoformat(),
-                "active": True, "expiry": "", "speed_limit": 0, "tag": "",
-                "note": ""
+                "active": True, "expiry": "", "speed_limit": 0, "tag": "", "note": "",
             }
 
-def get_client_ip(websocket: WebSocket) -> str:
-    forwarded = websocket.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if websocket.client:
-        return websocket.client.host
-    return "unknown"
+def get_client_ip(ws):
+    fwd = ws.headers.get("x-forwarded-for")
+    if fwd: return fwd.split(",")[0].strip()
+    return ws.client.host if ws.client else "unknown"
 
-def count_connections_for_link(uid: str) -> int:
+def count_connections_for_link(uid):
     return len(link_ip_map.get(uid, set()))
 
-def remove_ip_from_link(uid: str, ip: str):
+def remove_ip_from_link(uid, ip):
     if uid in link_ip_map:
         link_ip_map[uid].discard(ip)
         if not link_ip_map[uid]:
             link_ip_map.pop(uid, None)
 
-async def close_connections_for_link(uid: str):
+async def close_connections_for_link(uid):
     to_close = [cid for cid, info in connections.items() if info.get("uuid") == uid]
     for cid in to_close:
         ws = connection_sockets.get(cid)
         if ws:
-            try:
-                await ws.close(code=1000, reason="link deleted")
-            except Exception:
-                pass
+            try: await ws.close(code=1000, reason="link deleted")
+            except Exception: pass
         connections.pop(cid, None)
         connection_sockets.pop(cid, None)
     link_ip_map.pop(uid, None)
 
 def get_real_ips():
-    ipv4 = ""
-    ipv6 = ""
+    ipv4, ipv6 = "", ""
     try:
         for iface, addrs in psutil.net_if_addrs().items():
-            for addr in addrs:
-                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
-                    ipv4 = addr.address
-                elif addr.family == socket.AF_INET6 and not addr.address.startswith("::1") and not addr.address.startswith("fe80"):
-                    ipv6 = addr.address.split("%")[0]
+            for a in addrs:
+                if a.family == socket.AF_INET and not a.address.startswith("127."):
+                    ipv4 = a.address
+                elif a.family == socket.AF_INET6 and not a.address.startswith("::1") and not a.address.startswith("fe80"):
+                    ipv6 = a.address.split("%")[0]
     except Exception:
         pass
     return ipv4, ipv6
@@ -439,51 +353,127 @@ def get_net_speed():
     try:
         nc = psutil.net_io_counters()
         now = time.time()
-        elapsed = now - _net_baseline["ts"]
-        if elapsed < 0.1:
-            elapsed = 1.0
-        up_bps = (nc.bytes_sent - _net_baseline["bytes_sent"]) / elapsed
-        down_bps = (nc.bytes_recv - _net_baseline["bytes_recv"]) / elapsed
+        elapsed = max(now - _net_baseline["ts"], 0.1)
+        up = (nc.bytes_sent - _net_baseline["bytes_sent"]) / elapsed
+        down = (nc.bytes_recv - _net_baseline["bytes_recv"]) / elapsed
         _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": now}
-        return nc.bytes_sent, nc.bytes_recv, up_bps, down_bps
+        return nc.bytes_sent, nc.bytes_recv, up, down
     except Exception:
         return 0, 0, 0, 0
 
-def fmt_bytes_speed(bps: float) -> str:
-    if bps >= 1_048_576:
-        return f"{bps/1_048_576:.2f} MB"
-    elif bps >= 1024:
-        return f"{bps/1024:.2f} KB"
-    else:
-        return f"{bps:.0f} B"
+def fmt_speed(bps):
+    if bps >= 1048576: return f"{bps/1048576:.2f} MB/s"
+    if bps >= 1024: return f"{bps/1024:.2f} KB/s"
+    return f"{bps:.0f} B/s"
 
-def fmt_bytes(b: int) -> str:
-    if b >= 1_073_741_824:
-        return f"{b/1_073_741_824:.2f} GB"
-    elif b >= 1_048_576:
-        return f"{b/1_048_576:.2f} MB"
-    elif b >= 1024:
-        return f"{b/1024:.1f} KB"
+def fmt_bytes(b):
+    if b >= 1073741824: return f"{b/1073741824:.2f} GB"
+    if b >= 1048576: return f"{b/1048576:.2f} MB"
+    if b >= 1024: return f"{b/1024:.1f} KB"
     return f"{b} B"
 
-def get_net_connections_count():
+# ─── Lifespan ────────────────────────────────────────────────────────────────
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    global LINKS_LOCK, CUSTOM_ADDRESSES_LOCK, CUSTOM_DOMAIN_LOCK
+    global SESSIONS_LOCK, RATE_LIMIT_LOCK, http_client, _net_baseline
+    global CUSTOM_DOMAIN, CUSTOM_ADDRESSES, AUTH
+
+    LINKS_LOCK = asyncio.Lock()
+    CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
+    CUSTOM_DOMAIN_LOCK = asyncio.Lock()
+    SESSIONS_LOCK = asyncio.Lock()
+    RATE_LIMIT_LOCK = asyncio.Lock()
+
+    AUTH = {
+        "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin")),
+        "username": os.environ.get("ADMIN_USERNAME", "admin"),
+    }
+
+    db_init()
+    # Load saved state
+    saved = db_get("links")
+    if saved:
+        try:
+            async with LINKS_LOCK:
+                LINKS.update(json.loads(saved))
+            logger.info(f"Loaded {len(LINKS)} links")
+        except Exception as e:
+            logger.warning(f"Load links err: {e}")
+    saved_a = db_get("addresses")
+    if saved_a:
+        try:
+            async with CUSTOM_ADDRESSES_LOCK:
+                CUSTOM_ADDRESSES = json.loads(saved_a)
+        except Exception: pass
+    saved_d = db_get("domain")
+    if saved_d is not None:
+        CUSTOM_DOMAIN = saved_d
+    saved_pw = db_get("auth_hash")
+    if saved_pw:
+        AUTH["password_hash"] = saved_pw
+
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
+        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True
+    )
     try:
-        conns = psutil.net_connections()
-        tcp = sum(1 for c in conns if c.type == socket.SOCK_STREAM)
-        udp = sum(1 for c in conns if c.type == socket.SOCK_DGRAM)
-        return tcp, udp
+        nc = psutil.net_io_counters()
+        _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": time.time()}
     except Exception:
-        return 0, 0
+        pass
 
-#  USF Panel v2.0.0 — API Endpoints
-# ============================================================
+    logger.info(f"Usf v3.0.0 started on port {CONFIG['port']}")
 
-# ─── Main Endpoints ───────────────────────────────────────────────────────────
+    async def keep_alive():
+        while True:
+            await asyncio.sleep(600)
+            try:
+                d = get_domain()
+                if d and d != "localhost":
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        await c.get(f"https://{d}/health")
+            except Exception: pass
 
+    async def periodic_save():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                async with LINKS_LOCK:
+                    db_set("links", json.dumps(LINKS, ensure_ascii=False))
+                async with CUSTOM_ADDRESSES_LOCK:
+                    db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
+                async with CUSTOM_DOMAIN_LOCK:
+                    db_set("domain", CUSTOM_DOMAIN)
+                db_set("auth_hash", AUTH["password_hash"])
+            except Exception as e:
+                logger.warning(f"Save err: {e}")
+
+    t1 = asyncio.create_task(keep_alive())
+    t2 = asyncio.create_task(periodic_save())
+
+    yield
+
+    t1.cancel()
+    t2.cancel()
+    try:
+        async with LINKS_LOCK:
+            db_set("links", json.dumps(LINKS, ensure_ascii=False))
+        async with CUSTOM_ADDRESSES_LOCK:
+            db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
+        async with CUSTOM_DOMAIN_LOCK:
+            db_set("domain", CUSTOM_DOMAIN)
+        db_set("auth_hash", AUTH["password_hash"])
+    except Exception: pass
+    if http_client:
+        await http_client.aclose()
+
+app.router.lifespan_context = lifespan
+
+# ─── API Endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if await is_valid_session(token):
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/dashboard")
     return RedirectResponse(url="/login")
 
@@ -493,253 +483,151 @@ async def health():
 
 @app.post("/api/login")
 async def api_login(request: Request):
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else "unknown"
-    if not await rate_limit_check(client_ip, max_requests=5, window_sec=60):
-        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a minute.")
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "?")
+    if not await rate_limit_check(ip, 5, 60):
+        raise HTTPException(429, "Too many attempts. Wait 60s.")
     body = await request.json()
-    password = str(body.get("password") or "")
-    username = str(body.get("username") or "")
-    if username and username != AUTH["username"]:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    if hash_password(password) != AUTH["password_hash"]:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    pw = str(body.get("password") or "")
+    un = str(body.get("username") or "")
+    if un and un != AUTH["username"]:
+        raise HTTPException(401, "Invalid credentials")
+    if hash_password(pw) != AUTH["password_hash"]:
+        raise HTTPException(401, "Invalid credentials")
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=True)
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=True)
     return resp
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    await destroy_session(token)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(SESSION_COOKIE, path="/")
-    return resp
+    await destroy_session(request.cookies.get(SESSION_COOKIE))
+    r = JSONResponse({"ok": True})
+    r.delete_cookie(SESSION_COOKIE, path="/")
+    return r
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    return {"authenticated": await is_valid_session(token)}
+    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    current = str(body.get("current_password") or "")
+    cur = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
-    if hash_password(current) != AUTH["password_hash"]:
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if hash_password(cur) != AUTH["password_hash"]:
+        raise HTTPException(400, "Current password is wrong")
     if len(new) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+        raise HTTPException(400, "Password min 4 chars")
     AUTH["password_hash"] = hash_password(new)
-    current_token = request.cookies.get(SESSION_COOKIE)
+    tok = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
-        if current_token:
-            SESSIONS[current_token] = time.time() + SESSION_TTL
+        if tok:
+            SESSIONS[tok] = time.time() + SESSION_TTL
     return {"ok": True}
 
-@app.get("/stats")
-async def get_stats(_=Depends(require_auth)):
-    return {
-        "active_connections": len(connections),
-        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
-        "total_requests": stats["total_requests"],
-        "total_errors": stats["total_errors"],
-        "uptime": uptime(),
-        "timestamp": datetime.now().isoformat(),
-        "recent_errors": list(error_logs)[-10:],
-        "links_count": len(LINKS),
-        "domain": get_domain(),
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
-        "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(hourly_traffic),
-    }
-
 @app.get("/api/stats")
-async def get_api_stats(_=Depends(require_auth)):
+async def api_stats(_=Depends(require_auth)):
     cpu = psutil.cpu_percent(interval=0.1)
     vm = psutil.virtual_memory()
-    ram_pct = vm.percent
-    ram_used_mb = vm.used / 1_048_576
-    ram_total_mb = vm.total / 1_048_576
-
-    load_avg = [0.0, 0.0, 0.0]
-    try:
-        load_avg = list(os.getloadavg())
-    except Exception:
-        pass
-
-    total_sent_bytes, total_recv_bytes, up_bps, down_bps = get_net_speed()
+    ts, tr, up_bps, down_bps = get_net_speed()
     ipv4, ipv6 = get_real_ips()
-    tcp, udp = get_net_connections_count()
-
-    try:
-        proc = psutil.Process()
-        threads = proc.num_threads()
-        proc_ram = proc.memory_info().rss / 1_048_576
-    except Exception:
-        threads = 0
-        proc_ram = ram_used_mb
-
+    xray_up = int(time.time() - SERVICE_STARTED_AT) if SERVICE_RUNNING else 0
     try:
         sw = psutil.swap_memory()
-        swap_pct = sw.percent
-        swap_used = sw.used
-        swap_total = sw.total
-    except Exception:
-        swap_pct, swap_used, swap_total = 0.0, 0, 0
-
-    try:
         du = psutil.disk_usage("/")
-        disk_pct = du.percent
-        disk_used = du.used
-        disk_total = du.total
+        proc = psutil.Process()
     except Exception:
-        disk_pct, disk_used, disk_total = 0.0, 0, 0
-
-    try:
-        cpu_cores = psutil.cpu_count(logical=True) or 1
-    except Exception:
-        cpu_cores = 1
-
-    if SERVICE_RUNNING:
-        xray_uptime_s = int(time.time() - SERVICE_STARTED_AT)
-        if xray_uptime_s < 3600:
-            xray_uptime = f"{xray_uptime_s // 60}m"
-        elif xray_uptime_s < 86400:
-            xray_uptime = f"{xray_uptime_s // 3600}h {(xray_uptime_s % 3600)//60}m"
-        else:
-            xray_uptime = f"{xray_uptime_s // 86400}d {(xray_uptime_s % 86400)//3600}h"
-    else:
-        xray_uptime = "Stopped"
-
+        sw = du = None
+        proc = None
     return {
         "cpuUsage": round(cpu, 1),
-        "ramUsage": round(ram_pct, 1),
-        "ramUsed": f"{ram_used_mb:.1f} MB",
-        "ramTotal": f"{ram_total_mb:.0f} MB",
+        "ramUsage": round(vm.percent, 1),
+        "ramUsed": f"{vm.used/1048576:.1f} MB",
+        "ramTotal": f"{vm.total/1048576:.0f} MB",
         "uptime": os_uptime_str(),
-        "xrayUptime": xray_uptime,
-        "systemLoad": f"{load_avg[0]:.2f} | {load_avg[1]:.2f} | {load_avg[2]:.2f}",
-        "threads": threads,
-        "uploadSpeed": fmt_bytes_speed(up_bps) + "/s",
-        "downloadSpeed": fmt_bytes_speed(down_bps) + "/s",
-        "totalSent": fmt_bytes(total_sent_bytes),
-        "totalReceived": fmt_bytes(total_recv_bytes),
+        "xrayUptime": f"{xray_up//60}m" if xray_up < 3600 else f"{xray_up//3600}h {(xray_up%3600)//60}m" if SERVICE_RUNNING else "Stopped",
+        "uploadSpeed": fmt_speed(up_bps),
+        "downloadSpeed": fmt_speed(down_bps),
+        "totalSent": fmt_bytes(ts),
+        "totalReceived": fmt_bytes(tr),
         "ipv4": ipv4 or "N/A",
         "ipv6": ipv6 or "N/A",
-        "tcpConnections": tcp,
-        "udpConnections": udp,
         "activeConnections": len(connections),
-        "totalTrafficMb": round(stats["total_bytes"] / 1_048_576, 2),
+        "totalTrafficMb": round(stats["total_bytes"] / 1048576, 2),
         "totalRequests": stats["total_requests"],
         "linksCount": len(LINKS),
         "domain": get_domain(),
         "hourlyTraffic": dict(hourly_traffic),
         "recentErrors": list(error_logs)[-5:],
-        "cpuCores": cpu_cores,
-        "swapUsage": round(swap_pct, 1),
-        "swapUsed": fmt_bytes(swap_used),
-        "swapTotal": fmt_bytes(swap_total),
-        "storageUsage": round(disk_pct, 1),
-        "storageUsed": fmt_bytes(disk_used),
-        "storageTotal": fmt_bytes(disk_total),
-        "appRam": f"{proc_ram:.2f} MB",
+        "cpuCores": psutil.cpu_count(logical=True) or 1,
+        "swapUsage": round(sw.percent, 1) if sw else 0,
+        "swapUsed": fmt_bytes(sw.used) if sw else "0 B",
+        "swapTotal": fmt_bytes(sw.total) if sw else "0 B",
+        "storageUsage": round(du.percent, 1) if du else 0,
+        "storageUsed": fmt_bytes(du.used) if du else "0 B",
+        "storageTotal": fmt_bytes(du.total) if du else "0 B",
+        "appRam": f"{proc.memory_info().rss/1048576:.2f} MB" if proc else "N/A",
         "xrayRunning": SERVICE_RUNNING,
         "panelVersion": PANEL_VERSION,
         "coreVersion": CORE_VERSION,
         "telegram": TELEGRAM_HANDLE,
     }
 
-async def _stop_service_internal():
-    global SERVICE_RUNNING
-    SERVICE_RUNNING = False
-    for cid, ws in list(connection_sockets.items()):
-        try:
-            await ws.close(code=1012, reason="service stopped")
-        except Exception:
-            pass
-    connections.clear()
-    connection_sockets.clear()
-    link_ip_map.clear()
-
 @app.get("/api/service")
 async def service_status(_=Depends(require_auth)):
-    return {"running": SERVICE_RUNNING, "core_version": CORE_VERSION,
-            "active_connections": len(connections)}
+    return {"running": SERVICE_RUNNING, "active_connections": len(connections)}
 
 @app.post("/api/service/stop")
 async def service_stop(_=Depends(require_auth)):
-    await _stop_service_internal()
-    logger.info("Core stopped via panel")
-    return {"ok": True, "running": SERVICE_RUNNING}
+    global SERVICE_RUNNING
+    SERVICE_RUNNING = False
+    for ws in list(connection_sockets.values()):
+        try: await ws.close(code=1012, reason="stopped")
+        except: pass
+    connections.clear(); connection_sockets.clear(); link_ip_map.clear()
+    return {"ok": True, "running": False}
 
 @app.post("/api/service/restart")
 async def service_restart(_=Depends(require_auth)):
     global SERVICE_RUNNING, SERVICE_STARTED_AT
-    await _stop_service_internal()
+    SERVICE_RUNNING = False
+    for ws in list(connection_sockets.values()):
+        try: await ws.close(code=1012, reason="restarting")
+        except: pass
+    connections.clear(); connection_sockets.clear(); link_ip_map.clear()
     await asyncio.sleep(0.3)
     SERVICE_RUNNING = True
     SERVICE_STARTED_AT = time.time()
-    logger.info("Core restarted via panel")
-    return {"ok": True, "running": SERVICE_RUNNING}
+    return {"ok": True, "running": True}
 
 @app.get("/api/logs")
 async def get_logs(_=Depends(require_auth)):
     return {
         "running": SERVICE_RUNNING,
-        "totals": {
-            "bytes": stats["total_bytes"],
-            "requests": stats["total_requests"],
-            "errors": stats["total_errors"],
-        },
+        "totals": {"bytes": stats["total_bytes"], "requests": stats["total_requests"], "errors": stats["total_errors"]},
         "errors": list(error_logs)[-50:],
-        "connections": [
-            {"id": cid, "uuid": info.get("uuid"), "ip": info.get("ip"),
-             "connected_at": info.get("connected_at"), "bytes": info.get("bytes", 0)}
-            for cid, info in connections.items()
-        ],
+        "connections": [{"id": c, "uuid": i.get("uuid"), "ip": i.get("ip"),
+                         "connected_at": i.get("connected_at"), "bytes": i.get("bytes", 0)}
+                        for c, i in connections.items()],
         "history": list(connection_history)[-50:],
     }
 
 @app.get("/api/config")
-async def get_runtime_config(_=Depends(require_auth)):
+async def get_config(_=Depends(require_auth)):
     async with LINKS_LOCK:
-        inbounds = [{"uuid": uid, "remark": d["label"], "enabled": d["active"],
-                     "ws_path": f"/ws/{uid}"} for uid, d in LINKS.items()]
-    async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
-    return {
-        "panel": "Usf",
-        "panel_version": PANEL_VERSION,
-        "core_version": CORE_VERSION,
-        "running": SERVICE_RUNNING,
-        "port": CONFIG["port"],
-        "domain": CUSTOM_DOMAIN or get_domain(),
-        "protocol": "vless",
-        "network": "ws",
-        "security": "tls",
-        "clean_addresses": addresses,
-        "inbounds": inbounds,
-    }
+        inbounds = [{"uuid": u, "remark": d["label"], "enabled": d["active"], "ws_path": f"/ws/{u}"} for u, d in LINKS.items()]
+    return {"panel": "Usf", "version": PANEL_VERSION, "running": SERVICE_RUNNING,
+            "domain": CUSTOM_DOMAIN or get_domain(), "inbounds": inbounds,
+            "clean_addresses": list(CUSTOM_ADDRESSES)}
 
 @app.get("/api/backup")
 async def download_backup(_=Depends(require_auth)):
     async with LINKS_LOCK:
-        links_copy = {uid: dict(d) for uid, d in LINKS.items()}
-    async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
-    backup = {
-        "panel": "Usf",
-        "panel_version": PANEL_VERSION,
-        "core_version": CORE_VERSION,
-        "exported_at": datetime.now().isoformat(),
-        "domain": CUSTOM_DOMAIN,
-        "addresses": addresses,
-        "username": AUTH["username"],
-        "password_hash": AUTH["password_hash"],
-        "links": links_copy,
-    }
+        links_copy = {u: dict(d) for u, d in LINKS.items()}
+    backup = {"panel": "Usf", "version": PANEL_VERSION, "exported_at": datetime.now().isoformat(),
+              "domain": CUSTOM_DOMAIN, "addresses": list(CUSTOM_ADDRESSES),
+              "username": AUTH["username"], "password_hash": AUTH["password_hash"], "links": links_copy}
     content = json.dumps(backup, indent=2)
     fname = f"Usf-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     return Response(content=content, media_type="application/json",
@@ -751,12 +639,11 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
     body = await request.json()
     links = body.get("links")
     if not isinstance(links, dict):
-        raise HTTPException(status_code=400, detail="Invalid backup file")
+        raise HTTPException(400, "Invalid backup")
     async with LINKS_LOCK:
         LINKS.clear()
         for uid, d in links.items():
-            if not isinstance(d, dict):
-                continue
+            if not isinstance(d, dict): continue
             LINKS[uid] = {
                 "label": str(d.get("label", "Restored"))[:60],
                 "limit_bytes": int(d.get("limit_bytes", 0) or 0),
@@ -766,170 +653,102 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 "active": bool(d.get("active", True)),
                 "expiry": d.get("expiry", ""),
                 "speed_limit": int(d.get("speed_limit", 0) or 0),
-                "tag": str(d.get("tag", "")),
-                "note": str(d.get("note", "")),
+                "tag": str(d.get("tag", ""))[:30],
+                "note": str(d.get("note", ""))[:200],
             }
     if isinstance(body.get("addresses"), list):
         async with CUSTOM_ADDRESSES_LOCK:
-            CUSTOM_ADDRESSES.clear()
-            for a in body["addresses"]:
-                if isinstance(a, str) and a:
-                    CUSTOM_ADDRESSES.append(a)
+            CUSTOM_ADDRESSES = [a for a in body["addresses"] if isinstance(a, str) and a]
     if isinstance(body.get("domain"), str):
         async with CUSTOM_DOMAIN_LOCK:
             CUSTOM_DOMAIN = body["domain"]
     return {"ok": True, "restored": len(LINKS)}
 
-# ─── Links/Inbounds CRUD ─────────────────────────────────────────────────────
-
+# ─── Links CRUD ──────────────────────────────────────────────────────────────
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
-    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-        raise HTTPException(status_code=400, detail="Name must contain only English letters, numbers, and: - _ . space")
-    if not label:
-        raise HTTPException(status_code=400, detail="Name is required")
+    if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(400, "Name required. Only English letters, numbers, - _ . space")
     async with LINKS_LOCK:
         if any(d["label"].lower() == label.lower() for d in LINKS.values()):
-            raise HTTPException(status_code=400, detail="A link with this name already exists")
-    limit_value = float(body.get("limit_value") or 0)
-    limit_unit = body.get("limit_unit") or "GB"
-    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-    max_conn = int(body.get("max_connections") or 0)
-    if max_conn < 0:
-        max_conn = 0
-    expiry = compute_expiry(body.get("expiry_days"))
-    speed_limit = int(body.get("speed_limit") or 0)
-    tag = str(body.get("tag") or "")[:30]
-    note = str(body.get("note") or "")[:200]
+            raise HTTPException(400, "Name already exists")
+    lv = float(body.get("limit_value") or 0)
+    lu = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
     uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-            "max_connections": max_conn, "created_at": datetime.now().isoformat(),
-            "active": True, "expiry": expiry, "speed_limit": speed_limit,
-            "tag": tag, "note": note,
+            "max_connections": int(body.get("max_connections") or 0),
+            "created_at": datetime.now().isoformat(), "active": True,
+            "expiry": compute_expiry(body.get("expiry_days")),
+            "speed_limit": int(body.get("speed_limit") or 0),
+            "tag": str(body.get("tag") or "")[:30],
+            "note": str(body.get("note") or "")[:200],
         }
-    return {
-        "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-        "max_connections": max_conn, "active": True, "expiry": expiry,
-        "created_at": LINKS[uid]["created_at"],
-        "vless_link": generate_vless_link(uid, remark=f"{label}"),
-        "speed_limit": speed_limit, "tag": tag,
-    }
+    return {"uuid": uid, "label": label, "ok": True}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
-        for uid, data in LINKS.items():
+        for uid, d in LINKS.items():
+            client_links = generate_all_client_links(uid, d["label"])
             result.append({
-                "uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"],
-                "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0),
-                "active": data["active"], "expiry": data.get("expiry", ""),
-                "expired": is_expired(data), "created_at": data["created_at"],
+                "uuid": uid, "label": d["label"],
+                "limit_bytes": d["limit_bytes"], "used_bytes": d["used_bytes"],
+                "max_connections": d.get("max_connections", 0),
+                "active": d["active"], "expiry": d.get("expiry", ""),
+                "expired": is_expired(d), "created_at": d["created_at"],
                 "current_connections": count_connections_for_link(uid),
-                "vless_link": generate_vless_link(uid, remark=f"{data['label']}"),
-                "speed_limit": data.get("speed_limit", 0),
-                "tag": data.get("tag", ""),
-                "note": data.get("note", ""),
+                "client_links": client_links,
+                "sub_url": client_links["Subscription"],
+                "vless_link": client_links["V2RayN"],
+                "speed_limit": d.get("speed_limit", 0),
+                "tag": d.get("tag", ""), "note": d.get("note", ""),
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
 @app.get("/api/inbounds")
 async def list_inbounds(_=Depends(require_auth)):
-    result = []
-    async with LINKS_LOCK:
-        for uid, data in LINKS.items():
-            result.append({
-                "id": uid, "uuid": uid, "remark": data["label"], "label": data["label"],
-                "protocol": "vless", "enabled": data["active"], "active": data["active"],
-                "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"],
-                "total_flow": data["limit_bytes"] / 1_073_741_824 if data["limit_bytes"] > 0 else 0,
-                "max_connections": data.get("max_connections", 0),
-                "expiry": data.get("expiry", ""), "expired": is_expired(data),
-                "created_at": data["created_at"],
-                "current_connections": count_connections_for_link(uid),
-                "vless_link": generate_vless_link(uid, remark=f"{data['label']}"),
-                "clients": [{"id": uid, "email": data["label"]}],
-                "speed_limit": data.get("speed_limit", 0),
-                "tag": data.get("tag", ""),
-                "note": data.get("note", ""),
-            })
-    result.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"items": result, "total": len(result)}
+    r = (await list_links(_))["links"]
+    for item in r:
+        item["id"] = item["uuid"]
+        item["remark"] = item["label"]
+        item["protocol"] = "vless"
+        item["enabled"] = item["active"]
+        item["total_flow"] = item["limit_bytes"] / 1073741824 if item["limit_bytes"] > 0 else 0
+        item["clients"] = [{"id": item["uuid"], "email": item["label"]}]
+    return {"items": r, "total": len(r)}
 
 @app.patch("/api/inbounds/{uid}")
-async def patch_inbound(uid: str, request: Request, _=Depends(require_auth)):
+@app.patch("/api/links/{uid}")
+async def update_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         if uid not in LINKS:
-            raise HTTPException(status_code=404, detail="inbound not found")
-        if "enabled" in body:
-            LINKS[uid]["active"] = bool(body["enabled"])
-        if "active" in body:
-            LINKS[uid]["active"] = bool(body["active"])
+            raise HTTPException(404, "Not found")
+        d = LINKS[uid]
+        if "active" in body: d["active"] = bool(body["active"])
+        if "enabled" in body: d["active"] = bool(body["enabled"])
         if "limit_value" in body:
             lv = float(body.get("limit_value") or 0)
             lu = body.get("limit_unit") or "GB"
-            LINKS[uid]["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
-        if "reset_usage" in body and body["reset_usage"]:
-            LINKS[uid]["used_bytes"] = 0
-        if "expiry_days" in body:
-            LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
-        if "label" in body:
-            LINKS[uid]["label"] = str(body["label"])[:60]
-        if "remark" in body:
-            LINKS[uid]["label"] = str(body["remark"])[:60]
-        if "max_connections" in body:
-            mc = int(body["max_connections"] or 0)
-            LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
-        if "speed_limit" in body:
-            LINKS[uid]["speed_limit"] = int(body["speed_limit"] or 0)
-        if "tag" in body:
-            LINKS[uid]["tag"] = str(body.get("tag", ""))[:30]
-        if "note" in body:
-            LINKS[uid]["note"] = str(body.get("note", ""))[:200]
+            d["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+        if body.get("reset_usage"): d["used_bytes"] = 0
+        if "expiry_days" in body: d["expiry"] = compute_expiry(body.get("expiry_days"))
+        if "label" in body: d["label"] = str(body["label"])[:60]
+        if "remark" in body: d["label"] = str(body["remark"])[:60]
+        if "max_connections" in body: d["max_connections"] = max(int(body["max_connections"] or 0), 0)
+        if "speed_limit" in body: d["speed_limit"] = int(body["speed_limit"] or 0)
+        if "tag" in body: d["tag"] = str(body.get("tag", ""))[:30]
+        if "note" in body: d["note"] = str(body.get("note", ""))[:200]
     return {"ok": True}
 
 @app.delete("/api/inbounds/{uid}")
-async def delete_inbound(uid: str, _=Depends(require_auth)):
-    async with LINKS_LOCK:
-        LINKS.pop(uid, None)
-    await close_connections_for_link(uid)
-    return {"ok": True}
-
-@app.patch("/api/links/{uid}")
-async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    async with LINKS_LOCK:
-        if uid not in LINKS:
-            raise HTTPException(status_code=404, detail="link not found")
-        if "active" in body:
-            LINKS[uid]["active"] = bool(body["active"])
-        if "limit_value" in body:
-            limit_value = float(body.get("limit_value") or 0)
-            limit_unit = body.get("limit_unit") or "GB"
-            LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-        if "reset_usage" in body and body["reset_usage"]:
-            LINKS[uid]["used_bytes"] = 0
-        if "expiry_days" in body:
-            LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
-        if "label" in body:
-            LINKS[uid]["label"] = str(body["label"])[:60]
-        if "max_connections" in body:
-            mc = int(body["max_connections"] or 0)
-            LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
-        if "speed_limit" in body:
-            LINKS[uid]["speed_limit"] = int(body["speed_limit"] or 0)
-        if "tag" in body:
-            LINKS[uid]["tag"] = str(body.get("tag", ""))[:30]
-        if "note" in body:
-            LINKS[uid]["note"] = str(body.get("note", ""))[:200]
-    return {"ok": True}
-
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
@@ -938,42 +757,33 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     return {"ok": True}
 
 # ─── Domain & Addresses ──────────────────────────────────────────────────────
-
 @app.get("/api/domain")
-async def get_custom_domain(_=Depends(require_auth)):
-    async with CUSTOM_DOMAIN_LOCK:
-        return {"domain": CUSTOM_DOMAIN}
+async def get_domain_api(_=Depends(require_auth)):
+    return {"domain": CUSTOM_DOMAIN}
 
 @app.post("/api/domain")
-async def set_custom_domain(request: Request, _=Depends(require_auth)):
+async def set_domain(request: Request, _=Depends(require_auth)):
+    global CUSTOM_DOMAIN
     body = await request.json()
-    domain = (body.get("domain") or "").strip().lower()
-    if domain:
-        domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
-        if not re.match(r'^[a-z0-9\-_.]+$', domain):
-            raise HTTPException(status_code=400, detail="Invalid domain format")
+    d = (body.get("domain") or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
+    if d and not re.match(r'^[a-z0-9\-_.]+$', d):
+        raise HTTPException(400, "Invalid domain")
     async with CUSTOM_DOMAIN_LOCK:
-        global CUSTOM_DOMAIN
-        CUSTOM_DOMAIN = domain
-    return {"ok": True, "domain": CUSTOM_DOMAIN}
+        CUSTOM_DOMAIN = d
+    return {"ok": True}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    async with CUSTOM_ADDRESSES_LOCK:
-        return {"addresses": list(CUSTOM_ADDRESSES)}
+    return {"addresses": list(CUSTOM_ADDRESSES)}
 
 @app.post("/api/addresses")
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    address = (body.get("address") or "").strip()
-    if not address:
-        raise HTTPException(status_code=400, detail="Address is required")
-    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
-        raise HTTPException(status_code=400, detail="Invalid address format")
+    a = (body.get("address") or "").strip()
+    if not a: raise HTTPException(400, "Address required")
     async with CUSTOM_ADDRESSES_LOCK:
-        if address in CUSTOM_ADDRESSES:
-            raise HTTPException(status_code=400, detail="Address already exists")
-        CUSTOM_ADDRESSES.append(address)
+        if a in CUSTOM_ADDRESSES: raise HTTPException(400, "Already exists")
+        CUSTOM_ADDRESSES.append(a)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
@@ -982,288 +792,230 @@ async def delete_address(index: int, _=Depends(require_auth)):
         if 0 <= index < len(CUSTOM_ADDRESSES):
             CUSTOM_ADDRESSES.pop(index)
         else:
-            raise HTTPException(status_code=404, detail="Address not found")
-    return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+            raise HTTPException(404, "Not found")
+    return {"ok": True}
 
-# ─── Subscription ─────────────────────────────────────────────────────────────
-
+# ─── Subscription ────────────────────────────────────────────────────────────
 @app.get("/api/links/{uid}/sub")
-async def get_subscription(uid: str, _=Depends(require_auth)):
+async def get_sub_info(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None:
-            raise HTTPException(status_code=404, detail="link not found")
-    vless_link = generate_vless_link(uid, remark=f"{link['label']}")
-    used = link["used_bytes"]
-    limit = link["limit_bytes"]
-    used_mb = round(used / (1024 * 1024), 2)
-    limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
-    pct = round((used / limit) * 100, 1) if limit > 0 else 0
-    remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
-    sub_content = f"vless://{uid}@{get_domain()}:443?encryption=none&security=tls&type=ws&host={get_domain()}&path=/ws/{uid}&sni={get_domain()}&fp=chrome&alpn=h2,http/1.1#{link['label']}"
-    encoded = base64.b64encode(sub_content.encode()).decode()
+        if not link: raise HTTPException(404, "Not found")
     return {
-        "subscription_url": f"https://{get_domain()}/sub/{uid}",
-        "config": vless_link,
+        "client_links": generate_all_client_links(uid, link["label"]),
+        "used_bytes": link["used_bytes"], "limit_bytes": link["limit_bytes"],
+        "used_mb": round(link["used_bytes"] / 1048576, 2),
+        "limit_mb": round(link["limit_bytes"] / 1048576, 2) if link["limit_bytes"] > 0 else 0,
+        "remaining_mb": round((link["limit_bytes"] - link["used_bytes"]) / 1048576, 2) if link["limit_bytes"] > 0 else 0,
+        "usage_percent": round((link["used_bytes"] / link["limit_bytes"]) * 100, 1) if link["limit_bytes"] > 0 else 0,
+        "active": link["active"], "expired": is_expired(link),
+        "expiry": link.get("expiry", ""),
         "label": link["label"],
-        "used_bytes": used, "limit_bytes": limit,
-        "used_mb": used_mb, "limit_mb": limit_mb,
-        "remaining_mb": remaining_mb, "usage_percent": pct,
-        "active": link["active"],
-        "sub_base64": encoded, "sub_text": sub_content,
+        "sub_url": f"https://{get_domain()}/sub/{uid}",
+        "speed_limit": link.get("speed_limit", 0),
+        "current_connections": count_connections_for_link(uid),
     }
 
 @app.get("/sub/{uid}")
-async def subscription_endpoint(uid: str):
+async def sub_endpoint(uid: str):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None:
-            raise HTTPException(status_code=404, detail="link not found")
-    if not link["active"]:
-        raise HTTPException(status_code=403, detail="link disabled")
-    if is_expired(link):
-        raise HTTPException(status_code=403, detail="link expired")
+        if not link: raise HTTPException(404, "Not found")
+    if not link["active"]: raise HTTPException(403, "Disabled")
+    if is_expired(link): raise HTTPException(403, "Expired")
     async with CUSTOM_ADDRESSES_LOCK:
-        addresses = list(CUSTOM_ADDRESSES)
-    sub_links = []
-    server_link = generate_vless_link(uid, remark=f"{link['label']}-Server")
-    sub_links.append(server_link)
-    for i, addr in enumerate(addresses):
-        remark = f"{link['label']}-IP{i+1}"
-        vless_link = generate_vless_link(uid, remark=remark, address=addr)
-        sub_links.append(vless_link)
-    sub_content = "\n".join(sub_links)
-    encoded = base64.b64encode(sub_content.encode()).decode()
-    headers = {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Content-Disposition": "attachment; filename=\"sub.txt\"",
-        "profile-update-interval": "6",
-        "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
-        "profile-title": f"{link['label']}",
-    }
-    return Response(content=encoded, headers=headers)
+        addrs = list(CUSTOM_ADDRESSES)
+    links_list = [generate_vless_link(uid, remark=f"{link['label']}-Server")]
+    for i, a in enumerate(addrs):
+        links_list.append(generate_vless_link(uid, remark=f"{link['label']}-IP{i+1}", address=a))
+    encoded = base64.b64encode("\n".join(links_list).encode()).decode()
+    return Response(
+        content=encoded,
+        headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Disposition": "attachment; filename=\"sub.txt\"",
+            "profile-update-interval": "6",
+            "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
+            "profile-title": link["label"],
+        }
+    )
 
-# ─── Panel Builder API ────────────────────────────────────────────────────────
-
+# ─── Panel Builder ───────────────────────────────────────────────────────────
 @app.post("/api/panel-builder/deploy")
 async def panel_builder_deploy(request: Request, _=Depends(require_auth)):
-    """Deploy a new USF panel to the user's HuggingFace Space."""
     try:
-        from huggingface_hub import HfApi, SpaceHardware
+        from huggingface_hub import HfApi
     except ImportError:
-        raise HTTPException(status_code=500, detail="huggingface_hub not installed on this Space")
-
+        raise HTTPException(500, "huggingface_hub not installed. Install it: pip install huggingface_hub")
     body = await request.json()
-    hf_token = (body.get("hf_token") or "").strip()
-    space_name = (body.get("space_name") or "").strip().lower()
+    token = (body.get("hf_token") or "").strip()
+    space = (body.get("space_name") or "").strip().lower()
     admin_user = (body.get("admin_username") or "admin").strip()[:30]
     admin_pass = (body.get("admin_password") or "admin").strip()
-    secret_key = secrets.token_urlsafe(32)
-
-    if not hf_token:
-        raise HTTPException(status_code=400, detail="HuggingFace token is required")
-    if not space_name or not re.match(r'^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$', space_name):
-        raise HTTPException(status_code=400, detail="Invalid space name (lowercase, alphanumeric, hyphens)")
-    if len(admin_pass) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-
+    if not token: raise HTTPException(400, "HF token required")
+    if not space or not re.match(r'^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$', space):
+        raise HTTPException(400, "Invalid space name")
+    if len(admin_pass) < 4: raise HTTPException(400, "Password min 4 chars")
     try:
-        api = HfApi(token=hf_token)
-        repo_id = f"{api.whoami()['name']}/{space_name}"
-
-        # Read current app.py as template
+        api = HfApi(token=token)
+        me = api.whoami()
+        repo_id = f"{me['name']}/{space}"
         import inspect
-        caller_file = inspect.getfile(lambda: None)
-        with open(caller_file, 'r', encoding='utf-8') as f:
-            app_code = f.read()
-
-        dockerfile = """FROM python:3.11-slim
-RUN pip install --no-cache-dir fastapi uvicorn httpx psutil httptools uvloop orjson huggingface_hub
+        app_file = inspect.getfile(lambda: None)
+        with open(app_file, 'r') as f:
+            code = f.read()
+        # Replace default secret with new one
+        new_secret = secrets.token_urlsafe(32)
+        code = code.replace("usf-default-secret-key-change-me", new_secret)
+        dockerfile = f"""FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 EXPOSE 7860
-CMD ["python", "app.py"]
+ENV ADMIN_USERNAME={admin_user}
+ENV ADMIN_PASSWORD={admin_pass}
+ENV SECRET_KEY={new_secret}
+CMD ["python", "-c", "import uvicorn; uvicorn.run('app:app', host='0.0.0.0', port=7860, log_level='info', access_log=False)"]
 """
-        readme = f"""---
-title: "{space_name}"
-sdk: docker
-app_port: 7860
----
-"""
+        reqs = "fastapi>=0.115.0\nuvicorn>=0.30.0\nhttpx>=0.27.0\npsutil>=5.9.0\n"
+        readme = f"---\ntitle: {space}\nsdk: docker\napp_port: 7860\n---\n"
         api.create_repo(repo_id=repo_id, repo_type="space", exist_ok=True, space_sdk="docker")
-        api.upload_file(
-            path_or_fileobj=app_code.encode('utf-8'),
-            path_in_repo="app.py",
-            repo_id=repo_id,
-            repo_type="space",
-        )
-        api.upload_file(
-            path_or_fileobj=dockerfile.encode('utf-8'),
-            path_in_repo="Dockerfile",
-            repo_id=repo_id,
-            repo_type="space",
-        )
-        api.upload_file(
-            path_or_fileobj=readme.encode('utf-8'),
-            path_in_repo="README.md",
-            repo_id=repo_id,
-            repo_type="space",
-        )
-
-        return {
-            "ok": True,
-            "space_url": f"https://huggingface.co/spaces/{repo_id}",
-            "app_url": f"https://{repo_id.split('/')[1]}.hf.space",
-            "repo_id": repo_id,
-        }
+        for fname, content in [("app.py", code.encode()), ("Dockerfile", dockerfile.encode()),
+                                ("requirements.txt", reqs.encode()), ("README.md", readme.encode())]:
+            api.upload_file(path_or_fileobj=content, path_in_repo=fname, repo_id=repo_id, repo_type="space")
+        return {"ok": True, "space_url": f"https://huggingface.co/spaces/{repo_id}",
+                "app_url": f"https://{repo_id.split('/')[1]}.hf.space", "repo_id": repo_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
-#  USF Panel v2.0.0 — WebSocket Tunnel (unchanged core)
-# ============================================================
-
+# ─── WebSocket Tunnel ───────────────────────────────────────────────────────
 RELAY_BUF = 512 * 1024
 
-async def parse_vless_header(first_chunk: bytes):
-    if len(first_chunk) < 24:
-        raise ValueError("chunk too small")
-    pos = 0
-    pos += 1; pos += 16
-    addon_len = first_chunk[pos]; pos += 1; pos += addon_len
-    command = first_chunk[pos]; pos += 1
-    port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
-    addr_type = first_chunk[pos]; pos += 1
-    if addr_type == 1:
-        addr_bytes = first_chunk[pos:pos + 4]; pos += 4
-        address = ".".join(str(b) for b in addr_bytes)
-    elif addr_type == 2:
-        domain_len = first_chunk[pos]; pos += 1
-        address = first_chunk[pos:pos + domain_len].decode("utf-8", errors="ignore"); pos += domain_len
-    elif addr_type == 3:
-        addr_bytes = first_chunk[pos:pos + 16]; pos += 16
-        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
+async def parse_vless_header(chunk):
+    if len(chunk) < 24: raise ValueError("too small")
+    p = 0
+    p += 1 + 16  # version + uuid
+    addon_len = chunk[p]; p += 1 + addon_len
+    cmd = chunk[p]; p += 1
+    port = int.from_bytes(chunk[p:p+2], "big"); p += 2
+    atype = chunk[p]; p += 1
+    if atype == 1:
+        addr = ".".join(str(b) for b in chunk[p:p+4]); p += 4
+    elif atype == 2:
+        dl = chunk[p]; p += 1
+        addr = chunk[p:p+dl].decode("utf-8", errors="ignore"); p += dl
+    elif atype == 3:
+        ab = chunk[p:p+16]; p += 16
+        addr = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
     else:
-        raise ValueError(f"unknown address type: {addr_type}")
-    return command, address, port, first_chunk[pos:]
+        raise ValueError(f"unknown addr type: {atype}")
+    return cmd, addr, port, chunk[p:]
 
-async def check_quota(uid: str, extra_bytes: int) -> bool:
+async def check_quota(uid, n):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None: return False
-        if not link["active"]: return False
-        if is_expired(link): return False
+        if not link or not link["active"] or is_expired(link): return False
         if link["limit_bytes"] == 0: return True
-        return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
+        return (link["used_bytes"] + n) <= link["limit_bytes"]
 
-async def add_usage(uid: str, n: int):
+async def add_usage(uid, n):
     async with LINKS_LOCK:
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
 
-async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
+async def ws_to_tcp(ws, writer, cid, uid):
     try:
         while True:
-            msg = await websocket.receive()
+            msg = await ws.receive()
             if msg["type"] == "websocket.disconnect": break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data: continue
-            size = len(data)
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
-            stats["total_bytes"] += size; stats["total_requests"] += 1
-            connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now().strftime("%H:00")] += size
-            await add_usage(link_uid, size)
+            if not await check_quota(uid, len(data)):
+                await ws.close(1008, "quota exceeded"); break
+            stats["total_bytes"] += len(data); stats["total_requests"] += 1
+            connections[cid]["bytes"] += len(data)
+            hourly_traffic[datetime.now().strftime("%H:00")] += len(data)
+            await add_usage(uid, len(data))
             writer.write(data); await writer.drain()
     except WebSocketDisconnect: pass
     finally:
         try: writer.write_eof()
         except: pass
 
-async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
+async def tcp_to_ws(ws, reader, cid, uid):
     first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data: break
-            size = len(data)
-            if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
-            stats["total_bytes"] += size
-            connections[conn_id]["bytes"] += size
-            hourly_traffic[datetime.now().strftime("%H:00")] += size
-            await add_usage(link_uid, size)
-            await websocket.send_bytes((b"\x00\x00" + data) if first else data)
+            if not await check_quota(uid, len(data)):
+                await ws.close(1008, "quota exceeded"); break
+            stats["total_bytes"] += len(data)
+            connections[cid]["bytes"] += len(data)
+            hourly_traffic[datetime.now().strftime("%H:00")] += len(data)
+            await add_usage(uid, len(data))
+            await ws.send_bytes((b"\x00\x00" + data) if first else data)
             first = False
     except: pass
 
-@app.websocket("/ws/{uuid}")
-async def websocket_tunnel(websocket: WebSocket, uuid: str):
+@app.websocket("/ws/{uid}")
+async def ws_tunnel(ws: WebSocket, uid: str):
     await ensure_default_link()
-    await websocket.accept()
+    await ws.accept()
     writer = None
-    conn_id = None
-    client_ip = get_client_ip(websocket)
+    cid = None
+    client_ip = get_client_ip(ws)
     try:
         if not SERVICE_RUNNING:
-            await websocket.close(code=1012, reason="service stopped"); return
+            await ws.close(1012, "stopped"); return
         async with LINKS_LOCK:
-            link_data = LINKS.get(uuid)
-            if link_data is None or not link_data["active"]:
-                await websocket.close(code=1008, reason="link not found or disabled"); return
-            if is_expired(link_data):
-                await websocket.close(code=1008, reason="link expired"); return
-            max_conn = link_data.get("max_connections", 0)
-        if max_conn > 0:
-            already_connected = client_ip in link_ip_map.get(uuid, set())
-            if not already_connected:
-                current = count_connections_for_link(uuid)
-                if current >= max_conn:
-                    await websocket.close(code=1008, reason="connection limit reached"); return
-        first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
+            ld = LINKS.get(uid)
+            if not ld or not ld["active"]:
+                await ws.close(1008, "disabled"); return
+            if is_expired(ld):
+                await ws.close(1008, "expired"); return
+            mc = ld.get("max_connections", 0)
+        if mc > 0:
+            if client_ip not in link_ip_map.get(uid, set()):
+                if count_connections_for_link(uid) >= mc:
+                    await ws.close(1008, "limit reached"); return
+        first_msg = await asyncio.wait_for(ws.receive(), timeout=15)
         if first_msg["type"] == "websocket.disconnect": return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk: return
-        command, address, port, initial_payload = await parse_vless_header(first_chunk)
-        conn_id = secrets.token_urlsafe(8)
-        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
-        connection_sockets[conn_id] = websocket
-        link_ip_map[uuid].add(client_ip)
-
-        # Connection history
+        chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        if not chunk: return
+        cmd, addr, port, payload = await parse_vless_header(chunk)
+        cid = secrets.token_urlsafe(8)
+        connections[cid] = {"uuid": uid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
+        connection_sockets[cid] = ws
+        link_ip_map[uid].add(client_ip)
         async with LINKS_LOCK:
-            link_label = LINKS.get(uuid, {}).get("label", "?")
-        connection_history.append({
-            "time": datetime.now().isoformat(), "uuid": uuid[:8],
-            "label": link_label, "ip": client_ip, "target": f"{address}:{port}",
-        })
-
-        size = len(first_chunk)
-        stats["total_bytes"] += size; stats["total_requests"] += 1
-        connections[conn_id]["bytes"] += size
-        hourly_traffic[datetime.now().strftime("%H:00")] += size
-        await add_usage(uuid, size)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+            lbl = LINKS.get(uid, {}).get("label", "?")
+        connection_history.append({"time": datetime.now().isoformat(), "uuid": uid[:8], "label": lbl, "ip": client_ip, "target": f"{addr}:{port}"})
+        sz = len(chunk)
+        stats["total_bytes"] += sz; stats["total_requests"] += 1
+        connections[cid]["bytes"] += sz
+        hourly_traffic[datetime.now().strftime("%H:00")] += sz
+        await add_usage(uid, sz)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=10)
         try:
             sock = writer.get_extra_info('socket')
-            if sock is not None:
+            if sock:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if initial_payload:
-            p_size = len(initial_payload)
-            stats["total_bytes"] += p_size
-            connections[conn_id]["bytes"] += p_size
-            hourly_traffic[datetime.now().strftime("%H:00")] += p_size
-            await add_usage(uuid, p_size)
-            writer.write(initial_payload); await writer.drain()
-        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
-        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+                except: pass
+        except: pass
+        if payload:
+            psz = len(payload)
+            stats["total_bytes"] += psz; connections[cid]["bytes"] += psz
+            hourly_traffic[datetime.now().strftime("%H:00")] += psz
+            await add_usage(uid, psz)
+            writer.write(payload); await writer.drain()
+        t1 = asyncio.create_task(ws_to_tcp(ws, writer, cid, uid))
+        t2 = asyncio.create_task(tcp_to_ws(ws, reader, cid, uid))
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel()
     except WebSocketDisconnect: pass
     except Exception as exc:
@@ -1273,1117 +1025,1043 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         if writer:
             try: writer.close()
             except: pass
-        if conn_id:
-            info = connections.pop(conn_id, None)
-            connection_sockets.pop(conn_id, None)
+        if cid:
+            info = connections.pop(cid, None)
+            connection_sockets.pop(cid, None)
             if info:
-                uid = info.get("uuid")
-                ip = info.get("ip")
-                if uid and ip:
-                    has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
-                    if not has_other:
-                        remove_ip_from_link(uid, ip)
+                u, ip = info.get("uuid"), info.get("ip")
+                if u and ip and not any(c.get("uuid") == u and c.get("ip") == ip for c in connections.values()):
+                    remove_ip_from_link(u, ip)
 
-#  USF Panel v2.0.0 — Status Page Function
-# ============================================================
-
-STATUS_404_HTML = r'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+# ─── HTML: Status 404 ────────────────────────────────────────────────────────
+STATUS_404 = r'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>لینک نامعتبر</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:system-ui,-apple-system,sans-serif}
-.box{background:rgba(20,27,45,0.7);backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);
-border-radius:24px;padding:48px 36px;text-align:center;max-width:400px;width:100%;
-box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
-.icon{width:56px;height:56px;border-radius:50%;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.2);
-display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
-.icon svg{width:24px;height:24px;stroke:#ef4444;fill:none;stroke-width:2}
+<style>*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:system-ui,sans-serif}
+.box{background:rgba(20,27,45,0.7);backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:24px;padding:48px 36px;text-align:center;max-width:400px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
+.icon{width:56px;height:56px;border-radius:50%;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.2);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:#ef4444;font-size:24px}
 h1{color:#f1f5f9;font-size:18px;margin-bottom:8px;font-weight:700}
-p{color:#94a3b8;font-size:13px;line-height:1.7}
-</style></head><body>
-<div class="box">
-<div class="icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div>
-<h1>لینک نامعتبر است</h1>
-<p>این اشتراک وجود ندارد یا حذف شده است.</p>
-</div></body></html>'''
+p{color:#94a3b8;font-size:13px;line-height:1.7}</style></head><body>
+<div class="box"><div class="icon">&#10005;</div><h1>لینک نامعتبر است</h1><p>این اشتراک وجود ندارد یا حذف شده است.</p></div>
+</body></html>'''
 
-STATUS_HTML_TEMPLATE = r'''<!DOCTYPE html>
+# ─── HTML: Status/Subscription Page ─────────────────────────────────────────
+STATUS_HTML = r'''<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
-<meta name="theme-color" content="#0b0f1a" id="meta-theme">
+<meta name="theme-color" content="#0b0f1a">
 <title>__TITLE__</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{--bg:#0b0f1a;--card:rgba(15,23,42,0.6);--glass:rgba(255,255,255,0.04);--accent:#6366f1;--accent2:#818cf8;
---accent-soft:rgba(99,102,241,0.12);--accent-glow:rgba(99,102,241,0.3);--text:#f1f5f9;--text2:#cbd5e1;
---text3:#94a3b8;--text4:#64748b;--border:rgba(99,102,241,0.18);--border-s:rgba(255,255,255,0.06);
+:root{--bg:#0b0f1a;--card:rgba(15,23,42,0.6);--accent:#6366f1;--accent2:#818cf8;
+--accent-soft:rgba(99,102,241,0.12);--accent-glow:rgba(99,102,241,0.3);
+--text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;
+--border:rgba(99,102,241,0.18);--border-s:rgba(255,255,255,0.06);
 --green:#22c55e;--red:#ef4444;--amber:#f59e0b;--radius:16px}
-html[data-theme="light"]{--bg:#f1f5f9;--card:rgba(255,255,255,0.8);--glass:rgba(0,0,0,0.03);
---text:#0f172a;--text2:#334155;--text3:#64748b;--text4:#94a3b8;--border:rgba(99,102,241,0.25);--border-s:rgba(0,0,0,0.06)}
+html[data-theme="light"]{--bg:#f1f5f9;--card:rgba(255,255,255,0.85);--text:#0f172a;--text2:#334155;--text3:#64748b;--border:rgba(99,102,241,0.25);--border-s:rgba(0,0,0,0.06)}
 html,body{height:100%}
-body{font-family:'Vazirmatn',system-ui,-apple-system,sans-serif;background:var(--bg);
-background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(99,102,241,0.12),transparent 60%),radial-gradient(ellipse 60% 40% at 80% 100%,rgba(139,92,246,0.08),transparent 50%);
-background-attachment:fixed;min-height:100vh;min-height:100dvh;display:flex;justify-content:center;align-items:center;
-padding:20px;color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
-.card{background:var(--card);backdrop-filter:blur(32px) saturate(180%);-webkit-backdrop-filter:blur(32px) saturate(180%);
-max-width:480px;width:100%;padding:28px 24px;border-radius:24px;border:1px solid var(--border);
-box-shadow:0 30px 60px -15px rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.03) inset;
-position:relative;overflow:hidden;animation:cardIn .6s cubic-bezier(.16,1,.3,1)}
-@keyframes cardIn{from{opacity:0;transform:translateY(20px) scale(.97)}to{opacity:1;transform:none}}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-background:linear-gradient(90deg,transparent,var(--accent) 30%,#a78bfa 50%,var(--accent) 70%,transparent);opacity:.6;pointer-events:none}
-.theme-btn{position:absolute;top:14px;left:14px;width:34px;height:34px;border-radius:50%;background:var(--glass);
-border:1px solid var(--border-s);color:var(--text3);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .25s;z-index:2}
-.theme-btn:hover{background:var(--accent-soft);color:var(--accent)}
-.theme-btn svg{width:16px;height:16px}
-.theme-btn .sun{display:none}
-html[data-theme="light"] .theme-btn .sun{display:block}
-html[data-theme="light"] .theme-btn .moon{display:none}
-.header{text-align:center;margin-bottom:20px;position:relative;z-index:1}
-.logo-text{font-size:28px;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--text),var(--accent2));
--webkit-background-clip:text;background-clip:text;color:transparent}
-.label-chip{display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:5px 14px;background:var(--glass);
-border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--text2);max-width:90%;word-break:break-word}
-.status-banner{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 16px;border-radius:var(--radius);
-margin-bottom:18px;font-size:13px;font-weight:600;__STATUS_STYLE__}
-.status-dot{width:8px;height:8px;border-radius:50%;__DOT_STYLE__;animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
-.sub-section{margin:16px 0;padding:16px;background:linear-gradient(135deg,var(--accent-soft),rgba(99,102,241,0.02));
-border:1px solid var(--border);border-radius:var(--radius);position:relative;z-index:1}
-.sec-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);margin-bottom:8px;
-font-weight:700;display:flex;align-items:center;gap:6px}
-.sec-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 2.5s ease-in-out infinite}
-.sub-row{display:flex;align-items:stretch;gap:8px}
-.sub-link{flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:11px;color:var(--accent);text-decoration:none;
-background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-direction:ltr;transition:all .2s;border:1px solid rgba(99,102,241,0.12);display:flex;align-items:center;gap:6px}
-html[data-theme="light"] .sub-link{background:rgba(0,0,0,0.04)}
-.sub-link:hover{background:var(--accent-soft);border-color:rgba(99,102,241,0.35)}
-.btn{border:none;font-family:inherit;font-weight:600;border-radius:10px;cursor:pointer;transition:all .2s;
-display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:12px;padding:10px 14px;white-space:nowrap}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:var(--accent2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
-.client-grid{margin-top:12px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
-.client-chip{display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px;border-radius:10px;
-text-decoration:none;background:var(--glass);border:1px solid var(--border-s);transition:all .2s;
-font-size:9.5px;color:var(--text3);font-weight:600}
-.client-chip:hover{background:var(--accent-soft);border-color:var(--border);color:var(--accent);transform:translateY(-1px)}
-.ci{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;
-font-size:10px;font-weight:800;color:#fff;letter-spacing:-.02em}
-.ci-v2n{background:#5b8def}.ci-v2g{background:#22c55e}.ci-str{background:#ff6b6b}
-.ci-sr{background:#1e293b}.ci-fox{background:#f97316}.ci-bull{background:#8b5cf6}
-.ci-npv{background:#06b6d4}.ci-hid{background:#ec4899}.ci-mah{background:#14b8a6}
-.gauge-section{margin:20px 0;display:flex;flex-direction:column;align-items:center;position:relative;z-index:1}
-.gauge-wrap{position:relative;width:140px;height:140px;margin-bottom:6px}
-.gauge-svg{width:100%;height:100%;transform:rotate(-90deg)}
-.gauge-track{fill:none;stroke:rgba(255,255,255,0.05);stroke-width:8}
-html[data-theme="light"] .gauge-track{stroke:rgba(0,0,0,0.06)}
-.gauge-fill{fill:none;stroke:url(#gGrad);stroke-width:8;stroke-linecap:round;stroke-dasharray:377;stroke-dashoffset:377;
-transition:stroke-dashoffset 1.2s cubic-bezier(.16,1,.3,1);filter:drop-shadow(0 0 6px var(--accent-glow))}
-.gauge-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.gauge-pct{font-size:28px;font-weight:800;color:var(--text);letter-spacing:-.02em;line-height:1}
-.gauge-pct .pct-s{font-size:16px;color:var(--text3);font-weight:600;margin-left:1px}
-.gauge-lbl{font-size:10px;color:var(--text3);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
-.gauge-stats{display:flex;gap:16px;margin-top:6px;flex-wrap:wrap;justify-content:center}
-.gs{text-align:center}
-.gs .gv{font-family:ui-monospace,monospace;font-size:12px;font-weight:700;color:var(--text);direction:ltr}
-.gs .gl{font-size:9px;color:var(--text3);margin-top:1px;text-transform:uppercase;letter-spacing:.05em}
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0;position:relative;z-index:1}
-.info-card{background:var(--glass);border:1px solid var(--border-s);border-radius:12px;padding:11px 12px;transition:all .2s}
-.info-card:hover{background:var(--accent-soft);border-color:var(--border)}
-.info-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin-bottom:3px;font-weight:700}
-.info-val{font-size:13px;color:var(--text);font-weight:700;direction:ltr;unicode-bidi:embed}
-.info-val.sm{font-size:11px}
-.config-sec{margin-top:14px;position:relative;z-index:1}
-.config-box{background:rgba(0,0,0,0.35);border:1px solid var(--border-s);border-radius:10px;padding:10px 12px;
-font-family:ui-monospace,monospace;font-size:10.5px;color:var(--text2);word-break:break-all;direction:ltr;
-text-align:left;max-height:72px;overflow-y:auto;line-height:1.5}
-html[data-theme="light"] .config-box{background:rgba(0,0,0,0.03)}
-.config-box::-webkit-scrollbar{width:4px}
-.config-box::-webkit-scrollbar-thumb{background:rgba(99,102,241,0.3);border-radius:2px}
-.btn-row{display:flex;gap:6px;margin-top:6px}
-.btn-row .btn{flex:1}
-.btn-ghost{background:var(--glass);color:var(--text2);border:1px solid var(--border-s)}
-.btn-ghost:hover{border-color:var(--border);color:var(--text)}
-.footer{text-align:center;font-size:10px;color:var(--text4);margin-top:18px;padding-top:14px;
-border-top:1px solid var(--border-s);display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;position:relative;z-index:1}
-.badge{background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);
-background:rgba(15,23,42,0.95);backdrop-filter:blur(16px);color:#fff;padding:11px 20px;border-radius:999px;
-font-size:12px;font-weight:500;border:1px solid var(--border);box-shadow:0 14px 36px rgba(0,0,0,0.5);
-opacity:0;transition:all .4s cubic-bezier(.4,0,.2,1);z-index:1000;pointer-events:none;max-width:90vw}
-html[data-theme="light"] .toast{background:rgba(15,23,42,0.92)}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.countdown{font-family:ui-monospace,monospace;font-weight:700;color:var(--text);direction:ltr}
-@media(max-width:560px){body{padding:0;align-items:flex-start}
-.card{border-radius:0;min-height:100vh;min-height:100dvh;padding:24px 16px;padding-top:max(24px,env(safe-area-inset-top));padding-bottom:max(24px,env(safe-area-inset-bottom))}
-.info-grid{grid-template-columns:1fr 1fr;gap:6px}.sub-row{flex-direction:column}.sub-link{width:100%}
-.logo-text{font-size:24px}.gauge-wrap{width:120px;height:120px}.gauge-pct{font-size:24px}}
-@media(max-width:380px){.info-grid{grid-template-columns:1fr}.client-grid{grid-template-columns:repeat(2,1fr)}}
+body{font-family:'Vazirmatn',system-ui,sans-serif;font-size:16px;line-height:1.7;color:var(--text);background:var(--bg);display:flex;align-items:center;justify-content:center;padding:16px;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);overflow-y:auto}
+.orbs{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.orb{position:absolute;border-radius:50%;filter:blur(100px);opacity:.18;animation:orb-float 20s ease-in-out infinite}
+.orb-1{width:340px;height:340px;background:#6366f1;top:-80px;right:-60px}
+.orb-2{width:280px;height:280px;background:#06b6d4;bottom:-60px;left:-40px;animation-delay:-7s}
+.orb-3{width:200px;height:200px;background:#8b5cf6;top:50%;left:50%;transform:translate(-50%,-50%);animation-delay:-14s}
+@keyframes orb-float{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-20px) scale(1.05)}66%{transform:translate(-20px,15px) scale(.95)}}
+.card{position:relative;z-index:1;background:var(--card);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius);padding:32px 24px;max-width:420px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.4)}
+@media(min-width:480px){.card{padding:40px 32px}}
+.header{text-align:center;margin-bottom:24px}
+.logo{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;font-size:28px;font-weight:800;color:#fff;box-shadow:0 0 30px var(--accent-glow)}
+.header h1{font-size:20px;font-weight:700;margin-bottom:4px}
+.header .sub{color:var(--text3);font-size:13px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:4px 14px;border-radius:20px;font-size:12px;font-weight:600;margin:8px 0 16px}
+.badge-active{background:rgba(34,197,94,0.12);color:#22c55e;border:1px solid rgba(34,197,94,0.2)}
+.badge-expired{background:rgba(239,68,68,0.12);color:#ef4444;border:1px solid rgba(239,68,68,0.2)}
+.badge-disabled{background:rgba(100,116,139,0.12);color:#94a3b8;border:1px solid rgba(100,116,139,0.2)}
+.badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.gauge-wrap{display:flex;justify-content:center;margin:20px 0}
+.gauge{position:relative;width:180px;height:100px;overflow:visible}
+.gauge svg{width:100%;height:100%}
+.gauge-bg{fill:none;stroke:var(--border-s);stroke-width:12;stroke-linecap:round}
+.gauge-fill{fill:none;stroke:url(#gaugeGrad);stroke-width:12;stroke-linecap:round;transition:stroke-dashoffset 1.4s cubic-bezier(.4,0,.2,1)}
+.gauge-text{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;bottom:-8px}
+.gauge-pct{font-size:32px;font-weight:800;background:linear-gradient(135deg,#6366f1,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.gauge-label{font-size:11px;color:var(--text3);margin-top:-2px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:20px 0}
+.stat{background:var(--border-s);border-radius:12px;padding:12px;text-align:center}
+.stat-val{font-size:16px;font-weight:700;color:var(--text)}
+.stat-lbl{font-size:11px;color:var(--text3);margin-top:2px}
+.info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border-s);font-size:13px}
+.info-row:last-child{border:none}
+.info-label{color:var(--text3)}
+.info-value{color:var(--text);font-weight:600;direction:ltr;text-align:left}
+.section-title{font-size:14px;font-weight:700;margin:20px 0 12px;color:var(--text2)}
+.sub-url{display:flex;align-items:center;gap:8px;background:var(--border-s);border-radius:12px;padding:10px 14px;margin-bottom:16px;cursor:pointer;transition:all .2s;border:1px solid transparent}
+.sub-url:hover{border-color:var(--border)}
+.sub-url span{flex:1;font-size:12px;color:var(--text2);direction:ltr;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub-url .copy-btn{background:var(--accent-soft);color:var(--accent);border:none;border-radius:8px;padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}
+.sub-url .copy-btn:hover{background:var(--accent);color:#fff}
+.clients{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.client-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 8px;border-radius:12px;border:1px solid var(--border-s);background:var(--border-s);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;text-decoration:none;font-family:inherit}
+.client-btn:hover{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);transform:translateY(-1px);box-shadow:0 4px 12px rgba(99,102,241,0.15)}
+.client-btn .c-icon{font-size:16px}
+.theme-toggle{position:fixed;top:16px;left:16px;z-index:10;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 10px;cursor:pointer;color:var(--text);font-size:16px;backdrop-filter:blur(12px);transition:all .2s}
+.theme-toggle:hover{border-color:var(--accent)}
+.countdown{font-size:13px;color:var(--text3);text-align:center;margin:8px 0}
+.countdown span{color:var(--amber);font-weight:700}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--accent);color:#fff;padding:10px 24px;border-radius:12px;font-size:13px;font-weight:600;z-index:100;opacity:0;transition:all .3s ease;font-family:inherit}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 </style>
 </head>
 <body>
+<div class="orbs"><div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div></div>
+<button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">&#9790;</button>
 <div class="card">
-  <button class="theme-btn" onclick="toggleTheme()">
-    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-  </button>
   <div class="header">
-    <div class="logo-text">Usf</div>
-    <div class="label-chip">__LABEL__</div>
+    <div class="logo">U</div>
+    <h1>__LABEL__</h1>
+    <div class="sub">__DOMAIN__</div>
+    <div id="badge"></div>
   </div>
-  <div class="status-banner">
-    <span class="status-dot"></span>
-    __STATUS_TEXT__
-  </div>
-  <div class="sub-section">
-    <div class="sec-label"><span class="sec-dot"></span>لینک اشتراک</div>
-    <div class="sub-row">
-      <a href="__SUB_URL__" class="sub-link" target="_blank" title="__SUB_URL__">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-        <span>__SUB_URL__</span>
-      </a>
-      <button class="btn btn-primary" onclick="copySub()">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        کپی
-      </button>
-    </div>
-    <div class="client-grid">
-      <a class="client-chip" href="v2rayn://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2n">N</span><span>V2RayN</span></a>
-      <a class="client-chip" href="v2rayng://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2g">G</span><span>V2RayNG</span></a>
-      <a class="client-chip" href="streisand://import/__SUB_URL_ENC__"><span class="ci ci-str">S</span><span>Streisand</span></a>
-      <a class="client-chip" href="shadowrocket://add/sub://__SUB_URL_B64__"><span class="ci ci-sr">SR</span><span>Shadowrocket</span></a>
-      <a class="client-chip" href="foxray://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-fox">F</span><span>Foxray</span></a>
-      <a class="client-chip" href="npv://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-npv">N</span><span>Npv</span></a>
-      <a class="client-chip" href="hiddify://import/__SUB_URL_ENC__"><span class="ci ci-hid">H</span><span>Hiddify</span></a>
-      <a class="client-chip" href="mahsa://import/__SUB_URL_ENC__"><span class="ci ci-mah">M</span><span>Mahsang</span></a>
-      <a class="client-chip" href="bullshit://install/__SUB_URL_ENC__"><span class="ci ci-bull">B</span><span>BS Client</span></a>
-    </div>
-  </div>
-  <div class="gauge-section">
-    <div class="gauge-wrap">
-      <svg class="gauge-svg" viewBox="0 0 140 140">
-        <defs><linearGradient id="gGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#22c55e"/><stop offset="50%" stop-color="#6366f1"/><stop offset="100%" stop-color="#ef4444"/>
+  <div class="countdown" id="countdown" style="display:none"></div>
+  <div class="gauge-wrap" id="gaugeWrap">
+    <div class="gauge">
+      <svg viewBox="0 0 200 110">
+        <defs><linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" style="stop-color:#6366f1"/><stop offset="100%" style="stop-color:#06b6d4"/>
         </linearGradient></defs>
-        <circle class="gauge-track" cx="70" cy="70" r="60"/>
-        <circle class="gauge-fill" id="gf" cx="70" cy="70" r="60"/>
+        <path class="gauge-bg" d="M 20 100 A 80 80 0 0 1 180 100"/>
+        <path class="gauge-fill" id="gaugeFill" d="M 20 100 A 80 80 0 0 1 180 100"
+              stroke-dasharray="251.3" stroke-dashoffset="251.3"/>
       </svg>
-      <div class="gauge-center">
-        <div class="gauge-pct"><span id="pn">0</span><span class="pct-s">%</span></div>
-        <div class="gauge-lbl">مصرف حجم</div>
+      <div class="gauge-text">
+        <div class="gauge-pct" id="gaugePct">0%</div>
+        <div class="gauge-label">مصرف حجم</div>
       </div>
     </div>
-    <div class="gauge-stats">
-      <div class="gs"><div class="gv">__USED__</div><div class="gl">مصرف‌شده</div></div>
-      <div class="gs"><div class="gv">__REMAIN__</div><div class="gl">باقی‌مانده</div></div>
-      <div class="gs"><div class="gv">__LIMIT__</div><div class="gl">کل سهمیه</div></div>
-    </div>
   </div>
-  <div class="info-grid">
-    <div class="info-card"><div class="info-lbl">اتصال همزمان</div><div class="info-val">__MAXCONN__</div></div>
-    <div class="info-card"><div class="info-lbl">تاریخ انقضا</div><div class="info-val sm">__EXPIRY__</div></div>
-    <div class="info-card" style="grid-column:1/-1"><div class="info-lbl">زمان باقی‌مانده</div><div class="info-val countdown" id="cd" data-exp="__EXP_EPOCH__">__REMAIN_TIME__</div></div>
+  <div class="stats">
+    <div class="stat"><div class="stat-val" id="sUsed">-</div><div class="stat-lbl">مصرف شده</div></div>
+    <div class="stat"><div class="stat-val" id="sRemain">-</div><div class="stat-lbl">باقیمانده</div></div>
+    <div class="stat"><div class="stat-val" id="sTotal">-</div><div class="stat-lbl">کل حجم</div></div>
+    <div class="stat"><div class="stat-val" id="sConns">0</div><div class="stat-lbl">اتصال فعال</div></div>
   </div>
-  <div class="config-sec">
-    <div class="sec-label" style="margin-bottom:6px">کانفیگ VLESS</div>
-    <div class="config-box" id="cfg">__VLESS__</div>
-    <div class="btn-row">
-      <button class="btn btn-primary" onclick="copyCfg()">کپی کانفیگ</button>
-      <button class="btn btn-ghost" onclick="dlCfg()">دانلود</button>
-    </div>
+  <div class="section-title">لینک اشتراک</div>
+  <div class="sub-url" onclick="copySub()">
+    <span id="subUrlText">-</span>
+    <button class="copy-btn">کپی</button>
   </div>
-  <div class="footer">
-    <span class="badge">Usf __VERSION__</span>
-    <span style="color:__STATUS_COLOR__;font-weight:600">__STATUS_TEXT__</span>
-  </div>
+  <div class="section-title">نصب سریع</div>
+  <div class="clients" id="clientBtns"></div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-var SU="__SUB_URL_JSON__",VL="__VLESS_JSON__",PC=__PCT_NUM__;
-function applyTheme(t){document.documentElement.setAttribute('data-theme',t);try{localStorage.setItem('usf-t',t)}catch(e){}}
-function toggleTheme(){var c=document.documentElement.getAttribute('data-theme')||'dark';applyTheme(c==='dark'?'light':'dark')}
-(function(){var s;try{s=localStorage.getItem('usf-t')}catch(e){}if(!s){s=window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark'}applyTheme(s)})();
-(function(){var f=document.getElementById('gf'),p=document.getElementById('pn'),C=2*Math.PI*60,t=Math.max(0,Math.min(100,PC)),st=null;
-function step(ts){if(!st)st=ts;var pr=Math.min(1,(ts-st)/1200),e=1-Math.pow(1-pr,3);f.style.strokeDashoffset=(C*(1-t*e/100)).toFixed(2);p.textContent=Math.round(t*e);if(pr<1)requestAnimationFrame(step)}requestAnimationFrame(step)})();
-(function(){var el=document.getElementById('cd');if(!el)return;var exp=parseInt(el.dataset.exp,10);if(!exp)return;
-function tick(){var d=exp-Math.floor(Date.now()/1000);if(d<=0){el.textContent='منقضی شده';el.style.color='var(--red)';return}
-var dd=Math.floor(d/86400),h=Math.floor((d%86400)/3600),m=Math.floor((d%3600)/60),s=d%60,txt='';if(dd>0)txt+=dd+' روز و ';
-txt+=(h<10?'0':'')+h+':';txt+=(m<10?'0':'')+m+':';txt+=(s<10?'0':'')+s;el.textContent=txt}tick();setInterval(tick,1000)})();
-function copySub(){navigator.clipboard.writeText(SU).then(function(){showToast('لینک اشتراک کپی شد')}).catch(function(){showToast('کپی ناموفق',true)})}
-function copyCfg(){navigator.clipboard.writeText(VL).then(function(){showToast('کانفیگ کپی شد')}).catch(function(){showToast('کپی ناموفق',true)})}
-function dlCfg(){try{var b=new Blob([VL],{type:'text/plain;charset=utf-8'}),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='__LABEL_SAFE__.txt';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(u);showToast('دانلود شد')}catch(e){showToast('خطا',true)}}
-var _tt;function showToast(m,e){var t=document.getElementById('toast');t.textContent=m;t.style.borderColor=e?'rgba(239,68,68,0.4)':'var(--border)';t.classList.add('show');clearTimeout(_tt);_tt=setTimeout(function(){t.classList.remove('show')},2500)}
+const D=__DATA__;
+document.title=D.label+' — Usf';
+// Badge
+const b=document.getElementById('badge');
+if(!D.active){b.innerHTML='<span class="badge badge-disabled"><span class="dot"></span>غیرفعال</span>'}
+else if(D.expired){b.innerHTML='<span class="badge badge-expired"><span class="dot"></span>منقضی</span>'}
+else{b.innerHTML='<span class="badge badge-active"><span class="dot"></span>فعال</span>'}
+// Gauge
+const pct=D.usage_percent||0;
+const circ=251.3;
+setTimeout(()=>{document.getElementById('gaugeFill').style.strokeDashoffset=circ-(circ*Math.min(pct,100)/100);document.getElementById('gaugePct').textContent=Math.round(pct)+'%'},100);
+// Stats
+document.getElementById('sUsed').textContent=D.used_mb+' MB';
+document.getElementById('sRemain').textContent=D.limit_bytes>0?D.remaining_mb+' MB':'نامحدود';
+document.getElementById('sTotal').textContent=D.limit_bytes>0?D.limit_mb+' MB':'نامحدود';
+document.getElementById('sConns').textContent=D.current_connections||0;
+// Sub URL
+document.getElementById('subUrlText').textContent=D.sub_url;
+function copySub(){navigator.clipboard.writeText(D.sub_url);showToast('کپی شد!')}
+// Client buttons
+const clients=D.client_links||{};
+const btns=document.getElementById('clientBtns');
+const order=['V2RayN','V2RayNG','Streisand','Shadowrocket','Foxray','Nekoray','BS Client','Npv Tunnel','Hiddify','Mahsang'];
+order.forEach(name=>{
+  if(!clients[name])return;
+  const a=document.createElement('a');
+  a.className='client-btn';
+  a.href=clients[name];
+  a.target='_blank';
+  a.rel='noopener';
+  a.innerHTML='<span class="c-icon">&#128279;</span>'+name;
+  btns.appendChild(a);
+});
+// Countdown
+if(D.expiry&&D.expiry!==''){
+  const cd=document.getElementById('countdown');
+  cd.style.display='block';
+  function updateCD(){
+    const left=new Date(D.expiry)-Date.now();
+    if(left<=0){cd.innerHTML='منقضی شده';return}
+    const d=Math.floor(left/86400000),h=Math.floor((left%86400000)/3600000),m=Math.floor((left%3600000)/60000),s=Math.floor((left%60000)/1000);
+    let t='';
+    if(d>0)t+=d+' روز ';
+    if(h>0)t+=h+' ساعت ';
+    t+=m+' دقیقه '+s+' ثانیه';
+    cd.innerHTML='مهلت باقیمانده: <span>'+t+'</span>';
+  }
+  updateCD();setInterval(updateCD,1000);
+}
+// Theme
+function toggleTheme(){
+  const t=document.documentElement.getAttribute('data-theme')==='light'?'dark':'light';
+  document.documentElement.setAttribute('data-theme',t);
+  localStorage.setItem('theme',t);
+  document.getElementById('themeBtn').innerHTML=t==='dark'?'&#9790;':'&#9728;';
+}
+(function(){const s=localStorage.getItem('theme');if(s){document.documentElement.setAttribute('data-theme',s);document.getElementById('themeBtn').innerHTML=s==='dark'?'&#9790;':'&#9728;'}else if(window.matchMedia('(prefers-color-scheme:light)').matches){document.documentElement.setAttribute('data-theme','light');document.getElementById('themeBtn').innerHTML='&#9728;'}})();
+// Toast
+function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
 </script>
 </body></html>'''
 
-
-@app.get("/status/{uuid}", response_class=HTMLResponse)
-async def subscription_status(uuid: str):
-    async with LINKS_LOCK:
-        link_data = LINKS.get(uuid)
-        if link_data is None:
-            return HTMLResponse(content=STATUS_404_HTML, status_code=404)
-
-    used_bytes = int(link_data.get("used_bytes", 0))
-    limit_bytes = int(link_data.get("limit_bytes", 0))
-    remaining_bytes = max(0, limit_bytes - used_bytes) if limit_bytes > 0 else 0
-    _domain = get_domain()
-    sub_url = f"https://{_domain}/sub/{uuid}" if _domain and _domain != "localhost" else f"/sub/{uuid}"
-    percent = min(100, (used_bytes / limit_bytes) * 100) if limit_bytes > 0 else 0
-
-    used_str = fmt_bytes(used_bytes)
-    limit_str = fmt_bytes(limit_bytes) if limit_bytes > 0 else "نامحدود"
-    remaining_str = fmt_bytes(remaining_bytes) if limit_bytes > 0 else "نامحدود"
-
-    expiry_raw = link_data.get('expiry', '')
-    expiry_display = "نامحدود"
-    expiry_epoch_val = 0
-    if expiry_raw:
-        try:
-            exp_dt = datetime.fromisoformat(expiry_raw)
-            expiry_epoch_val = int(exp_dt.timestamp())
-            expiry_display = exp_dt.strftime('%Y-%m-%d')
-        except (TypeError, ValueError):
-            expiry_raw = ''
-
-    label = link_data.get('label', 'بدون نام')
-    max_conn = link_data.get('max_connections', 0)
-    is_active = bool(link_data.get('active', False))
-    is_exp = is_expired(link_data)
-    status_text = 'فعال' if (is_active and not is_exp) else ('منقضی' if is_exp else 'غیرفعال')
-    status_color = '#22c55e' if (is_active and not is_exp) else ('#ef4444' if is_exp else '#f59e0b')
-
-    if not expiry_raw:
-        remain_time_display = "نامحدود"
-    elif expiry_epoch_val and expiry_epoch_val > time.time():
-        diff = expiry_epoch_val - int(time.time())
-        d = diff // 86400; h = (diff % 86400) // 3600; m = (diff % 3600) // 60
-        if d > 0: remain_time_display = f"{d} روز و {h:02d}:{m:02d}"
-        elif h > 0: remain_time_display = f"{h:02d}:{m:02d}:{diff % 60:02d}"
-        else: remain_time_display = f"{m:02d}:{diff % 60:02d}"
-    else:
-        remain_time_display = "منقضی شده"
-
-    max_conn_disp = str(max_conn) if max_conn and max_conn > 0 else 'نامحدود'
-    vless_link = generate_vless_link(uuid, remark=f"{label}")
-
-    label_h = _hesc(str(label))
-    sub_url_h = _hesc(sub_url, quote=True)
-    sub_url_j = json.dumps(sub_url)
-    sub_url_enc = quote(sub_url, safe='')
-    sub_url_b64 = base64.b64encode(sub_url.encode()).decode().rstrip('=')
-    vless_h = _hesc(vless_link)
-    vless_j = json.dumps(vless_link)
-    label_safe = re.sub(r'[^a-zA-Z0-9\-_.]', '_', str(label))
-
-    # Status banner styles
-    if is_active and not is_exp:
-        status_style = 'background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);color:#22c55e'
-        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
-    elif is_exp:
-        status_style = 'background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#ef4444'
-        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
-    else:
-        status_style = 'background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);color:#f59e0b'
-        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
-
-    html_content = (STATUS_HTML_TEMPLATE
-        .replace('__TITLE__', _hesc(f'اشتراک {label}'))
-        .replace('__LABEL__', label_h)
-        .replace('__STATUS_TEXT__', _hesc(status_text))
-        .replace('__STATUS_COLOR__', status_color)
-        .replace('__STATUS_STYLE__', status_style)
-        .replace('__DOT_STYLE__', dot_style)
-        .replace('__SUB_URL__', sub_url_h)
-        .replace('__SUB_URL_ENC__', sub_url_enc)
-        .replace('__SUB_URL_B64__', sub_url_b64)
-        .replace('__SUB_URL_JSON__', sub_url_j)
-        .replace('__USED__', _hesc(used_str))
-        .replace('__LIMIT__', _hesc(limit_str))
-        .replace('__REMAIN__', _hesc(remaining_str))
-        .replace('__PCT_NUM__', f"{percent:.1f}")
-        .replace('__MAXCONN__', _hesc(max_conn_disp))
-        .replace('__EXPIRY__', _hesc(expiry_display))
-        .replace('__EXP_EPOCH__', str(expiry_epoch_val))
-        .replace('__REMAIN_TIME__', _hesc(remain_time_display))
-        .replace('__VLESS__', vless_h)
-        .replace('__VLESS_JSON__', vless_j)
-        .replace('__VERSION__', _hesc(str(PANEL_VERSION)))
-        .replace('__LABEL_SAFE__', _hesc(label_safe))
-    )
-    return HTMLResponse(content=html_content)
-
-#  USF Panel v2.0.0 — Login Page
-# ============================================================
-
-LOGIN_HTML = r"""<!DOCTYPE html>
+# ─── HTML: Login Page ────────────────────────────────────────────────────────
+LOGIN_HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Usf - Login</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+<meta name="theme-color" content="#0b0f1a">
+<title>Usf Panel — Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:#0b0f1a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem;
-background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(99,102,241,0.1),transparent 60%),radial-gradient(ellipse 60% 40% at 80% 100%,rgba(139,92,246,0.06),transparent 50%)}
-#login{background:rgba(15,23,42,0.6);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:20px;padding:2.5rem 2rem 2rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
-@keyframes charge{0%{transform:translateY(1.5rem);opacity:0}100%{transform:translateY(0);opacity:1}}
-#login::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#6366f1 30%,#a78bfa 50%,#6366f1 70%,transparent);opacity:.5;border-radius:20px 20px 0 0}
-.theme-btn{position:absolute;top:14px;right:14px;width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);color:#94a3b8;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .25s}
-.theme-btn:hover{background:rgba(99,102,241,0.12);color:#a78bfa}
-.theme-btn svg{width:16px;height:16px}
-.logo{font-size:2rem;font-weight:800;text-align:center;margin-bottom:.5rem;letter-spacing:-.03em;background:linear-gradient(135deg,#f1f5f9,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent}
-.subtitle{text-align:center;color:#64748b;font-size:13px;margin-bottom:2rem}
-.fields{display:flex;flex-direction:column;gap:12px;margin-bottom:1.5rem}
-.field{display:flex;align-items:center;background:rgba(255,255,255,0.03);border:1.5px solid rgba(255,255,255,0.06);border-radius:12px;padding:0 14px;height:48px;transition:border-color .3s}
-.field:focus-within{border-color:rgba(99,102,241,0.5);box-shadow:0 0 0 3px rgba(99,102,241,0.1)}
-.field svg{flex-shrink:0;color:#475569}
-.field input{flex:1;background:transparent;border:none;outline:none;color:#f1f5f9;font-size:13px;height:100%;padding:0 10px;font-family:inherit}
-.field input::placeholder{color:#475569}
-.field .eye{cursor:pointer;color:#475569;padding:0 2px;transition:color .2s}
-.field .eye:hover{color:#818cf8}
-.login-btn{width:100%;height:46px;border:none;border-radius:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:all .3s;letter-spacing:.3px;font-family:inherit}
+body{background:#0b0f1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:'Inter',system-ui,sans-serif}
+.orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none}
+.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:.15;animation:orb-f 20s ease-in-out infinite}
+.o1{width:400px;height:400px;background:#6366f1;top:-100px;right:-80px}
+.o2{width:300px;height:300px;background:#06b6d4;bottom:-80px;left:-60px;animation-delay:-7s}
+@keyframes orb-f{0%,100%{transform:translate(0,0)}50%{transform:translate(30px,-20px)}}
+.card{position:relative;z-index:1;background:rgba(15,23,42,0.6);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:20px;padding:40px 32px;max-width:380px;width:100%;box-shadow:0 25px 50px rgba(0,0,0,0.5)}
+.logo{text-align:center;margin-bottom:32px}
+.logo h1{font-size:28px;font-weight:800;background:linear-gradient(135deg,#6366f1,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px}
+.logo p{color:#94a3b8;font-size:13px}
+.form-group{margin-bottom:20px}
+.form-group label{display:block;color:#cbd5e1;font-size:13px;font-weight:500;margin-bottom:6px}
+.form-group input{width:100%;padding:12px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;color:#f1f5f9;font-size:14px;font-family:inherit;outline:none;transition:all .2s}
+.form-group input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,0.15)}
+.login-btn{width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}
 .login-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(99,102,241,0.3)}
 .login-btn:active{transform:translateY(0)}
-.err{color:#ef4444;text-align:center;font-size:12px;padding:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.15);border-radius:8px;display:none;margin-top:8px}
-.err.show{display:block}
-html[data-theme="light"] body{background:#f1f5f9}
-html[data-theme="light"] #login{background:rgba(255,255,255,0.8);border-color:rgba(99,102,241,0.15)}
-html[data-theme="light"] .field{background:rgba(0,0,0,0.03);border-color:rgba(0,0,0,0.08)}
-html[data-theme="light"] .field input{color:#0f172a}
-html[data-theme="light"] .field svg,.html[data-theme="light"] .field .eye{color:#94a3b8}
-html[data-theme="light"] .err{background:rgba(239,68,68,0.06)}
+.login-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.error{color:#ef4444;font-size:13px;text-align:center;margin-top:16px;min-height:20px}
 </style>
 </head>
 <body>
-<div id="login">
-  <button class="theme-btn" onclick="toggleTheme()">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-  </button>
-  <div class="logo">Usf</div>
-  <div class="subtitle">Panel Management</div>
-  <form id="login-form">
-    <div class="fields">
-      <div class="field">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-        <input placeholder="Username" type="text" name="username" autocomplete="username" id="username" value="admin">
-      </div>
-      <div class="field">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-        <input placeholder="Password" type="password" name="password" autocomplete="current-password" id="password">
-        <span class="eye" onclick="togglePw()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-        </span>
-      </div>
-    </div>
-    <div class="err" id="err-msg"></div>
-    <button type="submit" class="login-btn">Sign In</button>
+<div class="orbs"><div class="orb o1"></div><div class="orb o2"></div></div>
+<div class="card">
+  <div class="logo"><h1>Usf Panel</h1><p>VLESS Tunnel Manager</p></div>
+  <form id="loginForm" onsubmit="doLogin(event)">
+    <div class="form-group"><label>Username</label><input type="text" id="username" autocomplete="username" required></div>
+    <div class="form-group"><label>Password</label><input type="password" id="password" autocomplete="current-password" required></div>
+    <button type="submit" class="login-btn" id="loginBtn">Sign In</button>
+    <div class="error" id="error"></div>
   </form>
 </div>
 <script>
-let dark=true;
-function toggleTheme(){dark=!dark;document.documentElement.setAttribute('data-theme',dark?'dark':'light')}
-function togglePw(){var i=document.getElementById('password');i.type=i.type==='password'?'text':'password'}
-document.getElementById('login-form').addEventListener('submit',async(e)=>{
-  e.preventDefault();var err=document.getElementById('err-msg');err.classList.remove('show');
-  var u=document.getElementById('username').value,p=document.getElementById('password').value;
-  try{var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:u,password:p})});
-  if(!r.ok){var d=await r.json().catch(()=>({}));err.textContent=d.detail||'Invalid credentials';err.classList.add('show');return}
-  window.location.href='/dashboard'}catch(e){err.textContent='Connection error';err.classList.add('show')}
-});
+async function doLogin(e){
+  e.preventDefault();
+  const btn=document.getElementById('loginBtn');
+  const err=document.getElementById('error');
+  btn.disabled=true;err.textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});
+    const d=await r.json();
+    if(r.ok){window.location.href='/dashboard'}
+    else{err.textContent=d.detail||'Login failed';btn.disabled=false}
+  }catch(x){err.textContent='Connection error';btn.disabled=false}
+}
+document.getElementById('username').focus();
 </script>
-</body>
-</html>"""
+</body></html>'''
 
-#  USF Panel v2.0.0 — Dashboard HTML
-# ============================================================
-
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+# ─── PLACEHOLDER: Dashboard HTML will be appended below ──────────────────────
+DASHBOARD_HTML = r'''
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Usf - Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<meta name="theme-color" content="#0b0f1a">
+<title>Usf Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg:#0b0f1a;--surface:#111827;--surface2:#1e293b;--border:rgba(99,102,241,0.12);
-  --border2:rgba(255,255,255,0.06);--text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;
-  --text4:#64748b;--accent:#6366f1;--accent2:#818cf8;--accent-soft:rgba(99,102,241,0.1);
-  --green:#22c55e;--red:#ef4444;--amber:#f59e0b;--purple:#a78bfa;
-  --radius:12px;--sidebar-w:220px;
+  --bg:#0b0f1a;--sidebar:#0f1629;--card:rgba(15,23,42,0.7);
+  --glass:rgba(255,255,255,0.04);--border:rgba(255,255,255,0.06);
+  --accent:#6366f1;--accent2:#818cf8;--cyan:#06b6d4;--emerald:#10b981;--amber:#f59e0b;--rose:#f43f5e;
+  --text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;--text4:#64748b;
+  --radius:14px;--glow:0 0 20px rgba(99,102,241,0.15);
 }
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text2);min-height:100vh;display:flex}
-::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+html,body{height:100%;overflow:hidden}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5;color:var(--text);background:var(--bg);display:flex}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--text4);border-radius:3px}
 
 /* Sidebar */
-.sidebar{width:var(--sidebar-w);height:100vh;background:var(--surface);border-right:1px solid var(--border2);
-  position:fixed;left:0;top:0;bottom:0;z-index:100;display:flex;flex-direction:column;transition:transform .3s ease}
-.sidebar-header{padding:16px;border-bottom:1px solid var(--border2)}
-.brand{display:flex;align-items:center;gap:10px}
-.brand-logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;color:#fff}
-.brand-name{font-size:15px;font-weight:700;color:var(--text)}
-.brand-ver{font-size:9px;color:var(--text4);background:var(--accent-soft);padding:2px 7px;border-radius:4px;margin-left:auto;font-weight:600}
-.sidebar-nav{flex:1;padding:8px;overflow-y:auto}
-.nav-section{font-size:9px;font-weight:700;color:var(--text4);text-transform:uppercase;letter-spacing:.1em;padding:12px 12px 4px}
-.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--text3);font-size:13px;cursor:pointer;transition:all .15s;border:none;background:none;width:100%;text-align:left;margin:1px 0;font-family:inherit}
-.nav-item:hover{background:var(--accent-soft);color:var(--text)}
-.nav-item.active{background:var(--accent-soft);color:var(--accent2);font-weight:600}
-.nav-item svg{width:16px;height:16px;flex-shrink:0}
-.nav-badge{margin-left:auto;background:var(--surface2);color:var(--text4);font-size:10px;padding:1px 7px;border-radius:6px;font-weight:600}
-.sidebar-footer{padding:10px;border-top:1px solid var(--border2)}
-.logout-btn{width:100%;padding:8px;border:1px solid var(--border2);border-radius:8px;background:none;color:var(--text4);font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
-.logout-btn:hover{background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.2);color:var(--red)}
-.hamburger{display:none;position:fixed;top:12px;left:12px;z-index:200;width:36px;height:36px;border-radius:8px;background:var(--surface);border:1px solid var(--border2);color:var(--text2);cursor:pointer;align-items:center;justify-content:center}
-.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
-.overlay.show{display:block}
+.sidebar{width:240px;min-width:240px;background:var(--sidebar);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;z-index:20;transition:all .3s}
+.sidebar.collapsed{width:64px;min-width:64px}
+.sidebar.collapsed .nav-label,.sidebar.collapsed .logo-text,.sidebar.collapsed .sidebar-footer-text{display:none}
+.sidebar.collapsed .nav-item{justify-content:center;padding:10px}
+.logo{padding:20px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.logo-icon{width:36px;height:36px;min-width:36px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#fff}
+.logo-text{font-size:16px;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;white-space:nowrap}
+.nav{flex:1;padding:12px 8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;color:var(--text3);cursor:pointer;transition:all .2s;margin-bottom:2px;font-size:13px;font-weight:500;white-space:nowrap}
+.nav-item:hover{background:var(--glass);color:var(--text2)}
+.nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent2)}
+.nav-item svg{width:18px;height:18px;min-width:18px;flex-shrink:0}
+.sidebar-footer{padding:12px;border-top:1px solid var(--border)}
+.sidebar-footer-text{font-size:11px;color:var(--text4);text-align:center}
 
-/* Main content */
-.main{flex:1;margin-left:var(--sidebar-w);padding:20px 24px 48px;min-height:100vh}
-.page{display:none;animation:pageIn .3s ease}.page.active{display:block}
-@keyframes pageIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+/* Main */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:56px;min-height:56px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;gap:16px}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.toggle-sidebar{background:none;border:none;color:var(--text3);cursor:pointer;padding:4px;border-radius:6px;display:none}
+.toggle-sidebar:hover{color:var(--text);background:var(--glass)}
+.page-title{font-size:16px;font-weight:700}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.topbar-badge{background:var(--glass);border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--text3)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--emerald);display:inline-block;margin-left:6px;animation:pulse-dot 2s infinite}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.4}}
+.logout-btn{background:none;border:1px solid var(--border);color:var(--text3);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;transition:all .2s;font-family:inherit}
+.logout-btn:hover{border-color:var(--rose);color:var(--rose)}
+
+.content{flex:1;overflow-y:auto;padding:24px}
 
 /* Cards */
-.card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:16px;margin-bottom:12px;transition:box-shadow .2s}
-.card:hover{box-shadow:0 2px 12px rgba(0,0,0,.2)}
-.card-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid var(--border2);margin-bottom:12px}
-.card-title{font-size:14px;font-weight:600;color:var(--text)}
-.card-extra{color:var(--text4);font-size:12px}
+.card{background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:all .3s}
+.card:hover{border-color:rgba(99,102,241,0.2)}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.card-title{font-size:14px;font-weight:600;color:var(--text2)}
 
-/* Stat grid */
-.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
-.stat-card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:14px;position:relative;overflow:hidden}
-.stat-card::after{content:'';position:absolute;top:0;right:0;width:40px;height:40px;border-radius:0 0 0 40px;opacity:.06}
-.stat-card:nth-child(1)::after{background:var(--accent)}.stat-card:nth-child(2)::after{background:var(--green)}
-.stat-card:nth-child(3)::after{background:var(--amber)}.stat-card:nth-child(4)::after{background:var(--purple)}
-.stat-label{font-size:10px;color:var(--text4);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
-.stat-value{font-size:18px;font-weight:700;color:var(--text);font-family:'JetBrains Mono',monospace}
-.stat-sub{font-size:10px;color:var(--text4);margin-top:4px}
+/* Stats Grid */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
+.stat-card{position:relative;overflow:hidden}
+.stat-card .stat-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;font-size:18px}
+.stat-card .stat-value{font-size:24px;font-weight:800;margin-bottom:2px}
+.stat-card .stat-label{font-size:12px;color:var(--text3)}
+.stat-card .stat-bar{position:absolute;bottom:0;left:0;right:0;height:3px;background:var(--glass)}
+.stat-card .stat-bar-fill{height:100%;border-radius:0 2px 0 0;transition:width .5s}
+.cpu-icon{background:rgba(99,102,241,0.12);color:var(--accent)}
+.ram-icon{background:rgba(6,182,212,0.12);color:var(--cyan)}
+.disk-icon{background:rgba(245,158,11,0.12);color:var(--amber)}
+.net-icon{background:rgba(16,185,129,0.12);color:var(--emerald)}
+.conn-icon{background:rgba(244,63,94,0.12);color:var(--rose)}
 
-/* Gauge row */
-.gauge-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
-.gauge-card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:14px;text-align:center}
-.gauge-card svg{width:80px;height:80px;margin:0 auto 6px;display:block}
-.gauge-card .g-label{font-size:10px;color:var(--text4);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
-.gauge-card .g-value{font-size:11px;color:var(--text3);margin-top:2px;font-family:'JetBrains Mono',monospace}
+/* Grid Layouts */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
+.grid-3{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:24px}
 
-/* Tags & Badges */
-.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
-.tag-green{background:rgba(34,197,94,0.12);color:#22c55e;border:1px solid rgba(34,197,94,0.15)}
-.tag-red{background:rgba(239,68,68,0.08);color:#ef4444;border:1px solid rgba(239,68,68,0.12)}
-.tag-purple{background:rgba(167,139,250,0.12);color:#a78bfa;border:1px solid rgba(167,139,250,0.15)}
-.tag-amber{background:rgba(245,158,11,0.12);color:#f59e0b;border:1px solid rgba(245,158,11,0.15)}
-.badge-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
-.badge-dot.green{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.2s ease-in-out infinite}
-.badge-dot.red{background:var(--red)}
-@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.4}}
+/* Tables */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
+td{padding:10px 12px;border-bottom:1px solid var(--glass);font-size:13px;vertical-align:middle}
+tr:hover td{background:var(--glass)}
+.status-active{color:var(--emerald);font-weight:600}
+.status-expired{color:var(--rose);font-weight:600}
+.status-disabled{color:var(--text4);font-weight:600}
 
 /* Buttons */
-.btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .15s}
-.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
-.btn-secondary{background:var(--surface2);color:var(--text3);border:1px solid var(--border2)}.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
-.btn-danger{background:rgba(239,68,68,0.08);color:var(--red);border:1px solid rgba(239,68,68,0.1)}.btn-danger:hover{background:rgba(239,68,68,0.15)}
-.btn-sm{padding:4px 9px;font-size:11px}
-.btn-icon{width:28px;height:28px;padding:0;justify-content:center;border-radius:6px;font-size:12px;font-weight:700}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:10px;border:1px solid var(--border);background:var(--glass);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:all .2s;font-family:inherit;white-space:nowrap}
+.btn:hover{border-color:var(--accent);color:var(--accent2);transform:translateY(-1px)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border:none;color:#fff}
+.btn-primary:hover{color:#fff;box-shadow:0 4px 16px rgba(99,102,241,0.3)}
+.btn-sm{padding:5px 10px;font-size:12px;border-radius:8px}
+.btn-danger{border-color:rgba(244,63,94,0.3);color:var(--rose)}
+.btn-danger:hover{background:rgba(244,63,94,0.12);border-color:var(--rose);color:var(--rose)}
+.btn-success{border-color:rgba(16,185,129,0.3);color:var(--emerald)}
+.btn-success:hover{background:rgba(16,185,129,0.12);border-color:var(--emerald)}
+.btn-icon{padding:6px 8px;font-size:14px}
 
-/* Table */
-.table-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--text4);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:10px 12px;border-bottom:1px solid var(--border2)}
-td{padding:10px 12px;border-bottom:1px solid var(--border2);color:var(--text2);vertical-align:middle}
-tr:hover td{background:rgba(99,102,241,0.03)}
-
-/* Usage bar */
-.usage-pill{display:flex;align-items:center;gap:8px;min-width:140px}
-.usage-pill .used{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text);white-space:nowrap;min-width:55px}
-.usage-pill .bar{flex:1;height:4px;background:var(--surface2);border-radius:2px;overflow:hidden;min-width:40px}
-.usage-pill .bar .fill{height:100%;border-radius:2px;transition:width .5s}
-.usage-pill .limit{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text4);white-space:nowrap}
-
-/* Filter chips */
-.chips{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
-.chip{padding:5px 12px;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border2);background:transparent;color:var(--text4);transition:all .15s;font-family:inherit}
-.chip:hover{border-color:var(--accent);color:var(--text2)}
-.chip.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent2)}
-.search-box{display:flex;align-items:center;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;height:34px;margin-bottom:12px;transition:border-color .2s}
-.search-box:focus-within{border-color:var(--accent)}
-.search-box svg{width:14px;height:14px;color:var(--text4);flex-shrink:0}
-.search-box input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:12px;padding:0 8px;font-family:inherit}
-.search-box input::placeholder{color:var(--text4)}
+/* Forms */
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:12px;font-weight:500;color:var(--text3);margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:all .2s}
+.form-group input:focus,.form-group select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,0.1)}
+.form-group textarea{resize:vertical;min-height:60px}
+.form-group select{cursor:pointer}
+.form-group select option{background:var(--sidebar);color:var(--text)}
 
 /* Modal */
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:300;align-items:center;justify-content:center;padding:20px}
-.modal-overlay.show{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border2);border-radius:16px;padding:24px;width:100%;max-width:440px;max-height:90vh;overflow-y:auto;animation:modalIn .25s ease}
-@keyframes modalIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
-.modal-close{position:absolute;top:12px;right:12px;width:28px;height:28px;border-radius:6px;background:var(--surface2);border:none;color:var(--text4);cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .15s}
-.modal-close:hover{background:rgba(239,68,68,0.1);color:var(--red)}
-.modal-title{font-size:16px;font-weight:700;color:var(--text);margin-bottom:16px;position:relative}
-.form-group{margin-bottom:12px}
-.form-label{display:block;font-size:11px;font-weight:600;color:var(--text3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em}
-.form-input{width:100%;height:40px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:border-color .2s}
-.form-input:focus{border-color:var(--accent)}
-.form-select{width:100%;height:40px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none;appearance:none;cursor:pointer}
-.form-row{display:flex;gap:8px}
-.form-row .form-group{flex:1}
-
-/* Info rows */
-.info-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border2)}
-.info-row:last-child{border-bottom:none}
-.info-label{font-size:12px;color:var(--text3)}
-.info-value{font-size:13px;color:var(--text);font-weight:600;font-family:'JetBrains Mono',monospace}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;opacity:0;pointer-events:none;transition:all .2s}
+.modal-overlay.open{opacity:1;pointer-events:auto}
+.modal{background:var(--sidebar);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:500px;width:100%;max-height:85vh;overflow-y:auto;transform:scale(.95);transition:all .2s}
+.modal-overlay.open .modal{transform:scale(1)}
+.modal-title{font-size:16px;font-weight:700;margin-bottom:20px}
 
 /* Toast */
-.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:10px;font-size:12px;font-weight:500;z-index:1000;transform:translateY(80px);opacity:0;transition:all .3s ease;pointer-events:none}
-.toast.show{transform:translateY(0);opacity:1}
-.toast.success{background:rgba(34,197,94,0.15);color:var(--green);border:1px solid rgba(34,197,94,0.2)}
-.toast.error{background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.2)}
+.toast-container{position:fixed;bottom:20px;right:20px;z-index:200;display:flex;flex-direction:column;gap:8px}
+.toast{padding:12px 20px;border-radius:10px;font-size:13px;font-weight:500;animation:toast-in .3s ease;box-shadow:0 8px 24px rgba(0,0,0,0.3)}
+.toast-success{background:var(--emerald);color:#fff}
+.toast-error{background:var(--rose);color:#fff}
+.toast-info{background:var(--accent);color:#fff}
+@keyframes toast-in{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
 
-/* Chart container */
-.chart-container{position:relative;height:200px;margin-top:8px}
+/* Tag */
+.tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:rgba(99,102,241,0.1);color:var(--accent2);border:1px solid rgba(99,102,241,0.2)}
 
-/* Address item */
-.addr-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;margin-bottom:6px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text2)}
+/* Copy Dropdown */
+.copy-dropdown{position:relative;display:inline-block}
+.copy-menu{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--sidebar);border:1px solid var(--border);border-radius:12px;padding:6px;min-width:160px;display:none;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,0.4);margin-bottom:4px}
+.copy-menu.open{display:block}
+.copy-menu-item{display:block;width:100%;text-align:left;padding:7px 12px;border:none;background:none;color:var(--text);font-size:12px;cursor:pointer;border-radius:8px;transition:all .15s;font-family:inherit;white-space:nowrap}
+.copy-menu-item:hover{background:rgba(99,102,241,0.12);color:var(--accent2)}
 
-/* IP blur */
-.ip-val{filter:blur(4px);cursor:pointer;transition:filter .2s}.ip-val.visible{filter:none}
+/* Client links grid in modal */
+.client-links-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:12px}
+.cl-item{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:8px 10px;background:var(--glass);border-radius:8px;font-size:11px}
+.cl-item span{color:var(--text2);font-weight:500}
+.cl-item button{background:none;border:none;color:var(--accent2);cursor:pointer;font-size:13px;padding:2px}
 
-/* Panel builder */
-.builder-card{background:linear-gradient(135deg,var(--surface),rgba(99,102,241,0.05));border:1px solid var(--border);border-radius:var(--radius);padding:24px;margin-bottom:12px}
-.builder-title{font-size:16px;font-weight:700;color:var(--text);margin-bottom:4px}
-.builder-desc{font-size:12px;color:var(--text3);margin-bottom:16px;line-height:1.6}
-.builder-steps{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
-.builder-step{flex:1;min-width:120px;padding:12px;background:var(--surface2);border:1px solid var(--border2);border-radius:10px;text-align:center}
-.builder-step .step-num{width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;margin-bottom:6px}
-.builder-step .step-text{font-size:11px;color:var(--text3)}
+/* Logs */
+.log-entry{padding:6px 10px;border-bottom:1px solid var(--glass);font-size:12px;font-family:'Courier New',monospace;display:flex;gap:10px}
+.log-time{color:var(--text4);min-width:70px}
+.log-type{min-width:50px;font-weight:600}
+.log-error{color:var(--rose)}
+.log-info{color:var(--cyan)}
+
+/* Page sections */
+.page{display:none}
+.page.active{display:block}
+
+/* Search */
+.search-bar{position:relative;margin-bottom:16px}
+.search-bar input{width:100%;padding:10px 14px 10px 38px;background:var(--glass);border:1px solid var(--border);border-radius:12px;color:var(--text);font-size:13px;outline:none;transition:all .2s;font-family:inherit}
+.search-bar input:focus{border-color:var(--accent)}
+.search-bar svg{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--text4);width:16px;height:16px}
+
+/* Panel Builder */
+.deploy-result{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:12px;padding:16px;margin-top:16px}
+.deploy-result a{color:var(--emerald);text-decoration:none;font-weight:600}
+.deploy-result a:hover{text-decoration:underline}
+
+/* Chart */
+.chart-container{position:relative;height:200px}
+
+/* Empty state */
+.empty-state{text-align:center;padding:48px 20px;color:var(--text4)}
+.empty-state svg{width:48px;height:48px;margin:0 auto 12px;opacity:.3}
 
 /* Responsive */
-@media(max-width:1024px){.stat-grid{grid-template-columns:repeat(2,1fr)}.gauge-row{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:768px){
-  .sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}
-  .hamburger{display:flex}.main{margin-left:0;padding:16px}
-  .stat-grid{grid-template-columns:1fr 1fr}.gauge-row{grid-template-columns:1fr 1fr}
+  .sidebar{position:fixed;right:0;top:0;bottom:0;z-index:50;transform:translateX(100%);transition:transform .3s}
+  .sidebar.mobile-open{transform:translateX(0)}
+  .toggle-sidebar{display:block}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .grid-2,.grid-3{grid-template-columns:1fr}
+  .form-row{grid-template-columns:1fr}
+  .content{padding:16px}
+  .topbar{padding:0 16px}
+  .client-links-grid{grid-template-columns:1fr}
 }
-@media(max-width:480px){.stat-grid,.gauge-row{grid-template-columns:1fr}}
+@media(max-width:480px){
+  .stats-grid{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
-
-<button class="hamburger" onclick="toggleSidebar()">
-  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-</button>
-<div class="overlay" id="overlay" onclick="closeSidebar()"></div>
-
 <!-- Sidebar -->
 <aside class="sidebar" id="sidebar">
-  <div class="sidebar-header">
-    <div class="brand">
-      <div class="brand-logo">U</div>
-      <span class="brand-name">Usf</span>
-      <span class="brand-ver" id="ver-badge">v2.0.0</span>
+  <div class="logo"><div class="logo-icon">U</div><div class="logo-text">Usf Panel</div></div>
+  <nav class="nav">
+    <div class="nav-item active" onclick="showPage('dashboard')" data-page="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span class="nav-label">Dashboard</span>
     </div>
-  </div>
-  <nav class="sidebar-nav">
-    <div class="nav-section">Main</div>
-    <button class="nav-item active" onclick="go('overview',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
-      Overview
-    </button>
-    <button class="nav-item" onclick="go('inbounds',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
-      Inbounds
-      <span class="nav-badge" id="links-badge">0</span>
-    </button>
-    <div class="nav-section">Network</div>
-    <button class="nav-item" onclick="go('cleanip',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-      Clean IP
-    </button>
-    <button class="nav-item" onclick="go('domain',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-      Domain
-    </button>
-    <div class="nav-section">Tools</div>
-    <button class="nav-item" onclick="go('builder',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-      Panel Builder
-    </button>
-    <button class="nav-item" onclick="go('settings',this)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      Settings
-    </button>
+    <div class="nav-item" onclick="showPage('inbounds')" data-page="inbounds">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      <span class="nav-label">Inbounds</span>
+    </div>
+    <div class="nav-item" onclick="showPage('ips')" data-page="ips">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10A15 15 0 0 1 12 2z"/></svg>
+      <span class="nav-label">Clean IPs</span>
+    </div>
+    <div class="nav-item" onclick="showPage('domain')" data-page="domain">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10A15 15 0 0 1 12 2z"/></svg>
+      <span class="nav-label">Domain</span>
+    </div>
+    <div class="nav-item" onclick="showPage('builder')" data-page="builder">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+      <span class="nav-label">Panel Builder</span>
+    </div>
+    <div class="nav-item" onclick="showPage('logs')" data-page="logs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+      <span class="nav-label">Logs</span>
+    </div>
+    <div class="nav-item" onclick="showPage('settings')" data-page="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span class="nav-label">Settings</span>
+    </div>
   </nav>
-  <div class="sidebar-footer">
-    <button class="logout-btn" onclick="doLogout()">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      Sign Out
-    </button>
-  </div>
+  <div class="sidebar-footer"><div class="sidebar-footer-text">v__PANEL_VER__</div></div>
 </aside>
 
-<!-- Main -->
+<!-- Main Content -->
 <div class="main">
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="toggle-sidebar" onclick="toggleSidebar()">&#9776;</button>
+      <span class="page-title" id="pageTitle">Dashboard</span>
+    </div>
+    <div class="topbar-right">
+      <span class="topbar-badge"><span class="status-dot"></span>Online</span>
+      <button class="logout-btn" onclick="doLogout()">Logout</button>
+    </div>
+  </header>
 
-<!-- Overview Page -->
-<section class="page active" id="page-overview">
-  <div class="stat-grid">
-    <div class="stat-card">
-      <div class="stat-label">Active Connections</div>
-      <div class="stat-value" id="s-conn">0</div>
-      <div class="stat-sub" id="s-tcp-udp">TCP: 0 | UDP: 0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Upload / Download</div>
-      <div class="stat-value" style="font-size:14px"><span id="s-up">--</span> / <span id="s-down">--</span></div>
-      <div class="stat-sub">per second</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Total Traffic</div>
-      <div class="stat-value" id="s-traffic">0 MB</div>
-      <div class="stat-sub">Sent: <span id="s-sent">--</span> | Recv: <span id="s-recv">--</span></div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Service Status</div>
-      <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
-        <span class="badge-dot green" id="xray-dot"></span>
-        <span style="font-weight:600;color:var(--text)" id="xray-status-text">Running</span>
+  <div class="content">
+    <!-- Dashboard Page -->
+    <div class="page active" id="page-dashboard">
+      <div class="stats-grid" id="statsGrid">
+        <div class="card stat-card"><div class="stat-icon cpu-icon">&#9889;</div><div class="stat-value" id="sCpu">0%</div><div class="stat-label">CPU Usage</div><div class="stat-bar"><div class="stat-bar-fill" id="sCpuBar" style="width:0%;background:var(--accent)"></div></div></div>
+        <div class="card stat-card"><div class="stat-icon ram-icon">&#128190;</div><div class="stat-value" id="sRam">0%</div><div class="stat-label">RAM Usage</div><div class="stat-bar"><div class="stat-bar-fill" id="sRamBar" style="width:0%;background:var(--cyan)"></div></div></div>
+        <div class="card stat-card"><div class="stat-icon disk-icon">&#128451;</div><div class="stat-value" id="sDisk">0%</div><div class="stat-label">Disk Usage</div><div class="stat-bar"><div class="stat-bar-fill" id="sDiskBar" style="width:0%;background:var(--amber)"></div></div></div>
+        <div class="card stat-card"><div class="stat-icon net-icon">&#128225;</div><div class="stat-value" id="sNet">0/0</div><div class="stat-label">Network Speed</div><div class="stat-bar"><div class="stat-bar-fill" style="width:100%;background:var(--emerald)"></div></div></div>
+        <div class="card stat-card"><div class="stat-icon conn-icon">&#128279;</div><div class="stat-value" id="sConns">0</div><div class="stat-label">Active Connections</div><div class="stat-bar"><div class="stat-bar-fill" id="sConnsBar" style="width:0%;background:var(--rose)"></div></div></div>
+        <div class="card stat-card"><div class="stat-icon" style="background:rgba(139,92,246,0.12);color:#8b5cf6">&#9200;</div><div class="stat-value" id="sUptime">0m</div><div class="stat-label">System Uptime</div><div class="stat-bar"><div class="stat-bar-fill" style="width:100%;background:#8b5cf6"></div></div></div>
       </div>
-      <div class="stat-sub">Uptime: <span id="s-uptime">--</span></div>
-    </div>
-  </div>
-
-  <div class="gauge-row">
-    <div class="gauge-card">
-      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-cpu" cx="40" cy="40" r="32" fill="none" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
-      <div class="g-label">CPU</div>
-      <div class="g-value" id="g-cpu-t">0%</div>
-    </div>
-    <div class="gauge-card">
-      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-ram" cx="40" cy="40" r="32" fill="none" stroke="var(--green)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
-      <div class="g-label">RAM</div>
-      <div class="g-value" id="g-ram-t">0%</div>
-    </div>
-    <div class="gauge-card">
-      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-swap" cx="40" cy="40" r="32" fill="none" stroke="var(--amber)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
-      <div class="g-label">Swap</div>
-      <div class="g-value" id="g-swap-t">0%</div>
-    </div>
-    <div class="gauge-card">
-      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-disk" cx="40" cy="40" r="32" fill="none" stroke="var(--purple)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
-      <div class="g-label">Disk</div>
-      <div class="g-value" id="g-disk-t">0%</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-head">
-      <div class="card-title">Traffic (24h)</div>
-      <div style="display:flex;gap:6px">
-        <button class="btn btn-sm btn-secondary" onclick="openLogs()">Logs</button>
-        <button class="btn btn-sm btn-secondary" onclick="openConfig()">Config</button>
-        <button class="btn btn-sm btn-primary" onclick="downloadBackup()">Backup</button>
+      <div class="grid-3">
+        <div class="card"><div class="card-header"><span class="card-title">Traffic (24h)</span></div><div class="chart-container"><canvas id="trafficChart"></canvas></div></div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">System Info</span></div>
+          <div style="font-size:13px;line-height:2.2">
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">RAM</span><span id="siRam">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Swap</span><span id="siSwap">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Storage</span><span id="siDisk">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">App RAM</span><span id="siAppRam">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">CPU Cores</span><span id="siCores">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Total Traffic</span><span id="siTraffic">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Total Requests</span><span id="siReqs">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">IPv4</span><span id="siIPv4">-</span></div>
+            <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Links</span><span id="siLinks">-</span></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="chart-container"><canvas id="trafficChart"></canvas></div>
-  </div>
 
-  <div class="card">
-    <div class="card-head">
-      <div class="card-title">System Info</div>
-      <div class="card-extra"><span class="tag tag-purple">Panel <span id="pv-tag">v2.0.0</span></span> <span class="tag tag-green" id="tg-tag"></span></div>
-    </div>
-    <div class="info-row"><span class="info-label">Domain</span><span class="info-value" id="s-domain">--</span></div>
-    <div class="info-row"><span class="info-label">IPv4</span><span class="info-value ip-val" id="s-ipv4" onclick="toggleIps()">N/A</span></div>
-    <div class="info-row"><span class="info-label">IPv6</span><span class="info-value ip-val" id="s-ipv6" onclick="toggleIps()">N/A</span></div>
-    <div class="info-row"><span class="info-label">System Load</span><span class="info-value" id="s-load">--</span></div>
-    <div class="info-row"><span class="info-label">App RAM / Threads</span><span class="info-value" id="s-ram-th">--</span></div>
-    <div class="info-row"><span class="info-label">OS Uptime</span><span class="info-value" id="s-os-up">--</span></div>
-  </div>
-</section>
-
-<!-- Inbounds Page -->
-<section class="page" id="page-inbounds">
-  <div class="card" style="margin-bottom:12px">
-    <div class="card-head">
-      <div class="card-title">Inbounds</div>
-      <button class="btn btn-primary btn-sm" onclick="showModal('add-modal')">+ New Inbound</button>
-    </div>
-    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px">
-      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-total">0</div><div style="font-size:10px;color:var(--text4)">Total</div></div>
-      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--green)" id="ib-active">0</div><div style="font-size:10px;color:var(--text4)">Active</div></div>
-      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-traffic">0 MB</div><div style="font-size:10px;color:var(--text4)">Proxy Traffic</div></div>
-      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-requests">0</div><div style="font-size:10px;color:var(--text4)">Requests</div></div>
-    </div>
-    <div class="chips">
-      <button class="chip active" onclick="setFilter('all',this)">All</button>
-      <button class="chip" onclick="setFilter('active',this)">Active</button>
-      <button class="chip" onclick="setFilter('disabled',this)">Disabled</button>
-      <button class="chip" onclick="setFilter('expired',this)">Expired</button>
-    </div>
-    <div class="search-box">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input placeholder="Search by name or UUID..." id="inbound-search" oninput="filterInbounds()">
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Traffic</th><th>Connections</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody id="inbounds-tbody"></tbody>
-      </table>
-    </div>
-  </div>
-</section>
-
-<!-- Clean IP Page -->
-<section class="page" id="page-cleanip">
-  <div class="card">
-    <div class="card-head">
-      <div class="card-title">Clean IP / Domain Addresses</div>
-      <button class="btn btn-primary btn-sm" onclick="showModal('addr-modal')">+ Add</button>
-    </div>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:12px">These addresses are used as the connection address in VLESS links. The actual SNI/host remains your domain.</p>
-    <div id="address-list"></div>
-  </div>
-</section>
-
-<!-- Domain Page -->
-<section class="page" id="page-domain">
-  <div class="card">
-    <div class="card-head"><div class="card-title">Custom Domain</div></div>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:12px">Set a custom domain for generating VLESS links. Leave empty to use the default HF domain.</p>
-    <div class="info-row"><span class="info-label">Render Domain</span><span class="info-value" id="rd-domain">--</span></div>
-    <div class="info-row"><span class="info-label">Custom Domain</span><span class="info-value" id="dv-domain" style="cursor:pointer">--</span></div>
-    <div style="margin-top:12px">
-      <div class="form-row">
-        <div class="form-group" style="flex:3"><input class="form-input" id="domain-input" placeholder="e.g. mypanel.com"></div>
-        <button class="btn btn-primary" style="height:40px" onclick="saveDomain()">Save</button>
+    <!-- Inbounds Page -->
+    <div class="page" id="page-inbounds">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+        <div class="search-bar" style="margin-bottom:0;flex:1;max-width:360px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+          <input type="text" id="searchInbounds" placeholder="Search by name, tag..." oninput="renderInbounds()">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="filterStatus" style="padding:8px 12px;background:var(--glass);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:12px;font-family:inherit;outline:none" onchange="renderInbounds()">
+            <option value="all">All Status</option>
+            <option value="active">Active</option>
+            <option value="expired">Expired</option>
+            <option value="disabled">Disabled</option>
+          </select>
+          <button class="btn btn-primary" onclick="openCreateModal()">+ New Link</button>
+        </div>
       </div>
-      <button class="btn btn-danger btn-sm" id="domain-clear-btn" style="display:none;margin-top:6px" onclick="clearDomain()">Clear Custom Domain</button>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Status</th><th>Usage</th><th>Expiry</th><th>Connections</th><th>Tag</th><th>Actions</th></tr></thead>
+            <tbody id="inboundsBody"></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="emptyInbounds" style="display:none">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+          <p>No inbounds yet. Create one to get started.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clean IPs Page -->
+    <div class="page" id="page-ips">
+      <div class="card">
+        <div class="card-header"><span class="card-title">Clean IP Addresses</span></div>
+        <p style="color:var(--text3);font-size:13px;margin-bottom:16px">These IPs will be bundled in subscriptions as additional server addresses.</p>
+        <div style="display:flex;gap:8px;margin-bottom:16px">
+          <input type="text" id="newAddr" placeholder="e.g. example.com or 1.2.3.4" style="flex:1;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;font-family:inherit">
+          <button class="btn btn-primary" onclick="addAddr()">Add</button>
+        </div>
+        <div id="addrList"></div>
+      </div>
+    </div>
+
+    <!-- Domain Page -->
+    <div class="page" id="page-domain">
+      <div class="card">
+        <div class="card-header"><span class="card-title">Custom Domain</span></div>
+        <p style="color:var(--text3);font-size:13px;margin-bottom:16px">Point your domain via CNAME to your HF Space URL.</p>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="domainInput" placeholder="e.g. mypanel.example.com" style="flex:1;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;font-family:inherit">
+          <button class="btn btn-primary" onclick="saveDomain()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel Builder Page -->
+    <div class="page" id="page-builder">
+      <div class="card" style="max-width:560px">
+        <div class="card-header"><span class="card-title">Panel Builder</span></div>
+        <p style="color:var(--text3);font-size:13px;margin-bottom:20px">Deploy a new Usf Panel to HuggingFace Spaces with just a few clicks. Your HF token needs write access.</p>
+        <div class="form-group"><label>HuggingFace Token</label><input type="password" id="pbToken" placeholder="hf_xxxxx"></div>
+        <div class="form-row">
+          <div class="form-group"><label>Space Name</label><input type="text" id="pbSpace" placeholder="my-panel"></div>
+          <div class="form-group"><label>Admin Username</label><input type="text" id="pbUser" value="admin"></div>
+        </div>
+        <div class="form-group"><label>Admin Password</label><input type="password" id="pbPass" value="admin" placeholder="min 4 chars"></div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px" onclick="deployPanel()" id="deployBtn">Deploy Panel</button>
+        <div class="deploy-result" id="deployResult" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- Logs Page -->
+    <div class="page" id="page-logs">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Error Log</span><button class="btn btn-sm" onclick="loadLogs()">Refresh</button></div>
+          <div id="errorLogs" style="max-height:400px;overflow-y:auto"><p style="color:var(--text4);text-align:center;padding:20px">No errors</p></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Connection History</span></div>
+          <div id="connHistory" style="max-height:400px;overflow-y:auto"><p style="color:var(--text4);text-align:center;padding:20px">No connections</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Page -->
+    <div class="page" id="page-settings">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Change Password</span></div>
+          <div class="form-group"><label>Current Password</label><input type="password" id="curPw"></div>
+          <div class="form-group"><label>New Password</label><input type="password" id="newPw"></div>
+          <button class="btn btn-primary" onclick="changePw()">Update Password</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Backup & Restore</span></div>
+          <p style="color:var(--text3);font-size:13px;margin-bottom:16px">Export all panel data as JSON, or import from a backup file.</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-success" onclick="downloadBackup()">Download Backup</button>
+            <button class="btn" onclick="document.getElementById('restoreFile').click()">Restore Backup</button>
+            <input type="file" id="restoreFile" accept=".json" style="display:none" onchange="restoreBackup(this)">
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px;max-width:560px">
+        <div class="card-header"><span class="card-title">Service Control</span></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-danger" onclick="serviceAction('stop')">Stop Service</button>
+          <button class="btn btn-success" onclick="serviceAction('restart')">Restart Service</button>
+        </div>
+      </div>
     </div>
   </div>
-</section>
+</div>
 
-<!-- Panel Builder Page -->
-<section class="page" id="page-builder">
-  <div class="builder-card">
-    <div class="builder-title">Panel Builder</div>
-    <div class="builder-desc">Create a new Usf panel on your HuggingFace account with just a few clicks. Your HF token must have write access to Spaces.</div>
-    <div class="builder-steps">
-      <div class="builder-step"><div class="step-num">1</div><div class="step-text">Enter HF Token</div></div>
-      <div class="builder-step"><div class="step-num">2</div><div class="step-text">Choose Space Name</div></div>
-      <div class="builder-step"><div class="step-num">3</div><div class="step-text">Set Credentials</div></div>
-      <div class="builder-step"><div class="step-num">4</div><div class="step-text">Deploy</div></div>
-    </div>
-    <div class="form-group"><label class="form-label">HuggingFace Token</label><input class="form-input" id="pb-token" type="password" placeholder="hf_xxxxxxxxxxxxxxxxxx"></div>
-    <div class="form-group"><label class="form-label">Space Name (lowercase)</label><input class="form-input" id="pb-space" placeholder="my-usf-panel"></div>
+<!-- Create/Edit Modal -->
+<div class="modal-overlay" id="linkModal">
+  <div class="modal">
+    <div class="modal-title" id="modalTitle">New Link</div>
+    <input type="hidden" id="editUid">
+    <div class="form-group"><label>Name *</label><input type="text" id="fLabel" placeholder="e.g. My VPN"></div>
     <div class="form-row">
-      <div class="form-group"><label class="form-label">Admin Username</label><input class="form-input" id="pb-user" value="admin"></div>
-      <div class="form-group"><label class="form-label">Admin Password</label><input class="form-input" id="pb-pass" type="password" value="admin" placeholder="min 4 chars"></div>
-    </div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center;height:44px;font-size:14px;margin-top:4px" onclick="deployPanel()">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-      Deploy Panel
-    </button>
-    <div id="pb-result" style="margin-top:12px;display:none"></div>
-  </div>
-</section>
-
-<!-- Settings Page -->
-<section class="page" id="page-settings">
-  <div class="card">
-    <div class="card-head"><div class="card-title">Change Password</div></div>
-    <div class="form-group"><label class="form-label">Current Password</label><input class="form-input" id="cur-pw" type="password"></div>
-    <div class="form-group"><label class="form-label">New Password</label><input class="form-input" id="new-pw" type="password"></div>
-    <div class="form-group"><label class="form-label">Confirm New Password</label><input class="form-input" id="cfm-pw" type="password"></div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="changePassword()">Update Password</button>
-  </div>
-</section>
-
-</div>
-
-<!-- Modals -->
-<div class="modal-overlay" id="add-modal" onclick="if(event.target===this)closeModal('add-modal')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="closeModal('add-modal')">&times;</button>
-    <div class="modal-title">New Inbound</div>
-    <div class="form-group"><label class="form-label">Name</label><input class="form-input" id="n-label" placeholder="e.g. User1"></div>
-    <div class="form-row">
-      <div class="form-group"><label class="form-label">Traffic Limit</label><input class="form-input" id="n-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited"></div>
-      <div class="form-group" style="max-width:90px"><label class="form-label">Unit</label><select class="form-select" id="n-unit"><option value="GB">GB</option><option value="MB">MB</option></select></div>
+      <div class="form-group"><label>Data Limit</label><div style="display:flex;gap:6px"><input type="number" id="fLimitVal" placeholder="0 = unlimited" min="0" step="0.1" style="flex:1"><select id="fLimitUnit" style="width:70px"><option>GB</option><option>MB</option></select></div></div>
+      <div class="form-group"><label>Expiry (days)</label><input type="number" id="fExpiry" placeholder="0 = never" min="0" step="1"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label class="form-label">Max Connections (0 = Unlimited)</label><input class="form-input" id="n-maxconn" type="number" min="0" placeholder="0"></div>
-      <div class="form-group"><label class="form-label">Expiry Days (0 = Never)</label><input class="form-input" id="n-expiry" type="number" min="0" placeholder="0"></div>
+      <div class="form-group"><label>Max Connections</label><input type="number" id="fMaxConn" placeholder="0 = unlimited" min="0"></div>
+      <div class="form-group"><label>Speed Limit (Mbps)</label><input type="number" id="fSpeed" placeholder="0 = unlimited" min="0"></div>
     </div>
-    <div class="form-group"><label class="form-label">Tag (optional)</label><input class="form-input" id="n-tag" placeholder="e.g. VIP, Trial"></div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="createInbound()">Create Inbound</button>
-  </div>
-</div>
-
-<div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)closeModal('edit-modal')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="closeModal('edit-modal')">&times;</button>
-    <div class="modal-title" id="edit-title">Edit Inbound</div>
-    <input type="hidden" id="edit-uid">
-    <div class="form-group"><label class="form-label">Name (read-only)</label><input class="form-input" id="e-name" readonly style="opacity:.5;cursor:not-allowed"></div>
-    <div class="form-row">
-      <div class="form-group"><label class="form-label">Traffic Limit</label><input class="form-input" id="e-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited"></div>
-      <div class="form-group" style="max-width:90px"><label class="form-label">Unit</label><select class="form-select" id="e-unit"><option value="GB">GB</option><option value="MB">MB</option></select></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label class="form-label">Max Connections</label><input class="form-input" id="e-maxconn" type="number" min="0" placeholder="0"></div>
-      <div class="form-group"><label class="form-label">Expiry Days</label><input class="form-input" id="e-expiry" type="number" min="0" placeholder="0 = Keep current"></div>
-    </div>
-    <div class="form-group"><label class="form-label">Tag</label><input class="form-input" id="e-tag" placeholder="e.g. VIP"></div>
-    <div style="display:flex;gap:8px;margin-top:12px">
-      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
-      <button class="btn btn-danger" onclick="resetTraffic()">Reset Traffic</button>
+    <div class="form-group"><label>Tag</label><input type="text" id="fTag" placeholder="e.g. premium, trial"></div>
+    <div class="form-group"><label>Note</label><textarea id="fNote" placeholder="Optional notes..."></textarea></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveLink()" id="saveLinkBtn">Create</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="addr-modal" onclick="if(event.target===this)closeModal('addr-modal')">
-  <div class="modal" style="position:relative">
-    <button class="modal-close" onclick="closeModal('addr-modal')">&times;</button>
-    <div class="modal-title">Add Clean IP / Domain</div>
-    <div class="form-group"><label class="form-label">Addresses (one per line)</label><textarea class="form-input" id="n-addr" rows="5" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:'JetBrains Mono',monospace;height:auto;padding:10px 12px"></textarea></div>
-    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="addAddresses()">Add All</button>
+<!-- Client Links Modal -->
+<div class="modal-overlay" id="clientModal">
+  <div class="modal">
+    <div class="modal-title" id="clientModalTitle">Client Links</div>
+    <div id="clientLinksContent"></div>
+    <div style="text-align:right;margin-top:16px"><button class="btn" onclick="document.getElementById('clientModal').classList.remove('open')">Close</button></div>
   </div>
 </div>
 
-<div class="modal-overlay" id="logs-modal" onclick="if(event.target===this)closeModal('logs-modal')">
-  <div class="modal" style="max-width:560px;position:relative">
-    <button class="modal-close" onclick="closeModal('logs-modal')">&times;</button>
-    <div class="modal-title">Logs &amp; Connections</div>
-    <div style="background:var(--surface2);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6" id="logs-box">Loading...</div>
-    <button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:10px" onclick="openLogs()">Refresh</button>
-  </div>
-</div>
-
-<div class="modal-overlay" id="config-modal" onclick="if(event.target===this)closeModal('config-modal')">
-  <div class="modal" style="max-width:560px;position:relative">
-    <button class="modal-close" onclick="closeModal('config-modal')">&times;</button>
-    <div class="modal-title">Runtime Config</div>
-    <div style="background:var(--surface2);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:400px;overflow-y:auto;white-space:pre-wrap" id="config-box">Loading...</div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
+<div class="toast-container" id="toastContainer"></div>
 
 <script>
-var allLinks=[],curFilter='all',apiStats={},trafficChart=null;
-function go(id,el){document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active')});document.getElementById('page-'+id).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});if(el)el.classList.add('active');closeSidebar();if(id==='inbounds')loadInbounds();if(id==='cleanip')loadAddresses();if(id==='domain')loadDomain()}
-function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
-function closeSidebar(){document.getElementById('sidebar').classList.remove('open');document.getElementById('overlay').classList.remove('show')}
-function closeModal(id){document.getElementById(id).classList.remove('show')}
-function showModal(id){document.getElementById(id).classList.add('show')}
-function toast(m,e){var t=document.getElementById('toast');t.textContent=m;t.className='toast '+(e?'error':'success')+' show';setTimeout(function(){t.classList.remove('show')},3000)}
-function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function fmtB(b){if(!b||b===0)return '0 B';if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B'}
-function fmtL(b){if(!b||b===0)return 'Unlimited';var g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB'}
+const PANEL_VER='__PANEL_VER__';
+let links=[], statsInterval, trafficChart;
 
-function setGauge(id,pct){pct=Math.max(0,Math.min(100,pct||0));var el=document.getElementById(id);if(el)el.setAttribute('stroke-dashoffset',(201*(1-pct/100)).toFixed(1))}
-
-async function loadStats(){
-  try{
-    var r=await fetch('/api/stats');if(!r.ok)throw 0;apiStats=await r.json();
-    setGauge('g-cpu',apiStats.cpuUsage);setGauge('g-ram',apiStats.ramUsage);setGauge('g-swap',apiStats.swapUsage);setGauge('g-disk',apiStats.storageUsage);
-    document.getElementById('g-cpu-t').textContent=(apiStats.cpuUsage||0).toFixed(1)+'%';
-    document.getElementById('g-ram-t').textContent=(apiStats.ramUsage||0).toFixed(1)+'%';
-    document.getElementById('g-swap-t').textContent=(apiStats.swapUsage||0).toFixed(1)+'%';
-    document.getElementById('g-disk-t').textContent=(apiStats.storageUsage||0).toFixed(1)+'%';
-    var run=apiStats.xrayRunning!==false;
-    document.getElementById('xray-dot').className='badge-dot '+(run?'green':'red');
-    document.getElementById('xray-status-text').textContent=run?'Running':'Stopped';
-    document.getElementById('s-conn').textContent=apiStats.activeConnections||0;
-    document.getElementById('s-up').textContent=apiStats.uploadSpeed||'--';
-    document.getElementById('s-down').textContent=apiStats.downloadSpeed||'--';
-    document.getElementById('s-traffic').textContent=(apiStats.totalTrafficMb||0).toFixed(2)+' MB';
-    document.getElementById('s-sent').textContent=apiStats.totalSent||'--';
-    document.getElementById('s-recv').textContent=apiStats.totalReceived||'--';
-    document.getElementById('s-uptime').textContent=apiStats.xrayUptime||'--';
-    document.getElementById('s-tcp-udp').textContent='TCP: '+(apiStats.tcpConnections||0)+' | UDP: '+(apiStats.udpConnections||0);
-    document.getElementById('s-domain').textContent=apiStats.domain||'--';
-    document.getElementById('s-ipv4').textContent=apiStats.ipv4||'N/A';
-    document.getElementById('s-ipv6').textContent=apiStats.ipv6||'N/A';
-    document.getElementById('s-load').textContent=apiStats.systemLoad||'--';
-    document.getElementById('s-ram-th').textContent=(apiStats.appRam||'--')+' / '+(apiStats.threads||'--')+' threads';
-    document.getElementById('s-os-up').textContent=apiStats.uptime||'--';
-    document.getElementById('pv-tag').textContent=apiStats.panelVersion||'v2.0.0';
-    document.getElementById('ver-badge').textContent=apiStats.panelVersion||'v2.0.0';
-    if(apiStats.telegram)document.getElementById('tg-tag').textContent=apiStats.telegram;
-    var lb=document.getElementById('links-badge');if(lb)lb.textContent=apiStats.linksCount||0;
-    if(document.getElementById('ib-total'))document.getElementById('ib-total').textContent=apiStats.linksCount||0;
-    if(document.getElementById('ib-traffic'))document.getElementById('ib-traffic').textContent=(apiStats.totalTrafficMb||0).toFixed(2)+' MB';
-    if(document.getElementById('ib-requests'))document.getElementById('ib-requests').textContent=apiStats.totalRequests||0;
-    var rd=document.getElementById('rd-domain');if(rd)rd.textContent=apiStats.domain||'--';
-    updateChart(apiStats.hourlyTraffic||{});
-  }catch(e){}
+// ── Auth ──
+async function f(url,opts={}){
+  try{const r=await fetch(url,opts);if(r.status===401){window.location.href='/login';return null}return r}catch(e){toast('Connection error','error');return null}
 }
 
-var ipsVis=false;function toggleIps(){ipsVis=!ipsVis;document.querySelectorAll('.ip-val').forEach(function(el){el.classList.toggle('visible',ipsVis)})}
+// ── Navigation ──
+function showPage(p){
+  document.querySelectorAll('.page').forEach(el=>el.classList.remove('active'));
+  document.getElementById('page-'+p).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===p));
+  const titles={dashboard:'Dashboard',inbounds:'Inbounds',ips:'Clean IPs',domain:'Domain',builder:'Panel Builder',logs:'Logs',settings:'Settings'};
+  document.getElementById('pageTitle').textContent=titles[p]||p;
+  if(p==='inbounds')loadLinks();
+  if(p==='ips')loadAddresses();
+  if(p==='domain')loadDomain();
+  if(p==='logs')loadLogs();
+  // Close mobile sidebar
+  document.getElementById('sidebar').classList.remove('mobile-open');
+}
+function toggleSidebar(){document.getElementById('sidebar').classList.toggle('mobile-open')}
+
+// ── Toast ──
+function toast(msg,type='info'){
+  const c=document.getElementById('toastContainer');
+  const d=document.createElement('div');
+  d.className='toast toast-'+type;d.textContent=msg;
+  c.appendChild(d);
+  setTimeout(()=>d.remove(),3000);
+}
+
+// ── Stats ──
+async function loadStats(){
+  const r=await f('/api/stats');if(!r)return;
+  const s=await r.json();
+  document.getElementById('sCpu').textContent=s.cpuUsage+'%';
+  document.getElementById('sCpuBar').style.width=s.cpuUsage+'%';
+  document.getElementById('sRam').textContent=s.ramUsage+'%';
+  document.getElementById('sRamBar').style.width=s.ramUsage+'%';
+  document.getElementById('sDisk').textContent=s.storageUsage+'%';
+  document.getElementById('sDiskBar').style.width=s.storageUsage+'%';
+  document.getElementById('sNet').textContent=s.downloadSpeed.replace('/s','')+' | '+s.uploadSpeed.replace('/s','');
+  document.getElementById('sConns').textContent=s.activeConnections;
+  document.getElementById('sUptime').textContent=s.uptime;
+  document.getElementById('siRam').textContent=s.ramUsed+' / '+s.ramTotal;
+  document.getElementById('siSwap').textContent=s.swapUsage+'%';
+  document.getElementById('siDisk').textContent=s.storageUsed+' / '+s.storageTotal;
+  document.getElementById('siAppRam').textContent=s.appRam;
+  document.getElementById('siCores').textContent=s.cpuCores;
+  document.getElementById('siTraffic').textContent=s.totalTrafficMb+' MB';
+  document.getElementById('siReqs').textContent=s.totalRequests;
+  document.getElementById('siIPv4').textContent=s.ipv4;
+  document.getElementById('siLinks').textContent=s.linksCount;
+  // Update traffic chart
+  updateChart(s.hourlyTraffic);
+}
 
 function initChart(){
-  var ctx=document.getElementById('trafficChart');if(!ctx)return;
-  var labels=[];for(var i=0;i<24;i++){var h=(new Date().getHours()-23+i+24)%24;labels.push((h<10?'0':'')+h+':00')}
-  trafficChart=new Chart(ctx,{type:'bar',data:{labels:labels,datasets:[{label:'Traffic',data:new Array(24).fill(0),backgroundColor:'rgba(99,102,241,0.3)',borderColor:'#6366f1',borderWidth:1,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9}}},y:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9},callback:function(v){return fmtB(v)}}}}}});
+  const ctx=document.getElementById('trafficChart');
+  if(!ctx)return;
+  const labels=[];const now=new Date();
+  for(let i=23;i>=0;i--){const h=new Date(now-3600000*i);labels.push(h.getHours().toString().padStart(2,'0')+':00')}
+  trafficChart=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label:'Traffic',data:new Array(24).fill(0),backgroundColor:'rgba(99,102,241,0.3)',borderColor:'rgba(99,102,241,0.8)',borderWidth:1,borderRadius:4}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:10}}},y:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:10},callback:v=>v>=1048576?(v/1048576).toFixed(1)+'MB':v>=1024?(v/1024).toFixed(0)+'KB':v+'B'}}}}});
 }
+
 function updateChart(ht){
   if(!trafficChart)return;
-  var data=[];for(var i=0;i<24;i++){var h=(new Date().getHours()-23+i+24)%24;var key=(h<10?'0':'')+h+':00';data.push(((ht[key]||0)/1048576))}
-  trafficChart.data.datasets[0].data=data;trafficChart.update('none');
+  const now=new Date();const data=new Array(24).fill(0);
+  for(let i=23;i>=0;i--){const h=new Date(now-3600000*i);const key=h.getHours().toString().padStart(2,'0')+':00';data[23-i]=ht[key]||0}
+  trafficChart.data.datasets[0].data=data;
+  trafficChart.update('none');
 }
 
-async function openLogs(){
-  try{var r=await fetch('/api/logs');var d=await r.json();
-  var out='STATUS: '+(d.running?'Running':'Stopped')+'\nTraffic: '+fmtB(d.totals.bytes)+'  |  Requests: '+d.totals.requests+'  |  Errors: '+d.totals.errors+'\n\n';
-  out+='── Active connections ('+d.connections.length+') ──\n';
-  if(!d.connections.length)out+='(none)\n';
-  d.connections.forEach(function(c){out+=c.ip+'  '+(c.uuid||'').slice(0,8)+'...  '+fmtB(c.bytes)+'  '+(c.connected_at||'').slice(11,19)+'\n'});
-  if(d.history&&d.history.length){out+='\n── Recent history ('+d.history.length+') ──\n';d.history.slice(-20).forEach(function(h){out+=(h.time||'').slice(11,19)+'  '+(h.label||'?')+'  '+h.ip+'  -> '+h.target+'\n'})}
-  out+='\n── Recent errors ('+d.errors.length+') ──\n';
-  if(!d.errors.length)out+='(none)\n';
-  d.errors.slice().reverse().forEach(function(e){out+=(e.time||'').slice(11,19)+'  '+e.error+'\n'});
-  document.getElementById('logs-box').textContent=out;showModal('logs-modal')}catch(e){toast('Failed to load logs',true)}
+// ── Inbounds ──
+async function loadLinks(){
+  const r=await f('/api/links');if(!r)return;
+  const d=await r.json();links=d.links;renderInbounds();
 }
-async function openConfig(){try{var r=await fetch('/api/config');var d=await r.json();document.getElementById('config-box').textContent=JSON.stringify(d,null,2);showModal('config-modal')}catch(e){toast('Failed',true)}}
-function downloadBackup(){var a=document.createElement('a');a.href='/api/backup';a.download='';document.body.appendChild(a);a.click();a.remove();toast('Backup downloaded')}
 
-/* Inbounds */
-async function loadInbounds(){
-  try{var r=await fetch('/api/links');if(!r.ok)throw 0;var d=await r.json();allLinks=d.links||[];filterInbounds();
-  if(document.getElementById('ib-total'))document.getElementById('ib-total').textContent=allLinks.length;
-  if(document.getElementById('ib-active'))document.getElementById('ib-active').textContent=allLinks.filter(function(l){return l.active}).length;
-  }catch(e){document.getElementById('inbounds-tbody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:32px;color:var(--text4)">Failed to load</td></tr>'}
-}
-function setFilter(f,el){curFilter=f;document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active')});el.classList.add('active');filterInbounds()}
-function filterInbounds(){
-  var q=(document.getElementById('inbound-search')?document.getElementById('inbound-search').value:'').toLowerCase();
-  var filtered=allLinks;
-  if(curFilter==='active')filtered=filtered.filter(function(l){return l.active});
-  if(curFilter==='disabled')filtered=filtered.filter(function(l){return !l.active});
-  if(curFilter==='expired')filtered=filtered.filter(function(l){return l.expired});
-  if(q)filtered=filtered.filter(function(l){return l.label.toLowerCase().indexOf(q)!==-1||l.uuid.toLowerCase().indexOf(q)!==-1});
-  renderInbounds(filtered);
-}
-function renderInbounds(links){
-  var tbody=document.getElementById('inbounds-tbody');if(!links.length){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:32px;color:var(--text4)">No inbounds found</td></tr>';return}
-  var idx=links.length;
-  tbody.innerHTML=links.map(function(l){
-    var u=l.used_bytes,lim=l.limit_bytes,uF=fmtB(u),lF=fmtL(lim);
-    var pct=lim>0?Math.min(100,(u/lim)*100):0;
-    var col=pct>90?'#ef4444':pct>70?'#f59e0b':'#6366f1';
-    var i=idx--;var mc=l.max_connections||0;var cc=l.current_connections||0;
-    var statusTag=l.expired?'<span class="tag tag-amber">Expired</span>':(l.active?'<span class="tag tag-green">Active</span>':'<span class="tag tag-red">Disabled</span>');
-    var tag=l.tag?'<span class="tag tag-purple" style="margin-right:4px">'+esc(l.tag)+'</span>':'';
-    return '<tr><td style="color:var(--text4);font-size:10px">'+i+'</td><td style="font-weight:600;color:var(--text)">'+tag+esc(l.label)+'</td><td><span class="tag tag-purple">VLESS</span></td><td><div class="usage-pill"><span class="used">'+uF+'</span><div class="bar"><div class="fill" style="width:'+pct+'%;background:'+col+'"></div></div><span class="limit">'+lF+'</span></div></td><td style="font-size:11px;font-weight:600;color:'+(mc>0&&cc>=mc?'var(--red)':'var(--text3)')+'">'+cc+'/'+(mc||'&infin;')+'</td><td>'+statusTag+'</td><td><div style="display:flex;gap:3px;align-items:center"><button class="btn-icon btn-secondary" data-uid="'+l.uuid+'" onclick="toggleInbound(this)" title="Toggle">'+(l.active?'ON':'OFF')+'</button><button class="btn-icon btn-secondary" onclick="showEditModal(\''+l.uuid+'\')" title="Edit" style="color:var(--amber)">E</button><button class="btn-icon btn-secondary" onclick="copyVless(\''+esc(l.vless_link).replace(/'/g,"\\'")+'\')" title="Copy Config">C</button><button class="btn-icon btn-secondary" onclick="copySubUrl(\''+l.uuid+'\')" title="Copy Sub URL" style="color:var(--green)">S</button><button class="btn-icon btn-danger" onclick="deleteInbound(\''+l.uuid+'\')" title="Delete">X</button></div></td></tr>';
+function renderInbounds(){
+  const q=(document.getElementById('searchInbounds').value||'').toLowerCase();
+  const fs=document.getElementById('filterStatus').value;
+  let filtered=links.filter(l=>{
+    if(q&&!l.label.toLowerCase().includes(q)&&!(l.tag||'').toLowerCase().includes(q))return false;
+    if(fs==='active'&&(!l.active||l.expired))return false;
+    if(fs==='expired'&&!l.expired)return false;
+    if(fs==='disabled'&&l.active)return false;
+    return true;
+  });
+  const tbody=document.getElementById('inboundsBody');
+  const empty=document.getElementById('emptyInbounds');
+  if(!filtered.length){tbody.innerHTML='';empty.style.display='block';return}
+  empty.style.display='none';
+  tbody.innerHTML=filtered.map(l=>{
+    const pct=l.limit_bytes>0?Math.round(l.used_bytes/l.limit_bytes*100):0;
+    const statusCls=l.expired?'status-expired':l.active?'status-active':'status-disabled';
+    const statusTxt=l.expired?'Expired':l.active?'Active':'Disabled';
+    const usedMB=l.used_bytes>=1073741824?(l.used_bytes/1073741824).toFixed(2)+' GB':(l.used_bytes/1048576).toFixed(1)+' MB';
+    const limitTxt=l.limit_bytes>0?(l.limit_bytes>=1073741824?(l.limit_bytes/1073741824).toFixed(1)+' GB':(l.limit_bytes/1048576).toFixed(0)+' MB'):'Unlimited';
+    const expTxt=l.expiry?new Date(l.expiry).toLocaleDateString():'Never';
+    const tag=l.tag?'<span class="tag">'+esc(l.tag)+'</span>':'-';
+    const copyBtns=`
+      <div class="copy-dropdown">
+        <button class="btn btn-sm btn-icon" onclick="toggleCopyMenu(event)" title="Copy link">&#128203;</button>
+        <div class="copy-menu" id="cm_${l.uuid}">
+          ${Object.entries(l.client_links||{}).map(([k,v])=>`<button class="copy-menu-item" onclick="copyText('${esc(v)}','${k}')">${k}</button>`).join('')}
+        </div>
+      </div>`;
+    return `<tr>
+      <td><strong>${esc(l.label)}</strong></td>
+      <td><span class="${statusCls}">${statusTxt}</span></td>
+      <td>${usedMB} / ${limitTxt} (${pct}%)</td>
+      <td>${expTxt}</td>
+      <td>${l.current_connections}</td>
+      <td>${tag}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm" onclick="showClientLinks('${l.uuid}','${esc(l.label)}')">&#128279;</button>
+        ${copyBtns}
+        <button class="btn btn-sm" onclick="openEditModal('${l.uuid}')">&#9998;</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteLink('${l.uuid}','${esc(l.label)}')">&#10005;</button>
+      </td></tr>`;
   }).join('');
 }
-async function toggleInbound(el){var uid=el.dataset.uid;var link=allLinks.find(function(l){return l.uuid===uid});if(!link)return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!link.active})});await loadInbounds();await loadStats()}catch(e){toast('Error',true)}}
-async function createInbound(){
-  var label=document.getElementById('n-label').value.trim();if(!label){toast('Name required',true);return}
-  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Invalid name',true);return}
-  var val=parseFloat(document.getElementById('n-limit').value)||0;
-  var unit=document.getElementById('n-unit').value;
-  var mc=parseInt(document.getElementById('n-maxconn').value)||0;
-  var exp=parseInt(document.getElementById('n-expiry').value)||0;
-  var tag=document.getElementById('n-tag').value.trim();
-  try{var r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label,limit_value:val,limit_unit:unit,max_connections:mc,expiry_days:exp,tag:tag})});
-  if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Error')}
-  toast('Inbound created');document.getElementById('n-label').value='';document.getElementById('n-limit').value='';document.getElementById('n-maxconn').value='';document.getElementById('n-expiry').value='';document.getElementById('n-tag').value='';closeModal('add-modal');await loadInbounds();await loadStats()}catch(e){toast(e.message,true)}
+
+function toggleCopyMenu(e){e.stopPropagation();const m=e.target.nextElementSibling;document.querySelectorAll('.copy-menu.open').forEach(el=>{if(el!==m)el.classList.remove('open')});m.classList.toggle('open')}
+document.addEventListener('click',()=>document.querySelectorAll('.copy-menu.open').forEach(el=>el.classList.remove('open')));
+
+function showClientLinks(uid,label){
+  const l=links.find(x=>x.uuid===uid);if(!l)return;
+  document.getElementById('clientModalTitle').textContent='Client Links — '+label;
+  const c=document.getElementById('clientLinksContent');
+  c.innerHTML='<div class="client-links-grid">'+
+    Object.entries(l.client_links||{}).map(([k,v])=>`<div class="cl-item"><span>${k}</span><button onclick="copyText('${esc(v)}','${k}')" title="Copy">&#128203;</button></div>`).join('')+
+    '</div><div style="margin-top:12px;padding:10px;background:var(--glass);border-radius:8px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Subscription URL</div><div style="display:flex;gap:6px"><input type="text" value="'+esc(l.sub_url)+'" readonly style="flex:1;padding:6px 10px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit;outline:none"><button class="btn btn-sm" onclick="copyText('${esc(l.sub_url)}','Subscription')">Copy</button></div></div>';
+  document.getElementById('clientModal').classList.add('open');
 }
-async function deleteInbound(uid){if(!confirm('Delete this inbound?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');await loadInbounds();await loadStats()}catch(e){toast('Error',true)}}
-function showEditModal(uid){var l=allLinks.find(function(x){return x.uuid===uid});if(!l)return;document.getElementById('edit-uid').value=uid;document.getElementById('e-name').value=l.label;document.getElementById('e-limit').value=l.limit_bytes>0?(l.limit_bytes/1073741824).toFixed(2):'';document.getElementById('e-unit').value='GB';document.getElementById('e-maxconn').value=l.max_connections>0?l.max_connections:'';document.getElementById('e-expiry').value='';document.getElementById('e-tag').value=l.tag||'';document.getElementById('edit-title').textContent='Edit: '+l.label;showModal('edit-modal')}
-async function saveEdit(){var uid=document.getElementById('edit-uid').value;var val=parseFloat(document.getElementById('e-limit').value)||0;var unit=document.getElementById('e-unit').value;var mc=parseInt(document.getElementById('e-maxconn').value)||0;var exp=parseInt(document.getElementById('e-expiry').value)||0;var tag=document.getElementById('e-tag').value.trim();var body={limit_value:val,limit_unit:unit,max_connections:mc,tag:tag};if(exp>0)body.expiry_days=exp;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');closeModal('edit-modal');await loadInbounds()}catch(e){toast('Error',true)}}
-async function resetTraffic(){var uid=document.getElementById('edit-uid').value;if(!confirm('Reset traffic?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Traffic reset');await loadInbounds()}catch(e){toast('Error',true)}}
-function copyVless(t){navigator.clipboard.writeText(t).then(function(){toast('Config copied')}).catch(function(){toast('Copy failed',true)})}
-async function copySubUrl(uid){var url='https://'+location.host+'/sub/'+uid;navigator.clipboard.writeText(url).then(function(){toast('Sub URL copied')}).catch(function(){toast('Copy failed',true)})}
 
-/* Addresses */
-var allAddrs=[];
-async function loadAddresses(){try{var r=await fetch('/api/addresses');if(!r.ok)throw 0;var d=await r.json();allAddrs=d.addresses||[];renderAddrs()}catch(e){}}
-function renderAddrs(){var el=document.getElementById('address-list');if(!allAddrs.length){el.innerHTML='<div style="color:var(--text4);font-size:12px;padding:8px 0">No addresses added</div>';return}
-el.innerHTML=allAddrs.map(function(a,i){return '<div class="addr-item"><span>'+esc(a)+'</span><button class="btn btn-danger btn-sm" onclick="delAddr('+i+')">Remove</button></div>'}).join('')}
-async function addAddresses(){var text=document.getElementById('n-addr').value.trim();if(!text){toast('Enter address',true);return}var lines=text.split('\n').map(function(l){return l.trim()}).filter(function(l){return l});var added=0,errors=0;for(var i=0;i<lines.length;i++){var addr=lines[i];if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){errors++;continue}try{var r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)added++;else errors++}catch(e){errors++}}if(added>0)toast('Added '+added+' address(es)');if(errors>0)toast(errors+' failed',true);if(added>0){closeModal('addr-modal');await loadAddresses()}}
-async function delAddr(i){if(!confirm('Remove this address?'))return;try{var r=await fetch('/api/addresses/'+i,{method:'DELETE'});if(!r.ok)throw 0;toast('Removed');await loadAddresses()}catch(e){toast('Error',true)}}
+function openCreateModal(){
+  document.getElementById('modalTitle').textContent='New Link';
+  document.getElementById('editUid').value='';
+  document.getElementById('fLabel').value='';
+  document.getElementById('fLimitVal').value='';
+  document.getElementById('fExpiry').value='';
+  document.getElementById('fMaxConn').value='';
+  document.getElementById('fSpeed').value='';
+  document.getElementById('fTag').value='';
+  document.getElementById('fNote').value='';
+  document.getElementById('saveLinkBtn').textContent='Create';
+  document.getElementById('linkModal').classList.add('open');
+}
 
-/* Domain */
-var curDomain='';
-async function loadDomain(){try{var r=await fetch('/api/domain');if(!r.ok)throw 0;var d=await r.json();curDomain=d.domain||'';var rd=document.getElementById('rd-domain');if(rd)rd.textContent=apiStats.domain||location.host;var dv=document.getElementById('dv-domain');var cb=document.getElementById('domain-clear-btn');if(curDomain){dv.textContent=curDomain;dv.style.color='var(--accent)';if(cb)cb.style.display=''}else{dv.textContent=(apiStats.domain||location.host)+' (default)';dv.style.color='var(--text3)';if(cb)cb.style.display='none'}}catch(e){}}
-async function saveDomain(){var d=document.getElementById('domain-input').value.trim();if(!d){toast('Enter domain',true);return}try{var r=await fetch('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})});if(!r.ok){var j=await r.json().catch(function(){return{}});throw new Error(j.detail||'Error')}toast('Domain saved');document.getElementById('domain-input').value='';await loadDomain()}catch(e){toast(e.message,true)}}
-async function clearDomain(){try{await fetch('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:''})});toast('Domain cleared');await loadDomain()}catch(e){toast('Error',true)}}
+function openEditModal(uid){
+  const l=links.find(x=>x.uuid===uid);if(!l)return;
+  document.getElementById('modalTitle').textContent='Edit — '+l.label;
+  document.getElementById('editUid').value=uid;
+  document.getElementById('fLabel').value=l.label;
+  if(l.limit_bytes>0){const gb=l.limit_bytes/1073741824;if(gb>=1){document.getElementById('fLimitVal').value=gb;document.getElementById('fLimitUnit').value='GB'}else{document.getElementById('fLimitVal').value=l.limit_bytes/1048576;document.getElementById('fLimitUnit').value='MB'}}
+  else{document.getElementById('fLimitVal').value='';document.getElementById('fLimitUnit').value='GB'}
+  if(l.expiry){const diff=Math.max(0,Math.round((new Date(l.expiry)-Date.now())/86400000));document.getElementById('fExpiry').value=diff||''}else{document.getElementById('fExpiry').value=''}
+  document.getElementById('fMaxConn').value=l.max_connections||'';
+  document.getElementById('fSpeed').value=l.speed_limit||'';
+  document.getElementById('fTag').value=l.tag||'';
+  document.getElementById('fNote').value=l.note||'';
+  document.getElementById('saveLinkBtn').textContent='Save';
+  document.getElementById('linkModal').classList.add('open');
+}
 
-/* Panel Builder */
+function closeModal(){document.getElementById('linkModal').classList.remove('open')}
+
+async function saveLink(){
+  const uid=document.getElementById('editUid').value;
+  const body={
+    label:document.getElementById('fLabel').value,
+    limit_value:parseFloat(document.getElementById('fLimitVal').value)||0,
+    limit_unit:document.getElementById('fLimitUnit').value,
+    expiry_days:parseFloat(document.getElementById('fExpiry').value)||0,
+    max_connections:parseInt(document.getElementById('fMaxConn').value)||0,
+    speed_limit:parseInt(document.getElementById('fSpeed').value)||0,
+    tag:document.getElementById('fTag').value,
+    note:document.getElementById('fNote').value,
+  };
+  const url=uid?'/api/links/'+uid:'/api/links';
+  const method=uid?'PATCH':'POST';
+  const r=await f(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r){toast('Error','error');return}
+  if(r.ok){toast(uid?'Updated':'Created','success');closeModal();loadLinks()}
+  else{const d=await r.json();toast(d.detail||'Error','error')}
+}
+
+async function deleteLink(uid,label){
+  if(!confirm('Delete "'+label+'"? This will disconnect all active connections.'))return;
+  const r=await f('/api/links/'+uid,{method:'DELETE'});
+  if(r&&r.ok){toast('Deleted','success');loadLinks()}else{toast('Error','error')}
+}
+
+// ── Addresses ──
+async function loadAddresses(){
+  const r=await f('/api/addresses');if(!r)return;
+  const d=await r.json();
+  document.getElementById('addrList').innerHTML=d.addresses.map((a,i)=>
+    `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--glass);border-radius:10px;margin-bottom:6px">
+      <span style="font-size:13px;direction:ltr">${esc(a)}</span>
+      <button class="btn btn-sm btn-danger" onclick="delAddr(${i})">Remove</button>
+    </div>`
+  ).join('')||'<p style="color:var(--text4);text-align:center;padding:16px">No custom IPs</p>';
+}
+async function addAddr(){
+  const a=document.getElementById('newAddr').value.trim();if(!a)return;
+  const r=await f('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})});
+  if(r&&r.ok){document.getElementById('newAddr').value='';loadAddresses();toast('Added','success')}
+  else{const d=await r.json();toast(d.detail||'Error','error')}
+}
+async function delAddr(i){
+  const r=await f('/api/addresses/'+i,{method:'DELETE'});
+  if(r&&r.ok){loadAddresses();toast('Removed','success')}
+}
+
+// ── Domain ──
+async function loadDomain(){
+  const r=await f('/api/domain');if(!r)return;
+  const d=await r.json();document.getElementById('domainInput').value=d.domain||'';
+}
+async function saveDomain(){
+  const d=document.getElementById('domainInput').value.trim();
+  const r=await f('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})});
+  if(r&&r.ok)toast('Saved','success');else toast('Error','error');
+}
+
+// ── Panel Builder ──
 async function deployPanel(){
-  var token=document.getElementById('pb-token').value.trim();var space=document.getElementById('pb-space').value.trim();var user=document.getElementById('pb-user').value.trim();var pass=document.getElementById('pb-pass').value;
-  if(!token){toast('HF token required',true);return}if(!space){toast('Space name required',true);return}if(pass.length<4){toast('Password min 4 chars',true);return}
-  var res=document.getElementById('pb-result');res.style.display='block';res.innerHTML='<div style="color:var(--text3);font-size:12px">Deploying... please wait</div>';
-  try{var r=await fetch('/api/panel-builder/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hf_token:token,space_name:space,admin_username:user,admin_password:pass})});
-  if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Deploy failed')}
-  var d=await r.json();res.innerHTML='<div style="color:var(--green);font-size:13px;font-weight:600">Panel deployed successfully!</div><div style="margin-top:8px"><a href="'+esc(d.space_url)+'" target="_blank" style="color:var(--accent);font-size:12px">'+esc(d.space_url)+'</a></div><div style="margin-top:4px"><a href="'+esc(d.app_url)+'/dashboard" target="_blank" style="color:var(--accent2);font-size:12px">'+esc(d.app_url)+'/dashboard</a></div>';toast('Panel deployed!')}catch(e){res.innerHTML='<div style="color:var(--red);font-size:12px">'+esc(e.message)+'</div>';toast(e.message,true)}
+  const token=document.getElementById('pbToken').value.trim();
+  const space=document.getElementById('pbSpace').value.trim();
+  const user=document.getElementById('pbUser').value.trim();
+  const pass=document.getElementById('pbPass').value;
+  if(!token||!space){toast('Token and Space name required','error');return}
+  document.getElementById('deployBtn').disabled=true;document.getElementById('deployBtn').textContent='Deploying...';
+  const r=await f('/api/panel-builder/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hf_token:token,space_name:space,admin_username:user,admin_password:pass})});
+  document.getElementById('deployBtn').disabled=false;document.getElementById('deployBtn').textContent='Deploy Panel';
+  if(r&&r.ok){
+    const d=await r.json();
+    document.getElementById('deployResult').style.display='block';
+    document.getElementById('deployResult').innerHTML='<strong style="color:var(--emerald)">Panel deployed successfully!</strong><br><br>'+
+      '<a href="'+d.space_url+'" target="_blank">'+d.space_url+'</a><br>'+
+      '<a href="'+d.app_url+'" target="_blank">'+d.app_url+'</a>';
+    toast('Deployed!','success');
+  }else{const d=await r.json();toast(d.detail||'Deploy failed','error')}
 }
 
-/* Settings */
-async function changePassword(){var cur=document.getElementById('cur-pw').value;var nw=document.getElementById('new-pw').value;var cf=document.getElementById('cfm-pw').value;if(!cur||!nw||!cf){toast('Fill all fields',true);return}if(nw!==cf){toast('Passwords dont match',true);return}if(nw.length<4){toast('Min 4 characters',true);return}try{var r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Error')}toast('Password updated');document.getElementById('cur-pw').value='';document.getElementById('new-pw').value='';document.getElementById('cfm-pw').value=''}catch(e){toast(e.message,true)}}
-async function doLogout(){await fetch('/api/logout',{method:'POST'});location.href='/login'}
+// ── Logs ──
+async function loadLogs(){
+  const r=await f('/api/logs');if(!r)return;
+  const d=await r.json();
+  const el=document.getElementById('errorLogs');
+  if(d.errors.length){el.innerHTML=d.errors.map(e=>`<div class="log-entry"><span class="log-time">${e.time?.slice(11,19)||''}</span><span class="log-type log-error">ERROR</span><span>${esc(e.error||'')}</span></div>`).join('')}
+  else{el.innerHTML='<p style="color:var(--text4);text-align:center;padding:20px">No errors</p>'}
+  const ch=document.getElementById('connHistory');
+  if(d.history.length){ch.innerHTML=d.history.map(h=>`<div class="log-entry"><span class="log-time">${h.time?.slice(11,19)||''}</span><span style="color:var(--text3)">${esc(h.label||'')}</span><span>${esc(h.ip||'')}</span><span style="color:var(--text4)">${esc(h.target||'')}</span></div>`).join('')}
+  else{ch.innerHTML='<p style="color:var(--text4);text-align:center;padding:20px">No history</p>'}
+}
 
-/* Init */
-initChart();loadStats();loadInbounds();
-setInterval(loadStats,5000);setInterval(loadInbounds,15000);
+// ── Settings ──
+async function changePw(){
+  const cur=document.getElementById('curPw').value;
+  const nw=document.getElementById('newPw').value;
+  if(!cur||!nw){toast('Fill both fields','error');return}
+  const r=await f('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});
+  if(r&&r.ok){toast('Password changed','success');document.getElementById('curPw').value='';document.getElementById('newPw').value=''}
+  else{const d=await r.json();toast(d.detail||'Error','error')}
+}
+
+async function downloadBackup(){
+  const r=await f('/api/backup');if(!r)return;
+  const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='usf-backup.json';a.click();toast('Downloaded','success');
+}
+
+async function restoreBackup(input){
+  const file=input.files[0];if(!file)return;
+  const text=await file.text();
+  const r=await f('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:text});
+  if(r&&r.ok){toast('Restored!','success');loadLinks()}else{const d=await r.json();toast(d.detail||'Error','error')}
+  input.value='';
+}
+
+async function serviceAction(action){
+  if(!confirm(action==='stop'?'Stop the service?':'Restart the service?'))return;
+  const r=await f('/api/service/'+action,{method:'POST'});
+  if(r&&r.ok)toast('Done','success');else toast('Error','error');
+}
+
+async function doLogout(){
+  await f('/api/logout',{method:'POST'});
+  window.location.href='/login';
+}
+
+// ── Utils ──
+function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function copyText(text,name){
+  navigator.clipboard.writeText(text).then(()=>toast(name+' copied','success')).catch(()=>{
+    const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast(name+' copied','success');
+  });
+}
+
+// ── Init ──
+initChart();
+loadStats();
+statsInterval=setInterval(loadStats,3000);
 </script>
-</body>
-</html>"""
+</body></html>
+'''
 
-#  USF Panel v2.0.0 — Routes & Main
-# ============================================================
+# ─── HTML Route Handlers ────────────────────────────────────────────────────
+@app.get("/status/{uid}")
+async def status_page(uid: str):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if not link:
+            return HTMLResponse(content=STATUS_404, status_code=404)
+        domain = CUSTOM_DOMAIN or get_domain()
+        client_links = generate_all_client_links(uid, link["label"])
+        data_json = json.dumps({
+            "label": link["label"], "domain": domain, "uuid": uid,
+            "active": link["active"], "expired": is_expired(link),
+            "expiry": link.get("expiry", ""),
+            "used_bytes": link["used_bytes"], "limit_bytes": link["limit_bytes"],
+            "used_mb": round(link["used_bytes"] / 1048576, 2),
+            "limit_mb": round(link["limit_bytes"] / 1048576, 2) if link["limit_bytes"] > 0 else 0,
+            "remaining_mb": round((link["limit_bytes"] - link["used_bytes"]) / 1048576, 2) if link["limit_bytes"] > 0 else 0,
+            "usage_percent": round((link["used_bytes"] / link["limit_bytes"]) * 100, 1) if link["limit_bytes"] > 0 else 0,
+            "sub_url": f"https://{domain}/sub/{uid}",
+            "client_links": client_links,
+            "speed_limit": link.get("speed_limit", 0),
+            "current_connections": count_connections_for_link(uid),
+        }, ensure_ascii=False)
+    html = STATUS_HTML.replace("__TITLE__", link["label"] + " — Usf")
+    html = html.replace("__LABEL__", link["label"])
+    html = html.replace("__DOMAIN__", domain)
+    html = html.replace("__DATA__", data_json)
+    return HTMLResponse(content=html)
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if await is_valid_session(token):
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
+    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
-    return HTMLResponse(content=DASHBOARD_HTML)
-
-@app.get("/inbounds", response_class=HTMLResponse)
-async def inbounds_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
-        return RedirectResponse(url="/login")
-    return RedirectResponse(url="/dashboard")
-
-@app.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
-        return RedirectResponse(url="/login")
-    return RedirectResponse(url="/dashboard")
+    html = DASHBOARD_HTML.replace("__PANEL_VER__", PANEL_VERSION)
+    return HTMLResponse(content=html)
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=CONFIG["port"],
-        loop="uvloop" if _HAS_UVLOOP else "asyncio",
-        http="httptools" if _HAS_UVLOOP else "h11",
-        ws="websockets",
-        log_level="info",
-        access_log=False,
-        timeout_keep_alive=75,
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", access_log=False)
