@@ -911,15 +911,45 @@ $("tokenInput").addEventListener("keypress", (e) => {
 });
 
 // ─── Hide loading overlay ───────────────────────────────────────────────────
-window.addEventListener("load", () => {
-  setTimeout(() => {
-    $("loadingOverlay").classList.add("hide");
-    setTimeout(() => $("loadingOverlay").remove(), 500);
-  }, 300);
-});
+// Hide overlay as soon as the module script executes (don't wait for 'load'
+// event which waits for all resources including the esm.sh fetch).
+function hideOverlay() {
+  const ov = $("loadingOverlay");
+  if (ov) {
+    ov.classList.add("hide");
+    setTimeout(() => ov.remove(), 500);
+  }
+}
+hideOverlay();
 
 // Make goToStep accessible globally
 window.goToStep = goToStep;
+</script>
+
+<!-- Inline script: hide overlay immediately + placeholder functions -->
+<script>
+(function() {
+  function hide() {
+    var ov = document.getElementById("loadingOverlay");
+    if (ov) { ov.classList.add("hide"); setTimeout(function(){ ov.remove(); }, 500); }
+  }
+  if (document.readyState !== "loading") hide();
+  else document.addEventListener("DOMContentLoaded", hide);
+  setTimeout(hide, 3000);
+
+  // Placeholder functions — overwritten when the ES module loads from esm.sh
+  // This prevents "function not defined" errors if user clicks before module loads.
+  var msg = "کمی صبر کنید، در حال بارگذاری ماژول‌ها...";
+  function placeholder() {
+    var t = document.getElementById("toast");
+    if (t) { t.textContent = msg; t.classList.add("show"); setTimeout(function(){ t.classList.remove("show"); }, 2500); }
+    else alert(msg);
+  }
+  window.validateToken = placeholder;
+  window.startDeploy = placeholder;
+  window.copyUrl = placeholder;
+  window.goToStep = placeholder;
+})();
 </script>
 </body>
 </html>
