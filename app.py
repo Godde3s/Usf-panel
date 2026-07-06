@@ -306,7 +306,14 @@ async def shutdown():
         await http_client.aclose()
 
 def get_domain() -> str:
-    return os.environ.get("SPACE_HOST", "localhost").replace("https://", "").replace("http://", "")
+    d = os.environ.get("SPACE_HOST", "")
+    if d:
+        return d.replace("https://", "").replace("http://", "").rstrip("/")
+    author = os.environ.get("SPACE_AUTHOR_NAME", "")
+    name = os.environ.get("SPACE_NAME", "")
+    if author and name:
+        return f"{author}-{name}.hf.space"
+    return "localhost"
 
 def generate_uuid(seed: str | None = None) -> str:
     if seed is None:
@@ -1123,9 +1130,7 @@ async def add_usage(uid: str, n: int):
 async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
     try:
         while True:
-            msg = await websocket.receive()
-            if msg["type"] == "websocket.disconnect": break
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
+            data = await websocket.receive_bytes()
             if not data: continue
             size = len(data)
             if not await check_quota(link_uid, size):
@@ -1136,12 +1141,12 @@ async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id:
             await add_usage(link_uid, size)
             writer.write(data); await writer.drain()
     except WebSocketDisconnect: pass
+    except Exception: pass
     finally:
         try: writer.write_eof()
         except: pass
 
 async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
-    first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
@@ -1153,14 +1158,11 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
             connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now().strftime("%H:00")] += size
             await add_usage(link_uid, size)
-            await websocket.send_bytes((b"\x00\x00" + data) if first else data)
-            first = False
-    except: pass
+            await websocket.send_bytes(data)
+    except Exception: pass
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
-    # NOTE: ensure_default_link() removed from here — was called on every
-    # WS connection, causing lock contention and latency. Now called at startup.
     await websocket.accept()
     writer = None
     conn_id = None
@@ -1171,8 +1173,10 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         async with LINKS_LOCK:
             link_data = LINKS.get(uuid)
             if link_data is None or not link_data["active"]:
+                logger.warning(f"WS rejected: uuid={uuid[:8]}... link not found or disabled (ip={client_ip})")
                 await websocket.close(code=1008, reason="link not found or disabled"); return
             if is_expired(link_data):
+                logger.warning(f"WS rejected: uuid={uuid[:8]}... link expired (ip={client_ip})")
                 await websocket.close(code=1008, reason="link expired"); return
             max_conn = link_data.get("max_connections", 0)
         if max_conn > 0:
@@ -1181,13 +1185,10 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                 current = count_connections_for_link(uuid)
                 if current >= max_conn:
                     await websocket.close(code=1008, reason="connection limit reached"); return
-        # Increased timeout from 15s to 30s — some clients (Hiddify) are slow
-        # to send the first VLESS header through HF's proxy chain.
-        first_msg = await asyncio.wait_for(websocket.receive(), timeout=30.0)
-        if first_msg["type"] == "websocket.disconnect": return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode("latin-1")
+        first_chunk = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
         if not first_chunk: return
         command, address, port, initial_payload = await parse_vless_header(first_chunk)
+        logger.info(f"WS connect: {client_ip} -> {address}:{port} (cmd={command}, uuid={uuid[:8]}...)")
         conn_id = secrets.token_urlsafe(8)
         connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
         connection_sockets[conn_id] = websocket
@@ -1198,12 +1199,10 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         hourly_traffic[datetime.now().strftime("%H:00")] += size
         await add_usage(uuid, size)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=15.0)
-        # ─── Speed: TCP_NODELAY disables Nagle's algorithm = lower latency for small packets
         try:
             sock = writer.get_extra_info('socket')
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # Increase send/recv buffers for higher throughput
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
@@ -1222,9 +1221,11 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
         done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel()
-    except WebSocketDisconnect: pass
+    except WebSocketDisconnect:
+        logger.info(f"WS disconnect: uuid={uuid[:8]}... ip={client_ip}")
     except Exception as exc:
         stats["total_errors"] += 1
+        logger.error(f"WS error: {exc} (uuid={uuid[:8]}... ip={client_ip})")
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
     finally:
         if writer:
