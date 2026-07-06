@@ -63,7 +63,7 @@
             display: none !important;
         }
 
-        /* ===== BG EFFECTS (mobile optimized) ===== */
+        /* ===== BG EFFECTS ===== */
         .bg-effects {
             position: fixed;
             inset: 0;
@@ -264,7 +264,7 @@
             color: var(--text);
         }
 
-        /* ===== HERO (MOBILE FIRST) ===== */
+        /* ===== HERO ===== */
         .hero {
             min-height: 100vh;
             min-height: 100dvh;
@@ -277,7 +277,7 @@
             display: grid;
             grid-template-columns: 1fr;
             gap: 28px;
-            align-items: center;
+            align-items: start;
         }
         body.lang-en .hero-grid {
             direction: ltr;
@@ -390,7 +390,6 @@
             border-radius: var(--radius);
             padding: 20px 16px;
             box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
-            order: 0;
         }
         .hero-card h3 {
             font-size: 15px;
@@ -428,6 +427,7 @@
             font-size: 13px;
             color: var(--text2);
             line-height: 1.7;
+            word-break: break-word;
         }
         .step-text strong {
             color: var(--text);
@@ -837,13 +837,32 @@
             .container {
                 padding: 0 40px;
             }
-            .hero-grid {
-                grid-template-columns: 1.1fr 0.9fr;
-                gap: 60px;
+            nav {
+                height: 64px;
+            }
+            .nav-logo {
+                font-size: 18px;
+            }
+            .nav-logo-icon {
+                width: 34px;
+                height: 34px;
+                font-size: 15px;
+            }
+            .nav-links a {
+                padding: 8px 16px;
+                font-size: 14px;
+            }
+            .lang-toggle button {
+                font-size: 12px;
+                padding: 5px 12px;
             }
             .hero {
                 padding-top: 96px;
                 min-height: 100vh;
+            }
+            .hero-grid {
+                grid-template-columns: 1.1fr 0.9fr;
+                gap: 60px;
             }
             .hero h1 {
                 font-size: clamp(36px, 4.5vw, 56px);
@@ -893,21 +912,10 @@
                 min-height: 56px;
                 font-size: 16px;
             }
-            .nav-links a {
-                padding: 8px 16px;
-                font-size: 14px;
-            }
-            .lang-toggle button {
-                font-size: 12px;
-                padding: 5px 12px;
-            }
             .btn-lg {
                 padding: 14px 28px;
                 font-size: 15px;
                 min-height: 52px;
-            }
-            .hero-buttons .btn-lg {
-                width: auto;
             }
             .orb-1 {
                 width: 600px;
@@ -974,6 +982,15 @@
                 font-size: 11px;
                 padding: 4px 10px;
                 min-height: 30px;
+            }
+            .hero-card {
+                padding: 16px 12px;
+            }
+            .section {
+                padding: 40px 0;
+            }
+            .section h2 {
+                font-size: 22px;
             }
         }
 
