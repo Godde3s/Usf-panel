@@ -179,7 +179,14 @@ async def anti_fingerprint(request, call_next):
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def get_domain():
-    return os.environ.get("SPACE_HOST", "localhost").replace("https://","").replace("http://","")
+    d = os.environ.get("SPACE_HOST", "")
+    if d:
+        return d.replace("https://","").replace("http://","").rstrip("/")
+    author = os.environ.get("SPACE_AUTHOR_NAME", "")
+    name = os.environ.get("SPACE_NAME", "")
+    if author and name:
+        return f"{author}-{name}.hf.space"
+    return "localhost"
 
 def generate_uuid(seed=None):
     if seed is None:
@@ -187,15 +194,20 @@ def generate_uuid(seed=None):
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uid, remark="Usf", address=None):
-    domain = CUSTOM_DOMAIN or get_domain()
-    addr = address or domain
-    params = {
+def _make_vless_params(domain, uid):
+    return {
         "encryption": "none", "security": "tls", "type": "ws",
         "flow": "xtls-rprx-vision", "host": domain,
         "path": f"/ws/{uid}", "sni": domain,
         "fp": "chrome", "alpn": "h2,http/1.1",
+        "mux": "true", "mux.max-connections": "8",
+        "pbk": base64.b64encode(os.urandom(16)).decode()[:22],
     }
+
+def generate_vless_link(uid, remark="Usf", address=None):
+    domain = CUSTOM_DOMAIN or get_domain()
+    addr = address or domain
+    params = _make_vless_params(domain, uid)
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
 
@@ -210,6 +222,7 @@ def generate_all_client_links(uid, label, address=None):
         "type": "ws", "security": "tls", "host": domain,
         "path": f"/ws/{uid}", "sni": domain,
         "fp": "chrome", "alpn": "h2,http/1.1", "flow": "xtls-rprx-vision",
+        "encryption": "none", "mux": "true",
     }
     npv_q = "&".join(f"{k}={quote(str(v))}" for k, v in npv_params.items())
     npv_link = f"npv://{uid}@{addr}:443?{npv_q}#{quote(label)}"
@@ -220,7 +233,7 @@ def generate_all_client_links(uid, label, address=None):
         "config_type": "vless", "uuid": uid, "network": "ws",
         "security": "tls", "sni": domain, "fp": "chrome",
         "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
-        "flow": "xtls-rprx-vision",
+        "flow": "xtls-rprx-vision", "multiplex": True,
     }, separators=(",", ":"))
     hiddify_b64 = base64.b64encode(hiddify_config.encode()).decode()
     hiddify_link = f"hiddify://import/{hiddify_b64}"
@@ -231,7 +244,7 @@ def generate_all_client_links(uid, label, address=None):
         "config_type": "vless", "id": uid, "network": "ws",
         "security": "tls", "sni": domain, "fp": "chrome",
         "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
-        "flow": "xtls-rprx-vision",
+        "flow": "xtls-rprx-vision", "multiplex": True,
     }, separators=(",", ":"))
     mahsang_b64 = base64.b64encode(mahsang_config.encode()).decode()
     mahsang_link = f"mahsa://{mahsang_b64}"
@@ -495,7 +508,8 @@ async def api_login(request: Request):
         raise HTTPException(401, "Invalid credentials")
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=True)
+    is_https = request.url.scheme == "https"
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=is_https)
     return resp
 
 @app.post("/api/logout")
@@ -893,23 +907,28 @@ CMD ["python", "-c", "import uvicorn; uvicorn.run('app:app', host='0.0.0.0', por
 RELAY_BUF = 512 * 1024
 
 async def parse_vless_header(chunk):
-    if len(chunk) < 24: raise ValueError("too small")
+    if len(chunk) < 26: raise ValueError("too small")
     p = 0
-    p += 1 + 16  # version + uuid
+    p += 1 + 16  # version(1) + uuid(16)
     addon_len = chunk[p]; p += 1 + addon_len
     cmd = chunk[p]; p += 1
-    port = int.from_bytes(chunk[p:p+2], "big"); p += 2
+    # VLESS spec: after command comes address TYPE, then ADDRESS, then PORT
     atype = chunk[p]; p += 1
-    if atype == 1:
+    if atype == 1:  # IPv4
+        if len(chunk) < p + 4 + 2: raise ValueError("truncated IPv4")
         addr = ".".join(str(b) for b in chunk[p:p+4]); p += 4
-    elif atype == 2:
+    elif atype == 2:  # Domain
         dl = chunk[p]; p += 1
+        if len(chunk) < p + dl + 2: raise ValueError("truncated domain")
         addr = chunk[p:p+dl].decode("utf-8", errors="ignore"); p += dl
-    elif atype == 3:
+    elif atype == 3:  # IPv6
+        if len(chunk) < p + 16 + 2: raise ValueError("truncated IPv6")
         ab = chunk[p:p+16]; p += 16
         addr = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
     else:
         raise ValueError(f"unknown addr type: {atype}")
+    if len(chunk) < p + 2: raise ValueError("truncated port")
+    port = int.from_bytes(chunk[p:p+2], "big"); p += 2
     return cmd, addr, port, chunk[p:]
 
 async def check_quota(uid, n):
@@ -924,7 +943,17 @@ async def add_usage(uid, n):
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
 
+def _get_speed_limit_bps(uid):
+    """Return speed limit in bytes/sec for a link, 0 = unlimited."""
+    link = LINKS.get(uid)
+    if not link: return 0
+    sl = link.get("speed_limit", 0)
+    if sl <= 0: return 0
+    # speed_limit is in Mbps, convert to bytes/sec
+    return int(sl * 1024 * 1024 / 8)
+
 async def ws_to_tcp(ws, writer, cid, uid):
+    limit_bps = _get_speed_limit_bps(uid)
     try:
         while True:
             msg = await ws.receive()
@@ -937,6 +966,11 @@ async def ws_to_tcp(ws, writer, cid, uid):
             connections[cid]["bytes"] += len(data)
             hourly_traffic[datetime.now().strftime("%H:00")] += len(data)
             await add_usage(uid, len(data))
+            if limit_bps > 0:
+                # Token-bucket: sleep to enforce rate
+                sleep_time = len(data) / limit_bps
+                if sleep_time > 0.01:
+                    await asyncio.sleep(sleep_time)
             writer.write(data); await writer.drain()
     except WebSocketDisconnect: pass
     finally:
@@ -944,6 +978,7 @@ async def ws_to_tcp(ws, writer, cid, uid):
         except: pass
 
 async def tcp_to_ws(ws, reader, cid, uid):
+    limit_bps = _get_speed_limit_bps(uid)
     first = True
     try:
         while True:
@@ -955,6 +990,11 @@ async def tcp_to_ws(ws, reader, cid, uid):
             connections[cid]["bytes"] += len(data)
             hourly_traffic[datetime.now().strftime("%H:00")] += len(data)
             await add_usage(uid, len(data))
+            if limit_bps > 0:
+                sleep_time = len(data) / limit_bps
+                if sleep_time > 0.01:
+                    await asyncio.sleep(sleep_time)
+            # VLESS response header: version(0x00) + addon_length(0x00)
             await ws.send_bytes((b"\x00\x00" + data) if first else data)
             first = False
     except: pass
