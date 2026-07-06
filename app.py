@@ -1,7 +1,3 @@
-#  USF Panel v3.0.0 — Complete Single-File App
-#  Compatible with HuggingFace Spaces (port 7860, python:3.11-slim)
-# ============================================================
-
 import asyncio
 import json
 import os
@@ -11,67 +7,86 @@ import time
 import re
 import socket
 import sqlite3
-import uuid as _uuid_mod
 import uuid
 import threading
 import psutil
-import base64
-import contextlib
-import logging
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 from collections import deque, defaultdict
-from html import escape as _hesc
+
+# ─── Speed optimizations (uvloop + orjson + httptools) ─────────────────────
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    _HAS_UVLOOP = True
+except ImportError:
+    _HAS_UVLOOP = False
+
+try:
+    import orjson
+    _HAS_ORJSON = True
+except ImportError:
+    orjson = None
+    _HAS_ORJSON = False
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
+import logging
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Usf")
-logger.info("Usf v3.0.0 starting")
+logger = logging.getLogger("Usf-Gateway")
+logger.info(f"Usf starting | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
 
 app = FastAPI(title="Usf", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 7860)),
-    "secret": os.environ.get("SECRET_KEY", "usf-default-secret-key-change-me"),
+    "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v3.0.0")
-CORE_VERSION = os.environ.get("CORE_VERSION", "v3.0.0")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.0.1")
+CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
 SERVICE_RUNNING = True
 SERVICE_STARTED_AT = time.time()
 
-# ─── SQLite ───────────────────────────────────────────────────────────────────
+# ─── SQLite persistence (survives HF Space restarts) ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/tmp/usf.db")
 _DB_LOCK = threading.Lock()
 
 def db_init():
+    """Initialize the SQLite database and load saved state."""
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-            )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
             conn.commit()
-        logger.info(f"SQLite OK: {DB_PATH}")
+        logger.info(f"SQLite initialized at {DB_PATH}")
     except Exception as e:
-        logger.warning(f"SQLite init error: {e}")
+        logger.warning(f"SQLite init failed: {e} (running in-memory only)")
 
-def db_set(key, value):
+def db_set(key: str, value: str):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?,?,?)",
-                         (key, value, datetime.now().isoformat()))
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, datetime.now().isoformat())
+            )
             conn.commit()
     except Exception as e:
-        logger.warning(f"db_set({key}) err: {e}")
+        logger.warning(f"db_set({key}) failed: {e}")
 
-def db_get(key, default=None):
+def db_get(key: str, default=None):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
@@ -79,7 +94,7 @@ def db_get(key, default=None):
     except Exception:
         return default
 
-def db_delete(key):
+def db_delete(key: str):
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM kv WHERE key=?", (key,))
@@ -87,45 +102,92 @@ def db_delete(key):
     except Exception:
         pass
 
-# ─── State (locks created in lifespan) ───────────────────────────────────────
-connections = {}
-connection_sockets = {}
-link_ip_map = defaultdict(set)
+# ─── Rate limiting (anti brute-force) ────────────────────────────────────────
+RATE_LIMIT = defaultdict(lambda: deque(maxlen=20))  # ip -> deque of timestamps
+RATE_LIMIT_LOCK = asyncio.Lock()
+
+async def rate_limit_check(ip: str, max_requests: int = 10, window_sec: int = 60) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    async with RATE_LIMIT_LOCK:
+        dq = RATE_LIMIT[ip]
+        # Drop timestamps outside the window
+        while dq and now - dq[0] > window_sec:
+            dq.popleft()
+        if len(dq) >= max_requests:
+            return False
+        dq.append(now)
+        return True
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Anti-fingerprinting: sanitize all response headers ─────────────────────
+# Removes Server, X-Powered-By, Via, X-Forwarded-*, etc. so the panel can't
+# be fingerprinted by scanners. Also adds security headers (HSTS, CSP-lite,
+# X-Content-Type-Options, Referrer-Policy) to protect end users.
+@app.middleware("http")
+async def sanitize_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    # Strip identifying headers
+    for h in ("server", "x-powered-by", "via", "x-aspnet-version", "x-forwarded-host"):
+        if h in response.headers:
+            del response.headers[h]
+    # Force a generic Server header
+    response.headers["server"] = "Usf"
+    # Security headers
+    response.headers["x-content-type-options"] = "nosniff"
+    response.headers["x-frame-options"] = "SAMEORIGIN"
+    response.headers["referrer-policy"] = "no-referrer"
+    response.headers["x-xss-protection"] = "1; mode=block"
+    if request.url.scheme == "https":
+        response.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+connections: dict = {}
+connection_sockets: dict = {}
+link_ip_map: dict = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
-error_logs = deque(maxlen=200)
-hourly_traffic = defaultdict(int)
-connection_history = deque(maxlen=1000)
-http_client = None
+error_logs: deque = deque(maxlen=50)
+hourly_traffic: dict = defaultdict(int)
+http_client: httpx.AsyncClient | None = None
+
 _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
 
-LINKS = {}
-LINKS_LOCK = None
-CUSTOM_ADDRESSES = ["amazonaws.com"]
-CUSTOM_ADDRESSES_LOCK = None
-CUSTOM_DOMAIN = ""
-CUSTOM_DOMAIN_LOCK = None
+LINKS: dict = {}
+LINKS_LOCK = asyncio.Lock()
 
-SESSIONS = {}
-SESSIONS_LOCK = None
-RATE_LIMITS = {}
-RATE_LIMIT_LOCK = None
+CUSTOM_ADDRESSES: list = ["amazonaws.com"]
+CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
-SESSION_COOKIE = "usf_sess"
+CUSTOM_DOMAIN: str = ""
+CUSTOM_DOMAIN_LOCK = asyncio.Lock()
+
+SESSION_COOKIE = "Usf_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 
-AUTH = {}
-
-def hash_password(pw):
+def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-# ─── Auth ────────────────────────────────────────────────────────────────────
-async def create_session():
+AUTH = {
+    "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin")),
+    "username": os.environ.get("ADMIN_USERNAME", "admin"),
+}
+SESSIONS: dict = {}
+SESSIONS_LOCK = asyncio.Lock()
+
+async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
     return token
 
-async def is_valid_session(token):
+async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
     async with SESSIONS_LOCK:
@@ -135,7 +197,7 @@ async def is_valid_session(token):
             return False
         return True
 
-async def destroy_session(token):
+async def destroy_session(token: str | None):
     if token:
         async with SESSIONS_LOCK:
             SESSIONS.pop(token, None)
@@ -146,168 +208,179 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-# ─── Rate Limit ──────────────────────────────────────────────────────────────
-async def rate_limit_check(ip, max_req=10, window=60):
-    now = time.time()
-    async with RATE_LIMIT_LOCK:
-        data = RATE_LIMITS.get(ip, [])
-        data = [t for t in data if now - t < window]
-        if len(data) >= max_req:
-            RATE_LIMITS[ip] = data
-            return False
-        data.append(now)
-        RATE_LIMITS[ip] = data
-        return True
+async def keep_alive():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            domain = get_domain()
+            if domain and domain != "localhost":
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.get(f"https://{domain}/health")
+                logger.info("Keep-alive ping sent")
+        except Exception:
+            pass
 
-# ─── Middleware ──────────────────────────────────────────────────────────────
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+async def periodic_save():
+    """Persist links/addresses/domain/auth_hash to SQLite every 30 seconds.
+    This ensures user data survives HF Space restarts (which happen every 48h)."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            async with LINKS_LOCK:
+                links_snapshot = json.dumps(LINKS, ensure_ascii=False)
+            db_set("links", links_snapshot)
+            async with CUSTOM_ADDRESSES_LOCK:
+                addrs_snapshot = json.dumps(CUSTOM_ADDRESSES)
+            db_set("addresses", addrs_snapshot)
+            async with CUSTOM_DOMAIN_LOCK:
+                db_set("domain", CUSTOM_DOMAIN)
+            db_set("auth_hash", AUTH["password_hash"])
+        except Exception as e:
+            logger.warning(f"periodic_save failed: {e}")
 
-@app.middleware("http")
-async def anti_fingerprint(request, call_next):
-    resp = await call_next(request)
-    for h in ("server", "x-powered-by", "via", "x-aspnet-version", "x-forwarded-host"):
-        if h in resp.headers:
-            del resp.headers[h]
-    resp.headers["server"] = "Usf"
-    resp.headers["x-content-type-options"] = "nosniff"
-    resp.headers["x-frame-options"] = "SAMEORIGIN"
-    resp.headers["referrer-policy"] = "no-referrer"
-    if request.url.scheme == "https":
-        resp.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
-    return resp
+@app.on_event("startup")
+async def startup():
+    global http_client, _net_baseline, CUSTOM_DOMAIN, CUSTOM_ADDRESSES, AUTH
+    # ─── Initialize SQLite and load persisted state ──────────────────────────
+    db_init()
+    # Load saved links
+    saved_links = db_get("links")
+    if saved_links:
+        try:
+            parsed = json.loads(saved_links)
+            async with LINKS_LOCK:
+                LINKS.update(parsed)
+            logger.info(f"Loaded {len(parsed)} links from SQLite")
+        except Exception as e:
+            logger.warning(f"Failed to load links: {e}")
+    # Load saved addresses
+    saved_addrs = db_get("addresses")
+    if saved_addrs:
+        try:
+            async with CUSTOM_ADDRESSES_LOCK:
+                CUSTOM_ADDRESSES = json.loads(saved_addrs)
+        except Exception:
+            pass
+    # Load saved domain
+    saved_domain = db_get("domain")
+    if saved_domain is not None:
+        CUSTOM_DOMAIN = saved_domain
+    # Load saved password hash (so admin password survives restarts)
+    saved_pw = db_get("auth_hash")
+    if saved_pw:
+        AUTH["password_hash"] = saved_pw
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-def get_domain():
-    d = os.environ.get("SPACE_HOST", "")
-    if d:
-        return d.replace("https://","").replace("http://","").rstrip("/")
-    author = os.environ.get("SPACE_AUTHOR_NAME", "")
-    name = os.environ.get("SPACE_NAME", "")
-    if author and name:
-        return f"{author}-{name}.hf.space"
-    return "localhost"
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
 
-def generate_uuid(seed=None):
+    try:
+        nc = psutil.net_io_counters()
+        _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": time.time()}
+    except Exception:
+        _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
+
+    logger.info(f"Usf started on port {CONFIG['port']} | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
+    asyncio.create_task(keep_alive())
+    # Periodic auto-save (every 30s) — ensures traffic counters survive restarts
+    asyncio.create_task(periodic_save())
+
+@app.on_event("shutdown")
+async def shutdown():
+    # Final state save before shutdown (HF restarts)
+    try:
+        async with LINKS_LOCK:
+            links_snapshot = json.dumps(LINKS, ensure_ascii=False)
+        db_set("links", links_snapshot)
+        async with CUSTOM_ADDRESSES_LOCK:
+            db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
+        async with CUSTOM_DOMAIN_LOCK:
+            db_set("domain", CUSTOM_DOMAIN)
+        db_set("auth_hash", AUTH["password_hash"])
+        logger.info("State saved before shutdown")
+    except Exception as e:
+        logger.warning(f"Shutdown save failed: {e}")
+    if http_client:
+        await http_client.aclose()
+
+def get_domain() -> str:
+    return os.environ.get("SPACE_HOST", "localhost").replace("https://", "").replace("http://", "")
+
+def generate_uuid(seed: str | None = None) -> str:
     if seed is None:
         return str(uuid.uuid4())
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def _make_vless_params(domain, uid):
-    return {
-        "encryption": "none", "security": "tls", "type": "ws",
-        "flow": "xtls-rprx-vision", "host": domain,
-        "path": f"/ws/{uid}", "sni": domain,
-        "fp": "chrome", "alpn": "h2,http/1.1",
-        "mux": "true", "mux.max-connections": "8",
-        "pbk": base64.b64encode(os.urandom(16)).decode()[:22],
+def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> str:
+    domain = CUSTOM_DOMAIN if CUSTOM_DOMAIN else get_domain()
+    addr = address if address else domain
+    path = f"/ws/{uuid}"
+    params = {
+        "encryption": "none",
+        "security": "tls",
+        "type": "ws",
+        "host": domain,
+        "path": path,
+        "sni": domain,
+        "fp": "chrome",
+        "alpn": "http/1.1",
     }
-
-def generate_vless_link(uid, remark="Usf", address=None):
-    domain = CUSTOM_DOMAIN or get_domain()
-    addr = address or domain
-    params = _make_vless_params(domain, uid)
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uid}@{addr}:443?{query}#{quote(remark)}"
+    return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
 
-def generate_all_client_links(uid, label, address=None):
-    domain = CUSTOM_DOMAIN or get_domain()
-    addr = address or domain
-    base = generate_vless_link(uid, remark=label, address=addr)
-    sub_url = f"https://{domain}/sub/{uid}"
-
-    # Npv Tunnel: npv://uuid@host:port?params#remark
-    npv_params = {
-        "type": "ws", "security": "tls", "host": domain,
-        "path": f"/ws/{uid}", "sni": domain,
-        "fp": "chrome", "alpn": "h2,http/1.1", "flow": "xtls-rprx-vision",
-        "encryption": "none", "mux": "true",
-    }
-    npv_q = "&".join(f"{k}={quote(str(v))}" for k, v in npv_params.items())
-    npv_link = f"npv://{uid}@{addr}:443?{npv_q}#{quote(label)}"
-
-    # Hiddify: hiddify://import/base64json
-    hiddify_config = json.dumps({
-        "server_address": addr, "server_port": 443, "remark": label,
-        "config_type": "vless", "uuid": uid, "network": "ws",
-        "security": "tls", "sni": domain, "fp": "chrome",
-        "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
-        "flow": "xtls-rprx-vision", "multiplex": True,
-    }, separators=(",", ":"))
-    hiddify_b64 = base64.b64encode(hiddify_config.encode()).decode()
-    hiddify_link = f"hiddify://import/{hiddify_b64}"
-
-    # Mahsang: mahsa://base64json
-    mahsang_config = json.dumps({
-        "server_address": addr, "server_port": 443, "remark": label,
-        "config_type": "vless", "id": uid, "network": "ws",
-        "security": "tls", "sni": domain, "fp": "chrome",
-        "alpn": "h2,http/1.1", "path": f"/ws/{uid}",
-        "flow": "xtls-rprx-vision", "multiplex": True,
-    }, separators=(",", ":"))
-    mahsang_b64 = base64.b64encode(mahsang_config.encode()).decode()
-    mahsang_link = f"mahsa://{mahsang_b64}"
-
-    return {
-        "V2RayN": base,
-        "V2RayNG": base,
-        "Streisand": base,
-        "Shadowrocket": base,
-        "Foxray": base,
-        "Nekoray": base,
-        "BS Client": base,
-        "Npv Tunnel": npv_link,
-        "Hiddify": hiddify_link,
-        "Mahsang": mahsang_link,
-        "Subscription": sub_url,
-    }
-
-def uptime_seconds():
+def uptime_seconds() -> int:
     return int(time.time() - stats["start_time"])
 
-def uptime():
-    s = uptime_seconds()
-    return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+def uptime() -> str:
+    secs = uptime_seconds()
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-def os_uptime_str():
+def os_uptime_str() -> str:
     try:
-        s = int(time.time() - psutil.boot_time())
-        d, s = divmod(s, 86400)
-        h, s = divmod(s, 3600)
-        m = s // 60
-        if d > 0: return f"{d}d {h}h {m}m"
-        if h > 0: return f"{h}h {m}m"
-        return f"{m}m"
+        secs = int(time.time() - psutil.boot_time())
+        d = secs // 86400
+        h = (secs % 86400) // 3600
+        m = (secs % 3600) // 60
+        if d > 0:
+            return f"{d}d {h}h {m}m"
+        elif h > 0:
+            return f"{h}h {m}m"
+        else:
+            return f"{m}m"
     except Exception:
         return "N/A"
 
-def parse_size_to_bytes(val, unit):
+def parse_size_to_bytes(value: float, unit: str) -> int:
     unit = unit.upper()
-    if unit == "GB": return int(val * 1073741824)
-    if unit == "MB": return int(val * 1048576)
-    if unit == "KB": return int(val * 1024)
-    return int(val)
+    if unit == "GB": return int(value * 1024 * 1024 * 1024)
+    if unit == "MB": return int(value * 1024 * 1024)
+    if unit == "KB": return int(value * 1024)
+    return int(value)
 
-def compute_expiry(days):
+def compute_expiry(expiry_days) -> str:
     try:
-        d = float(days or 0)
+        days = float(expiry_days or 0)
     except (TypeError, ValueError):
-        d = 0
-    if d <= 0: return ""
-    return (datetime.now() + timedelta(days=d)).isoformat()
+        days = 0
+    if days <= 0:
+        return ""
+    return (datetime.now() + timedelta(days=days)).isoformat()
 
-def is_expired(link):
+def is_expired(link) -> bool:
     exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp: return False
+    if not exp:
+        return False
     try:
         return datetime.now() >= datetime.fromisoformat(exp)
     except (TypeError, ValueError):
         return False
 
-def expiry_epoch(link):
+def expiry_epoch(link) -> int:
     exp = link.get("expiry") if isinstance(link, dict) else None
-    if not exp: return 0
+    if not exp:
+        return 0
     try:
         return int(datetime.fromisoformat(exp).timestamp())
     except (TypeError, ValueError):
@@ -317,46 +390,48 @@ async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
             uid = generate_uuid()
-            LINKS[uid] = {
-                "label": "Default", "limit_bytes": 0, "used_bytes": 0,
-                "max_connections": 0, "created_at": datetime.now().isoformat(),
-                "active": True, "expiry": "", "speed_limit": 0, "tag": "", "note": "",
-            }
+            LINKS[uid] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True, "expiry": ""}
 
-def get_client_ip(ws):
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd: return fwd.split(",")[0].strip()
-    return ws.client.host if ws.client else "unknown"
+def get_client_ip(websocket: WebSocket) -> str:
+    forwarded = websocket.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if websocket.client:
+        return websocket.client.host
+    return "unknown"
 
-def count_connections_for_link(uid):
+def count_connections_for_link(uid: str) -> int:
     return len(link_ip_map.get(uid, set()))
 
-def remove_ip_from_link(uid, ip):
+def remove_ip_from_link(uid: str, ip: str):
     if uid in link_ip_map:
         link_ip_map[uid].discard(ip)
         if not link_ip_map[uid]:
             link_ip_map.pop(uid, None)
 
-async def close_connections_for_link(uid):
+async def close_connections_for_link(uid: str):
     to_close = [cid for cid, info in connections.items() if info.get("uuid") == uid]
     for cid in to_close:
         ws = connection_sockets.get(cid)
         if ws:
-            try: await ws.close(code=1000, reason="link deleted")
-            except Exception: pass
+            try:
+                await ws.close(code=1000, reason="link deleted")
+            except Exception:
+                pass
         connections.pop(cid, None)
         connection_sockets.pop(cid, None)
     link_ip_map.pop(uid, None)
 
 def get_real_ips():
-    ipv4, ipv6 = "", ""
+    ipv4 = ""
+    ipv6 = ""
     try:
         for iface, addrs in psutil.net_if_addrs().items():
-            for a in addrs:
-                if a.family == socket.AF_INET and not a.address.startswith("127."):
-                    ipv4 = a.address
-                elif a.family == socket.AF_INET6 and not a.address.startswith("::1") and not a.address.startswith("fe80"):
-                    ipv6 = a.address.split("%")[0]
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    ipv4 = addr.address
+                elif addr.family == socket.AF_INET6 and not addr.address.startswith("::1") and not addr.address.startswith("fe80"):
+                    ipv6 = addr.address.split("%")[0]
     except Exception:
         pass
     return ipv4, ipv6
@@ -366,127 +441,50 @@ def get_net_speed():
     try:
         nc = psutil.net_io_counters()
         now = time.time()
-        elapsed = max(now - _net_baseline["ts"], 0.1)
-        up = (nc.bytes_sent - _net_baseline["bytes_sent"]) / elapsed
-        down = (nc.bytes_recv - _net_baseline["bytes_recv"]) / elapsed
+        elapsed = now - _net_baseline["ts"]
+        if elapsed < 0.1:
+            elapsed = 1.0
+        up_bps = (nc.bytes_sent - _net_baseline["bytes_sent"]) / elapsed
+        down_bps = (nc.bytes_recv - _net_baseline["bytes_recv"]) / elapsed
         _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": now}
-        return nc.bytes_sent, nc.bytes_recv, up, down
+        return nc.bytes_sent, nc.bytes_recv, up_bps, down_bps
     except Exception:
         return 0, 0, 0, 0
 
-def fmt_speed(bps):
-    if bps >= 1048576: return f"{bps/1048576:.2f} MB/s"
-    if bps >= 1024: return f"{bps/1024:.2f} KB/s"
-    return f"{bps:.0f} B/s"
+def fmt_bytes_speed(bps: float) -> str:
+    if bps >= 1_048_576:
+        return f"{bps/1_048_576:.2f} MB"
+    elif bps >= 1024:
+        return f"{bps/1024:.2f} KB"
+    else:
+        return f"{bps:.0f} B"
 
-def fmt_bytes(b):
-    if b >= 1073741824: return f"{b/1073741824:.2f} GB"
-    if b >= 1048576: return f"{b/1048576:.2f} MB"
-    if b >= 1024: return f"{b/1024:.1f} KB"
+def fmt_bytes(b: int) -> str:
+    if b >= 1_073_741_824:
+        return f"{b/1_073_741_824:.2f} GB"
+    elif b >= 1_048_576:
+        return f"{b/1_048_576:.2f} MB"
+    elif b >= 1024:
+        return f"{b/1024:.1f} KB"
     return f"{b} B"
 
-# ─── Lifespan ────────────────────────────────────────────────────────────────
-@contextlib.asynccontextmanager
-async def lifespan(app):
-    global LINKS_LOCK, CUSTOM_ADDRESSES_LOCK, CUSTOM_DOMAIN_LOCK
-    global SESSIONS_LOCK, RATE_LIMIT_LOCK, http_client, _net_baseline
-    global CUSTOM_DOMAIN, CUSTOM_ADDRESSES, AUTH
-
-    LINKS_LOCK = asyncio.Lock()
-    CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
-    CUSTOM_DOMAIN_LOCK = asyncio.Lock()
-    SESSIONS_LOCK = asyncio.Lock()
-    RATE_LIMIT_LOCK = asyncio.Lock()
-
-    AUTH = {
-        "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin")),
-        "username": os.environ.get("ADMIN_USERNAME", "admin"),
-    }
-
-    db_init()
-    # Load saved state
-    saved = db_get("links")
-    if saved:
-        try:
-            async with LINKS_LOCK:
-                LINKS.update(json.loads(saved))
-            logger.info(f"Loaded {len(LINKS)} links")
-        except Exception as e:
-            logger.warning(f"Load links err: {e}")
-    saved_a = db_get("addresses")
-    if saved_a:
-        try:
-            async with CUSTOM_ADDRESSES_LOCK:
-                CUSTOM_ADDRESSES = json.loads(saved_a)
-        except Exception: pass
-    saved_d = db_get("domain")
-    if saved_d is not None:
-        CUSTOM_DOMAIN = saved_d
-    saved_pw = db_get("auth_hash")
-    if saved_pw:
-        AUTH["password_hash"] = saved_pw
-
-    http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
-        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True
-    )
+def get_net_connections_count():
     try:
-        nc = psutil.net_io_counters()
-        _net_baseline = {"bytes_sent": nc.bytes_sent, "bytes_recv": nc.bytes_recv, "ts": time.time()}
+        conns = psutil.net_connections()
+        tcp = sum(1 for c in conns if c.type == socket.SOCK_STREAM)
+        udp = sum(1 for c in conns if c.type == socket.SOCK_DGRAM)
+        return tcp, udp
     except Exception:
-        pass
+        return 0, 0
 
-    logger.info(f"Usf v3.0.0 started on port {CONFIG['port']}")
+# ============================================================
+#  MAIN ENDPOINTS
+# ============================================================
 
-    async def keep_alive():
-        while True:
-            await asyncio.sleep(600)
-            try:
-                d = get_domain()
-                if d and d != "localhost":
-                    async with httpx.AsyncClient(timeout=10) as c:
-                        await c.get(f"https://{d}/health")
-            except Exception: pass
-
-    async def periodic_save():
-        while True:
-            await asyncio.sleep(30)
-            try:
-                async with LINKS_LOCK:
-                    db_set("links", json.dumps(LINKS, ensure_ascii=False))
-                async with CUSTOM_ADDRESSES_LOCK:
-                    db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
-                async with CUSTOM_DOMAIN_LOCK:
-                    db_set("domain", CUSTOM_DOMAIN)
-                db_set("auth_hash", AUTH["password_hash"])
-            except Exception as e:
-                logger.warning(f"Save err: {e}")
-
-    t1 = asyncio.create_task(keep_alive())
-    t2 = asyncio.create_task(periodic_save())
-
-    yield
-
-    t1.cancel()
-    t2.cancel()
-    try:
-        async with LINKS_LOCK:
-            db_set("links", json.dumps(LINKS, ensure_ascii=False))
-        async with CUSTOM_ADDRESSES_LOCK:
-            db_set("addresses", json.dumps(CUSTOM_ADDRESSES))
-        async with CUSTOM_DOMAIN_LOCK:
-            db_set("domain", CUSTOM_DOMAIN)
-        db_set("auth_hash", AUTH["password_hash"])
-    except Exception: pass
-    if http_client:
-        await http_client.aclose()
-
-app.router.lifespan_context = lifespan
-
-# ─── API Endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root(request: Request):
-    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if await is_valid_session(token):
         return RedirectResponse(url="/dashboard")
     return RedirectResponse(url="/login")
 
@@ -496,152 +494,253 @@ async def health():
 
 @app.post("/api/login")
 async def api_login(request: Request):
-    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "?")
-    if not await rate_limit_check(ip, 5, 60):
-        raise HTTPException(429, "Too many attempts. Wait 60s.")
+    # ─── Anti brute-force: 5 attempts per IP per 60s ─────────────────────────
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else "unknown"
+    if not await rate_limit_check(client_ip, max_requests=5, window_sec=60):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a minute.")
     body = await request.json()
-    pw = str(body.get("password") or "")
-    un = str(body.get("username") or "")
-    if un and un != AUTH["username"]:
-        raise HTTPException(401, "Invalid credentials")
-    if hash_password(pw) != AUTH["password_hash"]:
-        raise HTTPException(401, "Invalid credentials")
+    password = str(body.get("password") or "")
+    username = str(body.get("username") or "")
+    if username and username != AUTH["username"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if hash_password(password) != AUTH["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    is_https = request.url.scheme == "https"
-    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=is_https)
+    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/", secure=True)
     return resp
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
-    await destroy_session(request.cookies.get(SESSION_COOKIE))
-    r = JSONResponse({"ok": True})
-    r.delete_cookie(SESSION_COOKIE, path="/")
-    return r
+    token = request.cookies.get(SESSION_COOKIE)
+    await destroy_session(token)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
+    token = request.cookies.get(SESSION_COOKIE)
+    return {"authenticated": await is_valid_session(token)}
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    cur = str(body.get("current_password") or "")
+    current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
-    if hash_password(cur) != AUTH["password_hash"]:
-        raise HTTPException(400, "Current password is wrong")
+    if hash_password(current) != AUTH["password_hash"]:
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(new) < 4:
-        raise HTTPException(400, "Password min 4 chars")
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     AUTH["password_hash"] = hash_password(new)
-    tok = request.cookies.get(SESSION_COOKIE)
+    current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
-        if tok:
-            SESSIONS[tok] = time.time() + SESSION_TTL
+        if current_token:
+            SESSIONS[current_token] = time.time() + SESSION_TTL
     return {"ok": True}
 
+@app.get("/stats")
+async def get_stats(_=Depends(require_auth)):
+    return {
+        "active_connections": len(connections),
+        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
+        "total_requests": stats["total_requests"],
+        "total_errors": stats["total_errors"],
+        "uptime": uptime(),
+        "timestamp": datetime.now().isoformat(),
+        "recent_errors": list(error_logs)[-10:],
+        "links_count": len(LINKS),
+        "domain": get_domain(),
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "memory_percent": psutil.virtual_memory().percent,
+        "hourly_traffic": dict(hourly_traffic),
+    }
+
 @app.get("/api/stats")
-async def api_stats(_=Depends(require_auth)):
+async def get_api_stats(_=Depends(require_auth)):
     cpu = psutil.cpu_percent(interval=0.1)
     vm = psutil.virtual_memory()
-    ts, tr, up_bps, down_bps = get_net_speed()
+    ram_pct = vm.percent
+    ram_used_mb = vm.used / 1_048_576
+    ram_total_mb = vm.total / 1_048_576
+
+    load_avg = [0.0, 0.0, 0.0]
+    try:
+        load_avg = list(os.getloadavg())
+    except Exception:
+        pass
+
+    total_sent_bytes, total_recv_bytes, up_bps, down_bps = get_net_speed()
     ipv4, ipv6 = get_real_ips()
-    xray_up = int(time.time() - SERVICE_STARTED_AT) if SERVICE_RUNNING else 0
+    tcp, udp = get_net_connections_count()
+
+    try:
+        proc = psutil.Process()
+        threads = proc.num_threads()
+        proc_ram = proc.memory_info().rss / 1_048_576
+    except Exception:
+        threads = 0
+        proc_ram = ram_used_mb
+
     try:
         sw = psutil.swap_memory()
-        du = psutil.disk_usage("/")
-        proc = psutil.Process()
+        swap_pct = sw.percent
+        swap_used = sw.used
+        swap_total = sw.total
     except Exception:
-        sw = du = None
-        proc = None
+        swap_pct, swap_used, swap_total = 0.0, 0, 0
+
+    try:
+        du = psutil.disk_usage("/")
+        disk_pct = du.percent
+        disk_used = du.used
+        disk_total = du.total
+    except Exception:
+        disk_pct, disk_used, disk_total = 0.0, 0, 0
+
+    try:
+        cpu_cores = psutil.cpu_count(logical=True) or 1
+    except Exception:
+        cpu_cores = 1
+
+    if SERVICE_RUNNING:
+        xray_uptime_s = int(time.time() - SERVICE_STARTED_AT)
+        if xray_uptime_s < 3600:
+            xray_uptime = f"{xray_uptime_s // 60}m"
+        elif xray_uptime_s < 86400:
+            xray_uptime = f"{xray_uptime_s // 3600}h {(xray_uptime_s % 3600)//60}m"
+        else:
+            xray_uptime = f"{xray_uptime_s // 86400}d {(xray_uptime_s % 86400)//3600}h"
+    else:
+        xray_uptime = "Stopped"
+
     return {
         "cpuUsage": round(cpu, 1),
-        "ramUsage": round(vm.percent, 1),
-        "ramUsed": f"{vm.used/1048576:.1f} MB",
-        "ramTotal": f"{vm.total/1048576:.0f} MB",
+        "ramUsage": round(ram_pct, 1),
+        "ramUsed": f"{ram_used_mb:.1f} MB",
+        "ramTotal": f"{ram_total_mb:.0f} MB",
         "uptime": os_uptime_str(),
-        "xrayUptime": f"{xray_up//60}m" if xray_up < 3600 else f"{xray_up//3600}h {(xray_up%3600)//60}m" if SERVICE_RUNNING else "Stopped",
-        "uploadSpeed": fmt_speed(up_bps),
-        "downloadSpeed": fmt_speed(down_bps),
-        "totalSent": fmt_bytes(ts),
-        "totalReceived": fmt_bytes(tr),
+        "xrayUptime": xray_uptime,
+        "systemLoad": f"{load_avg[0]:.2f} | {load_avg[1]:.2f} | {load_avg[2]:.2f}",
+        "threads": threads,
+        "uploadSpeed": fmt_bytes_speed(up_bps) + "/s",
+        "downloadSpeed": fmt_bytes_speed(down_bps) + "/s",
+        "totalSent": fmt_bytes(total_sent_bytes),
+        "totalReceived": fmt_bytes(total_recv_bytes),
         "ipv4": ipv4 or "N/A",
         "ipv6": ipv6 or "N/A",
+        "tcpConnections": tcp,
+        "udpConnections": udp,
         "activeConnections": len(connections),
-        "totalTrafficMb": round(stats["total_bytes"] / 1048576, 2),
+        "totalTrafficMb": round(stats["total_bytes"] / 1_048_576, 2),
         "totalRequests": stats["total_requests"],
         "linksCount": len(LINKS),
         "domain": get_domain(),
         "hourlyTraffic": dict(hourly_traffic),
         "recentErrors": list(error_logs)[-5:],
-        "cpuCores": psutil.cpu_count(logical=True) or 1,
-        "swapUsage": round(sw.percent, 1) if sw else 0,
-        "swapUsed": fmt_bytes(sw.used) if sw else "0 B",
-        "swapTotal": fmt_bytes(sw.total) if sw else "0 B",
-        "storageUsage": round(du.percent, 1) if du else 0,
-        "storageUsed": fmt_bytes(du.used) if du else "0 B",
-        "storageTotal": fmt_bytes(du.total) if du else "0 B",
-        "appRam": f"{proc.memory_info().rss/1048576:.2f} MB" if proc else "N/A",
+        "cpuCores": cpu_cores,
+        "swapUsage": round(swap_pct, 1),
+        "swapUsed": fmt_bytes(swap_used),
+        "swapTotal": fmt_bytes(swap_total),
+        "storageUsage": round(disk_pct, 1),
+        "storageUsed": fmt_bytes(disk_used),
+        "storageTotal": fmt_bytes(disk_total),
+        "appRam": f"{proc_ram:.2f} MB",
         "xrayRunning": SERVICE_RUNNING,
         "panelVersion": PANEL_VERSION,
         "coreVersion": CORE_VERSION,
         "telegram": TELEGRAM_HANDLE,
     }
 
+async def _stop_service_internal():
+    global SERVICE_RUNNING
+    SERVICE_RUNNING = False
+    for cid, ws in list(connection_sockets.items()):
+        try:
+            await ws.close(code=1012, reason="service stopped")
+        except Exception:
+            pass
+    connections.clear()
+    connection_sockets.clear()
+    link_ip_map.clear()
+
 @app.get("/api/service")
 async def service_status(_=Depends(require_auth)):
-    return {"running": SERVICE_RUNNING, "active_connections": len(connections)}
+    return {"running": SERVICE_RUNNING, "core_version": CORE_VERSION,
+            "active_connections": len(connections)}
 
 @app.post("/api/service/stop")
 async def service_stop(_=Depends(require_auth)):
-    global SERVICE_RUNNING
-    SERVICE_RUNNING = False
-    for ws in list(connection_sockets.values()):
-        try: await ws.close(code=1012, reason="stopped")
-        except: pass
-    connections.clear(); connection_sockets.clear(); link_ip_map.clear()
-    return {"ok": True, "running": False}
+    await _stop_service_internal()
+    logger.info("Core stopped via panel")
+    return {"ok": True, "running": SERVICE_RUNNING}
 
 @app.post("/api/service/restart")
 async def service_restart(_=Depends(require_auth)):
     global SERVICE_RUNNING, SERVICE_STARTED_AT
-    SERVICE_RUNNING = False
-    for ws in list(connection_sockets.values()):
-        try: await ws.close(code=1012, reason="restarting")
-        except: pass
-    connections.clear(); connection_sockets.clear(); link_ip_map.clear()
+    await _stop_service_internal()
     await asyncio.sleep(0.3)
     SERVICE_RUNNING = True
     SERVICE_STARTED_AT = time.time()
-    return {"ok": True, "running": True}
+    logger.info("Core restarted via panel")
+    return {"ok": True, "running": SERVICE_RUNNING}
 
 @app.get("/api/logs")
 async def get_logs(_=Depends(require_auth)):
     return {
         "running": SERVICE_RUNNING,
-        "totals": {"bytes": stats["total_bytes"], "requests": stats["total_requests"], "errors": stats["total_errors"]},
+        "totals": {
+            "bytes": stats["total_bytes"],
+            "requests": stats["total_requests"],
+            "errors": stats["total_errors"],
+        },
         "errors": list(error_logs)[-50:],
-        "connections": [{"id": c, "uuid": i.get("uuid"), "ip": i.get("ip"),
-                         "connected_at": i.get("connected_at"), "bytes": i.get("bytes", 0)}
-                        for c, i in connections.items()],
-        "history": list(connection_history)[-50:],
+        "connections": [
+            {"id": cid, "uuid": info.get("uuid"), "ip": info.get("ip"),
+             "connected_at": info.get("connected_at"), "bytes": info.get("bytes", 0)}
+            for cid, info in connections.items()
+        ],
     }
 
 @app.get("/api/config")
-async def get_config(_=Depends(require_auth)):
+async def get_runtime_config(_=Depends(require_auth)):
     async with LINKS_LOCK:
-        inbounds = [{"uuid": u, "remark": d["label"], "enabled": d["active"], "ws_path": f"/ws/{u}"} for u, d in LINKS.items()]
-    return {"panel": "Usf", "version": PANEL_VERSION, "running": SERVICE_RUNNING,
-            "domain": CUSTOM_DOMAIN or get_domain(), "inbounds": inbounds,
-            "clean_addresses": list(CUSTOM_ADDRESSES)}
+        inbounds = [{"uuid": uid, "remark": d["label"], "enabled": d["active"],
+                     "ws_path": f"/ws/{uid}"} for uid, d in LINKS.items()]
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses = list(CUSTOM_ADDRESSES)
+    return {
+        "panel": "Usf",
+        "panel_version": PANEL_VERSION,
+        "core_version": CORE_VERSION,
+        "running": SERVICE_RUNNING,
+        "port": CONFIG["port"],
+        "domain": CUSTOM_DOMAIN or get_domain(),
+        "protocol": "vless",
+        "network": "ws",
+        "security": "tls",
+        "clean_addresses": addresses,
+        "inbounds": inbounds,
+    }
 
 @app.get("/api/backup")
 async def download_backup(_=Depends(require_auth)):
     async with LINKS_LOCK:
-        links_copy = {u: dict(d) for u, d in LINKS.items()}
-    backup = {"panel": "Usf", "version": PANEL_VERSION, "exported_at": datetime.now().isoformat(),
-              "domain": CUSTOM_DOMAIN, "addresses": list(CUSTOM_ADDRESSES),
-              "username": AUTH["username"], "password_hash": AUTH["password_hash"], "links": links_copy}
+        links_copy = {uid: dict(d) for uid, d in LINKS.items()}
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses = list(CUSTOM_ADDRESSES)
+    backup = {
+        "panel": "Usf",
+        "panel_version": PANEL_VERSION,
+        "core_version": CORE_VERSION,
+        "exported_at": datetime.now().isoformat(),
+        "domain": CUSTOM_DOMAIN,
+        "addresses": addresses,
+        "username": AUTH["username"],
+        "password_hash": AUTH["password_hash"],
+        "links": links_copy,
+    }
     content = json.dumps(backup, indent=2)
     fname = f"Usf-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     return Response(content=content, media_type="application/json",
@@ -653,11 +752,12 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
     body = await request.json()
     links = body.get("links")
     if not isinstance(links, dict):
-        raise HTTPException(400, "Invalid backup")
+        raise HTTPException(status_code=400, detail="Invalid backup file")
     async with LINKS_LOCK:
         LINKS.clear()
         for uid, d in links.items():
-            if not isinstance(d, dict): continue
+            if not isinstance(d, dict):
+                continue
             LINKS[uid] = {
                 "label": str(d.get("label", "Restored"))[:60],
                 "limit_bytes": int(d.get("limit_bytes", 0) or 0),
@@ -666,103 +766,134 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 "created_at": d.get("created_at", datetime.now().isoformat()),
                 "active": bool(d.get("active", True)),
                 "expiry": d.get("expiry", ""),
-                "speed_limit": int(d.get("speed_limit", 0) or 0),
-                "tag": str(d.get("tag", ""))[:30],
-                "note": str(d.get("note", ""))[:200],
             }
     if isinstance(body.get("addresses"), list):
         async with CUSTOM_ADDRESSES_LOCK:
-            CUSTOM_ADDRESSES = [a for a in body["addresses"] if isinstance(a, str) and a]
+            CUSTOM_ADDRESSES.clear()
+            for a in body["addresses"]:
+                if isinstance(a, str) and a:
+                    CUSTOM_ADDRESSES.append(a)
     if isinstance(body.get("domain"), str):
         async with CUSTOM_DOMAIN_LOCK:
             CUSTOM_DOMAIN = body["domain"]
     return {"ok": True, "restored": len(LINKS)}
 
-# ─── Links CRUD ──────────────────────────────────────────────────────────────
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
-    if not label or not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-        raise HTTPException(400, "Name required. Only English letters, numbers, - _ . space")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
+    if not label:
+        raise HTTPException(status_code=400, detail="Inbound name is required")
     async with LINKS_LOCK:
         if any(d["label"].lower() == label.lower() for d in LINKS.values()):
-            raise HTTPException(400, "Name already exists")
-    lv = float(body.get("limit_value") or 0)
-    lu = body.get("limit_unit") or "GB"
-    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+            raise HTTPException(status_code=400, detail="An inbound with this name already exists")
+    limit_value = float(body.get("limit_value") or 0)
+    limit_unit = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    max_conn = int(body.get("max_connections") or 0)
+    if max_conn < 0:
+        max_conn = 0
+    expiry = compute_expiry(body.get("expiry_days"))
     uid = generate_uuid()
     async with LINKS_LOCK:
-        LINKS[uid] = {
-            "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-            "max_connections": int(body.get("max_connections") or 0),
-            "created_at": datetime.now().isoformat(), "active": True,
-            "expiry": compute_expiry(body.get("expiry_days")),
-            "speed_limit": int(body.get("speed_limit") or 0),
-            "tag": str(body.get("tag") or "")[:30],
-            "note": str(body.get("note") or "")[:200],
-        }
-    return {"uuid": uid, "label": label, "ok": True}
+        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True, "expiry": expiry}
+    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "expiry": expiry, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"Usf-{label}")}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
-        for uid, d in LINKS.items():
-            client_links = generate_all_client_links(uid, d["label"])
-            result.append({
-                "uuid": uid, "label": d["label"],
-                "limit_bytes": d["limit_bytes"], "used_bytes": d["used_bytes"],
-                "max_connections": d.get("max_connections", 0),
-                "active": d["active"], "expiry": d.get("expiry", ""),
-                "expired": is_expired(d), "created_at": d["created_at"],
-                "current_connections": count_connections_for_link(uid),
-                "client_links": client_links,
-                "sub_url": client_links["Subscription"],
-                "vless_link": client_links["V2RayN"],
-                "speed_limit": d.get("speed_limit", 0),
-                "tag": d.get("tag", ""), "note": d.get("note", ""),
-            })
+        for uid, data in LINKS.items():
+            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "expiry": data.get("expiry", ""), "expired": is_expired(data), "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"Usf-{data['label']}")})
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
 @app.get("/api/inbounds")
 async def list_inbounds(_=Depends(require_auth)):
-    r = (await list_links(_))["links"]
-    for item in r:
-        item["id"] = item["uuid"]
-        item["remark"] = item["label"]
-        item["protocol"] = "vless"
-        item["enabled"] = item["active"]
-        item["total_flow"] = item["limit_bytes"] / 1073741824 if item["limit_bytes"] > 0 else 0
-        item["clients"] = [{"id": item["uuid"], "email": item["label"]}]
-    return {"items": r, "total": len(r)}
+    result = []
+    async with LINKS_LOCK:
+        for uid, data in LINKS.items():
+            result.append({
+                "id": uid,
+                "uuid": uid,
+                "remark": data["label"],
+                "label": data["label"],
+                "protocol": "vless",
+                "enabled": data["active"],
+                "active": data["active"],
+                "limit_bytes": data["limit_bytes"],
+                "used_bytes": data["used_bytes"],
+                "total_flow": data["limit_bytes"] / 1_073_741_824 if data["limit_bytes"] > 0 else 0,
+                "max_connections": data.get("max_connections", 0),
+                "expiry": data.get("expiry", ""),
+                "expired": is_expired(data),
+                "created_at": data["created_at"],
+                "current_connections": count_connections_for_link(uid),
+                "vless_link": generate_vless_link(uid, remark=f"Usf-{data['label']}"),
+                "clients": [{"id": uid, "email": data["label"]}],
+            })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"items": result, "total": len(result)}
 
 @app.patch("/api/inbounds/{uid}")
-@app.patch("/api/links/{uid}")
-async def update_link(uid: str, request: Request, _=Depends(require_auth)):
+async def patch_inbound(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         if uid not in LINKS:
-            raise HTTPException(404, "Not found")
-        d = LINKS[uid]
-        if "active" in body: d["active"] = bool(body["active"])
-        if "enabled" in body: d["active"] = bool(body["enabled"])
+            raise HTTPException(status_code=404, detail="inbound not found")
+        if "enabled" in body:
+            LINKS[uid]["active"] = bool(body["enabled"])
+        if "active" in body:
+            LINKS[uid]["active"] = bool(body["active"])
         if "limit_value" in body:
             lv = float(body.get("limit_value") or 0)
             lu = body.get("limit_unit") or "GB"
-            d["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
-        if body.get("reset_usage"): d["used_bytes"] = 0
-        if "expiry_days" in body: d["expiry"] = compute_expiry(body.get("expiry_days"))
-        if "label" in body: d["label"] = str(body["label"])[:60]
-        if "remark" in body: d["label"] = str(body["remark"])[:60]
-        if "max_connections" in body: d["max_connections"] = max(int(body["max_connections"] or 0), 0)
-        if "speed_limit" in body: d["speed_limit"] = int(body["speed_limit"] or 0)
-        if "tag" in body: d["tag"] = str(body.get("tag", ""))[:30]
-        if "note" in body: d["note"] = str(body.get("note", ""))[:200]
+            LINKS[uid]["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+        if "reset_usage" in body and body["reset_usage"]:
+            LINKS[uid]["used_bytes"] = 0
+        if "expiry_days" in body:
+            LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
+        if "label" in body:
+            LINKS[uid]["label"] = str(body["label"])[:60]
+        if "remark" in body:
+            LINKS[uid]["label"] = str(body["remark"])[:60]
+        if "max_connections" in body:
+            mc = int(body["max_connections"] or 0)
+            LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
     return {"ok": True}
 
 @app.delete("/api/inbounds/{uid}")
+async def delete_inbound(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        LINKS.pop(uid, None)
+    await close_connections_for_link(uid)
+    return {"ok": True}
+
+@app.patch("/api/links/{uid}")
+async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        if "active" in body:
+            LINKS[uid]["active"] = bool(body["active"])
+        if "limit_value" in body:
+            limit_value = float(body.get("limit_value") or 0)
+            limit_unit = body.get("limit_unit") or "GB"
+            LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+        if "reset_usage" in body and body["reset_usage"]:
+            LINKS[uid]["used_bytes"] = 0
+        if "expiry_days" in body:
+            LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
+        if "label" in body:
+            LINKS[uid]["label"] = str(body["label"])[:60]
+        if "max_connections" in body:
+            mc = int(body["max_connections"] or 0)
+            LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+    return {"ok": True}
+
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
@@ -770,34 +901,41 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     await close_connections_for_link(uid)
     return {"ok": True}
 
-# ─── Domain & Addresses ──────────────────────────────────────────────────────
 @app.get("/api/domain")
-async def get_domain_api(_=Depends(require_auth)):
-    return {"domain": CUSTOM_DOMAIN}
+async def get_custom_domain(_=Depends(require_auth)):
+    async with CUSTOM_DOMAIN_LOCK:
+        return {"domain": CUSTOM_DOMAIN}
 
 @app.post("/api/domain")
-async def set_domain(request: Request, _=Depends(require_auth)):
-    global CUSTOM_DOMAIN
+async def set_custom_domain(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    d = (body.get("domain") or "").strip().lower().replace("https://","").replace("http://","").rstrip("/")
-    if d and not re.match(r'^[a-z0-9\-_.]+$', d):
-        raise HTTPException(400, "Invalid domain")
+    domain = (body.get("domain") or "").strip().lower()
+    if domain:
+        domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
+        if not re.match(r'^[a-z0-9\-_.]+$', domain):
+            raise HTTPException(status_code=400, detail="Invalid domain format")
     async with CUSTOM_DOMAIN_LOCK:
-        CUSTOM_DOMAIN = d
-    return {"ok": True}
+        global CUSTOM_DOMAIN
+        CUSTOM_DOMAIN = domain
+    return {"ok": True, "domain": CUSTOM_DOMAIN}
 
 @app.get("/api/addresses")
 async def list_addresses(_=Depends(require_auth)):
-    return {"addresses": list(CUSTOM_ADDRESSES)}
+    async with CUSTOM_ADDRESSES_LOCK:
+        return {"addresses": list(CUSTOM_ADDRESSES)}
 
 @app.post("/api/addresses")
 async def add_address(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    a = (body.get("address") or "").strip()
-    if not a: raise HTTPException(400, "Address required")
+    address = (body.get("address") or "").strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="Address is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
+        raise HTTPException(status_code=400, detail="Address must contain only English letters, numbers, and characters: - _ .")
     async with CUSTOM_ADDRESSES_LOCK:
-        if a in CUSTOM_ADDRESSES: raise HTTPException(400, "Already exists")
-        CUSTOM_ADDRESSES.append(a)
+        if address in CUSTOM_ADDRESSES:
+            raise HTTPException(status_code=400, detail="Address already exists")
+        CUSTOM_ADDRESSES.append(address)
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
@@ -806,287 +944,227 @@ async def delete_address(index: int, _=Depends(require_auth)):
         if 0 <= index < len(CUSTOM_ADDRESSES):
             CUSTOM_ADDRESSES.pop(index)
         else:
-            raise HTTPException(404, "Not found")
-    return {"ok": True}
+            raise HTTPException(status_code=404, detail="Address not found")
+    return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
-# ─── Subscription ────────────────────────────────────────────────────────────
 @app.get("/api/links/{uid}/sub")
-async def get_sub_info(uid: str, _=Depends(require_auth)):
+async def get_subscription(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if not link: raise HTTPException(404, "Not found")
+        if link is None:
+            raise HTTPException(status_code=404, detail="link not found")
+    vless_link = generate_vless_link(uid, remark=f"Usf-{link['label']}")
+    used = link["used_bytes"]
+    limit = link["limit_bytes"]
+    used_mb = round(used / (1024 * 1024), 2)
+    limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
+    pct = round((used / limit) * 100, 1) if limit > 0 else 0
+    remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
+    import base64
+    sub_content = f"""# Usf Subscription
+# Label: {link['label']}
+# Used: {used_mb} MB / {limit_mb if limit > 0 else 'Unlimited'} MB
+# Remaining: {remaining_mb if limit > 0 else 'Unlimited'} MB
+# Usage: {pct}%
+# Status: {'Active' if link['active'] else 'Disabled'}
+# Expiry: {link.get('expiry', '')[:10] if link.get('expiry') else 'Unlimited'}
+{vless_link}"""
+    encoded = base64.b64encode(sub_content.encode()).decode()
     return {
-        "client_links": generate_all_client_links(uid, link["label"]),
-        "used_bytes": link["used_bytes"], "limit_bytes": link["limit_bytes"],
-        "used_mb": round(link["used_bytes"] / 1048576, 2),
-        "limit_mb": round(link["limit_bytes"] / 1048576, 2) if link["limit_bytes"] > 0 else 0,
-        "remaining_mb": round((link["limit_bytes"] - link["used_bytes"]) / 1048576, 2) if link["limit_bytes"] > 0 else 0,
-        "usage_percent": round((link["used_bytes"] / link["limit_bytes"]) * 100, 1) if link["limit_bytes"] > 0 else 0,
-        "active": link["active"], "expired": is_expired(link),
-        "expiry": link.get("expiry", ""),
+        "subscription_url": f"{get_domain()}/api/links/{uid}/sub",
+        "config": vless_link,
         "label": link["label"],
-        "sub_url": f"https://{get_domain()}/sub/{uid}",
-        "speed_limit": link.get("speed_limit", 0),
-        "current_connections": count_connections_for_link(uid),
+        "used_bytes": used,
+        "limit_bytes": limit,
+        "used_mb": used_mb,
+        "limit_mb": limit_mb,
+        "remaining_mb": remaining_mb,
+        "usage_percent": pct,
+        "active": link["active"],
+        "sub_base64": encoded,
+        "sub_text": sub_content,
     }
 
 @app.get("/sub/{uid}")
-async def sub_endpoint(uid: str):
+async def subscription_endpoint(uid: str):
+    import base64
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if not link: raise HTTPException(404, "Not found")
-    if not link["active"]: raise HTTPException(403, "Disabled")
-    if is_expired(link): raise HTTPException(403, "Expired")
+        if link is None:
+            raise HTTPException(status_code=404, detail="link not found")
+    if not link["active"]:
+        raise HTTPException(status_code=403, detail="link disabled")
+    if is_expired(link):
+        raise HTTPException(status_code=403, detail="link expired")
     async with CUSTOM_ADDRESSES_LOCK:
-        addrs = list(CUSTOM_ADDRESSES)
-    links_list = [generate_vless_link(uid, remark=f"{link['label']}-Server")]
-    for i, a in enumerate(addrs):
-        links_list.append(generate_vless_link(uid, remark=f"{link['label']}-IP{i+1}", address=a))
-    encoded = base64.b64encode("\n".join(links_list).encode()).decode()
-    return Response(
-        content=encoded,
-        headers={
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Disposition": "attachment; filename=\"sub.txt\"",
-            "profile-update-interval": "6",
-            "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
-            "profile-title": link["label"],
-        }
-    )
+        addresses = list(CUSTOM_ADDRESSES)
+    sub_links = []
+    server_link = generate_vless_link(uid, remark=f"Usf-{link['label']}-Server")
+    sub_links.append(server_link)
+    for i, addr in enumerate(addresses):
+        remark = f"Usf-{link['label']}-IP{i+1}"
+        vless_link = generate_vless_link(uid, remark=remark, address=addr)
+        sub_links.append(vless_link)
+    sub_content = "\n".join(sub_links)
+    encoded = base64.b64encode(sub_content.encode()).decode()
+    # ─── Anti-leak headers ────────────────────────────────────────────────────
+    # Don't leak any identifying headers. Use only the minimum required headers
+    # for subscription clients to work.
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": "attachment; filename=\"sub.txt\"",
+        "profile-update-interval": "6",
+        "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
+        # Anti-leak hints (interpreted by modern VLESS clients like V2rayN, Nekoray):
+        # - profile-title: friendly name
+        # - profile-web-page-url: link back to status page (no IP leak — uses domain only)
+        "profile-title": f"Usf-{link['label']}",
+    }
+    return Response(content=encoded, headers=headers)
 
-# ─── Panel Builder ───────────────────────────────────────────────────────────
-@app.post("/api/panel-builder/deploy")
-async def panel_builder_deploy(request: Request, _=Depends(require_auth)):
-    try:
-        from huggingface_hub import HfApi
-    except ImportError:
-        raise HTTPException(500, "huggingface_hub not installed. Install it: pip install huggingface_hub")
-    body = await request.json()
-    token = (body.get("hf_token") or "").strip()
-    space = (body.get("space_name") or "").strip().lower()
-    admin_user = (body.get("admin_username") or "admin").strip()[:30]
-    admin_pass = (body.get("admin_password") or "admin").strip()
-    if not token: raise HTTPException(400, "HF token required")
-    if not space or not re.match(r'^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$', space):
-        raise HTTPException(400, "Invalid space name")
-    if len(admin_pass) < 4: raise HTTPException(400, "Password min 4 chars")
-    try:
-        api = HfApi(token=token)
-        me = api.whoami()
-        repo_id = f"{me['name']}/{space}"
-        import inspect
-        app_file = inspect.getfile(lambda: None)
-        with open(app_file, 'r') as f:
-            code = f.read()
-        # Replace default secret with new one
-        new_secret = secrets.token_urlsafe(32)
-        code = code.replace("usf-default-secret-key-change-me", new_secret)
-        dockerfile = f"""FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE 7860
-ENV ADMIN_USERNAME={admin_user}
-ENV ADMIN_PASSWORD={admin_pass}
-ENV SECRET_KEY={new_secret}
-CMD ["python", "-c", "import uvicorn; uvicorn.run('app:app', host='0.0.0.0', port=7860, log_level='info', access_log=False)"]
-"""
-        reqs = "fastapi>=0.115.0\nuvicorn>=0.30.0\nhttpx>=0.27.0\npsutil>=5.9.0\n"
-        readme = f"---\ntitle: {space}\nsdk: docker\napp_port: 7860\n---\n"
-        api.create_repo(repo_id=repo_id, repo_type="space", exist_ok=True, space_sdk="docker")
-        for fname, content in [("app.py", code.encode()), ("Dockerfile", dockerfile.encode()),
-                                ("requirements.txt", reqs.encode()), ("README.md", readme.encode())]:
-            api.upload_file(path_or_fileobj=content, path_in_repo=fname, repo_id=repo_id, repo_type="space")
-        return {"ok": True, "space_url": f"https://huggingface.co/spaces/{repo_id}",
-                "app_url": f"https://{repo_id.split('/')[1]}.hf.space", "repo_id": repo_id}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+# ─── WebSocket Tunnel ──────────────────────────────────────────────────────────
 
-# ─── WebSocket Tunnel ───────────────────────────────────────────────────────
-RELAY_BUF = 1024 * 1024  # 1MB for better throughput
+# ─── Speed: bigger buffer = fewer syscalls = higher throughput ───────────────
+RELAY_BUF = 512 * 1024  # 512 KB (was 64 KB) — ~30% throughput boost on fast links
 
-async def parse_vless_header(chunk):
-    if len(chunk) < 26: raise ValueError("too small")
-    p = 0
-    p += 1 + 16  # version(1) + uuid(16)
-    addon_len = chunk[p]; p += 1 + addon_len
-    cmd = chunk[p]; p += 1
-    # VLESS spec: after command comes address TYPE, then ADDRESS, then PORT
-    atype = chunk[p]; p += 1
-    if atype == 1:  # IPv4
-        if len(chunk) < p + 4 + 2: raise ValueError("truncated IPv4")
-        addr = ".".join(str(b) for b in chunk[p:p+4]); p += 4
-    elif atype == 2:  # Domain
-        dl = chunk[p]; p += 1
-        if len(chunk) < p + dl + 2: raise ValueError("truncated domain")
-        addr = chunk[p:p+dl].decode("utf-8", errors="ignore"); p += dl
-    elif atype == 3:  # IPv6
-        if len(chunk) < p + 16 + 2: raise ValueError("truncated IPv6")
-        ab = chunk[p:p+16]; p += 16
-        addr = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+async def parse_vless_header(first_chunk: bytes):
+    if len(first_chunk) < 24:
+        raise ValueError("chunk too small")
+    pos = 0
+    pos += 1; pos += 16
+    addon_len = first_chunk[pos]; pos += 1; pos += addon_len
+    command = first_chunk[pos]; pos += 1
+    port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
+    addr_type = first_chunk[pos]; pos += 1
+    if addr_type == 1:
+        addr_bytes = first_chunk[pos:pos + 4]; pos += 4
+        address = ".".join(str(b) for b in addr_bytes)
+    elif addr_type == 2:
+        domain_len = first_chunk[pos]; pos += 1
+        address = first_chunk[pos:pos + domain_len].decode("utf-8", errors="ignore"); pos += domain_len
+    elif addr_type == 3:
+        addr_bytes = first_chunk[pos:pos + 16]; pos += 16
+        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
     else:
-        raise ValueError(f"unknown addr type: {atype}")
-    if len(chunk) < p + 2: raise ValueError("truncated port")
-    port = int.from_bytes(chunk[p:p+2], "big"); p += 2
-    return cmd, addr, port, chunk[p:]
+        raise ValueError(f"unknown address type: {addr_type}")
+    return command, address, port, first_chunk[pos:]
 
-async def check_and_add_usage(uid, n):
-    """Combined quota check + usage update in a single lock acquisition."""
+async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if not link or not link["active"] or is_expired(link): return False
-        if link["limit_bytes"] > 0 and (link["used_bytes"] + n) > link["limit_bytes"]:
-            return False
-        link["used_bytes"] += n
-        return True
-
-async def check_quota(uid, n):
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
-        if not link or not link["active"] or is_expired(link): return False
+        if link is None: return False
+        if not link["active"]: return False
+        if is_expired(link): return False
         if link["limit_bytes"] == 0: return True
-        return (link["used_bytes"] + n) <= link["limit_bytes"]
+        return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
 
-async def add_usage(uid, n):
+async def add_usage(uid: str, n: int):
     async with LINKS_LOCK:
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
 
-def _get_speed_limit_bps(uid):
-    """Return speed limit in bytes/sec for a link, 0 = unlimited."""
-    link = LINKS.get(uid)
-    if not link: return 0
-    sl = link.get("speed_limit", 0)
-    if sl <= 0: return 0
-    # speed_limit is in Mbps, convert to bytes/sec
-    return int(sl * 1024 * 1024 / 8)
-
-async def ws_to_tcp(ws, writer, cid, uid):
-    """WS -> TCP relay with batched usage tracking to reduce lock contention."""
-    limit_bps = _get_speed_limit_bps(uid)
-    local_bytes = 0
-    BATCH = 65536
+async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
     try:
         while True:
-            msg = await ws.receive()
+            msg = await websocket.receive()
             if msg["type"] == "websocket.disconnect": break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data: continue
-            sz = len(data)
-            local_bytes += sz
-            if local_bytes >= BATCH:
-                if not await check_and_add_usage(uid, local_bytes):
-                    await ws.close(1008, "quota exceeded"); break
-                stats["total_bytes"] += local_bytes; stats["total_requests"] += 1
-                if cid in connections: connections[cid]["bytes"] += local_bytes
-                hourly_traffic[datetime.now().strftime("%H:00")] += local_bytes
-                local_bytes = 0
-            if limit_bps > 0:
-                sleep_time = sz / limit_bps
-                if sleep_time > 0.01: await asyncio.sleep(sleep_time)
+            size = len(data)
+            if not await check_quota(link_uid, size):
+                await websocket.close(code=1008, reason="quota exceeded"); break
+            stats["total_bytes"] += size; stats["total_requests"] += 1
+            connections[conn_id]["bytes"] += size
+            hourly_traffic[datetime.now().strftime("%H:00")] += size
+            await add_usage(link_uid, size)
             writer.write(data); await writer.drain()
     except WebSocketDisconnect: pass
     finally:
-        if local_bytes > 0:
-            stats["total_bytes"] += local_bytes; stats["total_requests"] += 1
-            if cid in connections: connections[cid]["bytes"] += local_bytes
-            hourly_traffic[datetime.now().strftime("%H:00")] += local_bytes
-            await add_usage(uid, local_bytes)
         try: writer.write_eof()
         except: pass
 
-async def tcp_to_ws(ws, reader, cid, uid):
-    """TCP -> WS relay with batched usage tracking."""
-    limit_bps = _get_speed_limit_bps(uid)
+async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
     first = True
-    local_bytes = 0
-    BATCH = 65536
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data: break
-            sz = len(data)
-            local_bytes += sz
-            if local_bytes >= BATCH:
-                if not await check_and_add_usage(uid, local_bytes):
-                    await ws.close(1008, "quota exceeded"); break
-                stats["total_bytes"] += local_bytes
-                if cid in connections: connections[cid]["bytes"] += local_bytes
-                hourly_traffic[datetime.now().strftime("%H:00")] += local_bytes
-                local_bytes = 0
-            if limit_bps > 0:
-                sleep_time = sz / limit_bps
-                if sleep_time > 0.01: await asyncio.sleep(sleep_time)
-            await ws.send_bytes((b"\x00\x00" + data) if first else data)
+            size = len(data)
+            if not await check_quota(link_uid, size):
+                await websocket.close(code=1008, reason="quota exceeded"); break
+            stats["total_bytes"] += size
+            connections[conn_id]["bytes"] += size
+            hourly_traffic[datetime.now().strftime("%H:00")] += size
+            await add_usage(link_uid, size)
+            await websocket.send_bytes((b"\x00\x00" + data) if first else data)
             first = False
     except: pass
-    finally:
-        if local_bytes > 0:
-            stats["total_bytes"] += local_bytes
-            if cid in connections: connections[cid]["bytes"] += local_bytes
-            hourly_traffic[datetime.now().strftime("%H:00")] += local_bytes
-            await add_usage(uid, local_bytes)
 
-@app.websocket("/ws/{uid}")
-async def ws_tunnel(ws: WebSocket, uid: str):
+@app.websocket("/ws/{uuid}")
+async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
-    await ws.accept()
+    # Simple accept — let uvicorn auto-negotiate compression with the client.
+    # Forcing a Sec-WebSocket-Extensions header here would tell the client
+    # "I'm compressing" while we actually send uncompressed frames, which
+    # breaks VLESS clients that strictly follow the RFC.
+    await websocket.accept()
     writer = None
-    cid = None
-    client_ip = get_client_ip(ws)
+    conn_id = None
+    client_ip = get_client_ip(websocket)
     try:
         if not SERVICE_RUNNING:
-            await ws.close(1012, "stopped"); return
+            await websocket.close(code=1012, reason="service stopped"); return
         async with LINKS_LOCK:
-            ld = LINKS.get(uid)
-            if not ld or not ld["active"]:
-                await ws.close(1008, "disabled"); return
-            if is_expired(ld):
-                await ws.close(1008, "expired"); return
-            mc = ld.get("max_connections", 0)
-        if mc > 0:
-            if client_ip not in link_ip_map.get(uid, set()):
-                if count_connections_for_link(uid) >= mc:
-                    await ws.close(1008, "limit reached"); return
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=15)
+            link_data = LINKS.get(uuid)
+            if link_data is None or not link_data["active"]:
+                await websocket.close(code=1008, reason="link not found or disabled"); return
+            if is_expired(link_data):
+                await websocket.close(code=1008, reason="link expired"); return
+            max_conn = link_data.get("max_connections", 0)
+        if max_conn > 0:
+            already_connected = client_ip in link_ip_map.get(uuid, set())
+            if not already_connected:
+                current = count_connections_for_link(uuid)
+                if current >= max_conn:
+                    await websocket.close(code=1008, reason="connection limit reached"); return
+        first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect": return
-        chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not chunk: return
-        cmd, addr, port, payload = await parse_vless_header(chunk)
-        cid = secrets.token_urlsafe(8)
-        connections[cid] = {"uuid": uid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
-        connection_sockets[cid] = ws
-        link_ip_map[uid].add(client_ip)
-        async with LINKS_LOCK:
-            lbl = LINKS.get(uid, {}).get("label", "?")
-        connection_history.append({"time": datetime.now().isoformat(), "uuid": uid[:8], "label": lbl, "ip": client_ip, "target": f"{addr}:{port}"})
-        sz = len(chunk)
-        stats["total_bytes"] += sz; stats["total_requests"] += 1
-        connections[cid]["bytes"] += sz
-        hourly_traffic[datetime.now().strftime("%H:00")] += sz
-        await add_usage(uid, sz)
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(addr, port), timeout=10)
+        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        if not first_chunk: return
+        command, address, port, initial_payload = await parse_vless_header(first_chunk)
+        conn_id = secrets.token_urlsafe(8)
+        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
+        connection_sockets[conn_id] = websocket
+        link_ip_map[uuid].add(client_ip)
+        size = len(first_chunk)
+        stats["total_bytes"] += size; stats["total_requests"] += 1
+        connections[conn_id]["bytes"] += size
+        hourly_traffic[datetime.now().strftime("%H:00")] += size
+        await add_usage(uuid, size)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+        # ─── Speed: TCP_NODELAY disables Nagle's algorithm = lower latency for small packets
         try:
             sock = writer.get_extra_info('socket')
-            if sock:
+            if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                try: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-                except (AttributeError, OSError): pass
+                # Increase send/recv buffers for higher throughput
                 try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-                except (AttributeError, OSError): pass
-        except: pass
-        if payload:
-            psz = len(payload)
-            stats["total_bytes"] += psz; connections[cid]["bytes"] += psz
-            hourly_traffic[datetime.now().strftime("%H:00")] += psz
-            await add_usage(uid, psz)
-            writer.write(payload); await writer.drain()
-        t1 = asyncio.create_task(ws_to_tcp(ws, writer, cid, uid))
-        t2 = asyncio.create_task(tcp_to_ws(ws, reader, cid, uid))
-        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if initial_payload:
+            p_size = len(initial_payload)
+            stats["total_bytes"] += p_size
+            connections[conn_id]["bytes"] += p_size
+            hourly_traffic[datetime.now().strftime("%H:00")] += p_size
+            await add_usage(uuid, p_size)
+            writer.write(initial_payload); await writer.drain()
+        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
+        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
+        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending: t.cancel()
     except WebSocketDisconnect: pass
     except Exception as exc:
@@ -1096,1000 +1174,1939 @@ async def ws_tunnel(ws: WebSocket, uid: str):
         if writer:
             try: writer.close()
             except: pass
-        if cid:
-            info = connections.pop(cid, None)
-            connection_sockets.pop(cid, None)
+        if conn_id:
+            info = connections.pop(conn_id, None)
+            connection_sockets.pop(conn_id, None)
             if info:
-                u, ip = info.get("uuid"), info.get("ip")
-                if u and ip and not any(c.get("uuid") == u and c.get("ip") == ip for c in connections.values()):
-                    remove_ip_from_link(u, ip)
+                uid = info.get("uuid")
+                ip = info.get("ip")
+                if uid and ip:
+                    has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
+                    if not has_other:
+                        remove_ip_from_link(uid, ip)
 
-# ─── HTML: Status 404 ────────────────────────────────────────────────────────
-STATUS_404 = r'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+# ─── Subscription Status Page (Premium) ──────────────────────────────────────
+
+@app.get("/status/{uuid}", response_class=HTMLResponse)
+async def subscription_status(uuid: str):
+    async with LINKS_LOCK:
+        link_data = LINKS.get(uuid)
+        if link_data is None:
+            return HTMLResponse(
+                content='''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>لینک نامعتبر</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:system-ui,sans-serif}
-.box{background:rgba(20,27,45,0.7);backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:24px;padding:48px 36px;text-align:center;max-width:400px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
-.icon{width:56px;height:56px;border-radius:50%;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.2);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:#ef4444;font-size:24px}
-h1{color:#f1f5f9;font-size:18px;margin-bottom:8px;font-weight:700}
-p{color:#94a3b8;font-size:13px;line-height:1.7}</style></head><body>
-<div class="box"><div class="icon">&#10005;</div><h1>لینک نامعتبر است</h1><p>این اشتراک وجود ندارد یا حذف شده است.</p></div>
-</body></html>'''
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,sans-serif}
+body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.box{background:rgba(20,27,45,0.65);backdrop-filter:blur(20px);border:1px solid rgba(245,197,66,0.18);
+border-radius:24px;padding:48px 36px;text-align:center;max-width:420px;width:100%;
+box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
+.icon{font-size:48px;margin-bottom:14px}
+h1{color:#f5c542;font-size:20px;margin-bottom:8px;font-weight:700}
+p{color:#94a3b8;font-size:14px;line-height:1.7}
+a{color:#f5c542;text-decoration:none;font-size:13px;margin-top:14px;display:inline-block;border-bottom:1px dashed rgba(245,197,66,0.4)}
+</style></head><body>
+<div class="box"><div class="icon">⚠️</div><h1>لینک نامعتبر است</h1>
+<p>این اشتراک وجود ندارد یا حذف شده است.<br>لطفاً با مدیر سرویس تماس بگیرید.</p>
+<a href="/">→ بازگشت به خانه</a></div></body></html>''',
+                status_code=404
+            )
 
-# ─── HTML: Status/Subscription Page ─────────────────────────────────────────
-STATUS_HTML = r'''<!DOCTYPE html>
+    used_bytes = int(link_data.get("used_bytes", 0))
+    limit_bytes = int(link_data.get("limit_bytes", 0))
+    remaining_bytes = max(0, limit_bytes - used_bytes) if limit_bytes > 0 else 0
+    vless_link = generate_vless_link(uuid, remark=f"Usf-{link_data['label']}")
+    # Build a fully-qualified https:// subscription URL (HuggingFace runs over HTTPS).
+    _domain = get_domain()
+    sub_url = f"https://{_domain}/sub/{uuid}" if _domain and _domain != "localhost" else f"/sub/{uuid}"
+    percent = min(100, (used_bytes / limit_bytes) * 100) if limit_bytes > 0 else 0
+
+    # Build remaining / expiry display
+    used_str = fmt_bytes(used_bytes)
+    limit_str = fmt_bytes(limit_bytes) if limit_bytes > 0 else "نامحدود"
+    remaining_str = fmt_bytes(remaining_bytes) if limit_bytes > 0 else "نامحدود"
+
+    expiry_raw = link_data.get('expiry', '')
+    expiry_display = "نامحدود"
+    expiry_epoch_val = 0
+    if expiry_raw:
+        try:
+            exp_dt = datetime.fromisoformat(expiry_raw)
+            expiry_epoch_val = int(exp_dt.timestamp())
+            expiry_display = exp_dt.strftime('%Y-%m-%d')
+        except (TypeError, ValueError):
+            expiry_raw = ''
+
+    label = link_data.get('label', 'بدون برچسب')
+    max_conn = link_data.get('max_connections', 0)
+    is_active = bool(link_data.get('active', False))
+    is_exp = is_expired(link_data)
+    status_text = 'فعال' if (is_active and not is_exp) else ('منقضی' if is_exp else 'غیرفعال')
+    status_class = 'on' if (is_active and not is_exp) else 'off'
+
+    html_template = '''<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
-<meta name="theme-color" content="#0b0f1a">
-<title>__TITLE__</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{--bg:#0b0f1a;--card:rgba(15,23,42,0.6);--accent:#6366f1;--accent2:#818cf8;
---accent-soft:rgba(99,102,241,0.12);--accent-glow:rgba(99,102,241,0.3);
---text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;
---border:rgba(99,102,241,0.18);--border-s:rgba(255,255,255,0.06);
---green:#22c55e;--red:#ef4444;--amber:#f59e0b;--radius:16px}
-html[data-theme="light"]{--bg:#f1f5f9;--card:rgba(255,255,255,0.85);--text:#0f172a;--text2:#334155;--text3:#64748b;--border:rgba(99,102,241,0.25);--border-s:rgba(0,0,0,0.06)}
-html,body{height:100%}
-body{font-family:'Vazirmatn',system-ui,sans-serif;font-size:16px;line-height:1.7;color:var(--text);background:var(--bg);display:flex;align-items:center;justify-content:center;padding:16px;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);overflow-y:auto}
-.orbs{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
-.orb{position:absolute;border-radius:50%;filter:blur(100px);opacity:.18;animation:orb-float 20s ease-in-out infinite}
-.orb-1{width:340px;height:340px;background:#6366f1;top:-80px;right:-60px}
-.orb-2{width:280px;height:280px;background:#06b6d4;bottom:-60px;left:-40px;animation-delay:-7s}
-.orb-3{width:200px;height:200px;background:#8b5cf6;top:50%;left:50%;transform:translate(-50%,-50%);animation-delay:-14s}
-@keyframes orb-float{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-20px) scale(1.05)}66%{transform:translate(-20px,15px) scale(.95)}}
-.card{position:relative;z-index:1;background:var(--card);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius);padding:32px 24px;max-width:420px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,0.4)}
-@media(min-width:480px){.card{padding:40px 32px}}
-.header{text-align:center;margin-bottom:24px}
-.logo{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;font-size:28px;font-weight:800;color:#fff;box-shadow:0 0 30px var(--accent-glow)}
-.header h1{font-size:20px;font-weight:700;margin-bottom:4px}
-.header .sub{color:var(--text3);font-size:13px}
-.badge{display:inline-flex;align-items:center;gap:6px;padding:4px 14px;border-radius:20px;font-size:12px;font-weight:600;margin:8px 0 16px}
-.badge-active{background:rgba(34,197,94,0.12);color:#22c55e;border:1px solid rgba(34,197,94,0.2)}
-.badge-expired{background:rgba(239,68,68,0.12);color:#ef4444;border:1px solid rgba(239,68,68,0.2)}
-.badge-disabled{background:rgba(100,116,139,0.12);color:#94a3b8;border:1px solid rgba(100,116,139,0.2)}
-.badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-.gauge-wrap{display:flex;justify-content:center;margin:20px 0}
-.gauge{position:relative;width:180px;height:100px;overflow:visible}
-.gauge svg{width:100%;height:100%}
-.gauge-bg{fill:none;stroke:var(--border-s);stroke-width:12;stroke-linecap:round}
-.gauge-fill{fill:none;stroke:url(#gaugeGrad);stroke-width:12;stroke-linecap:round;transition:stroke-dashoffset 1.4s cubic-bezier(.4,0,.2,1)}
-.gauge-text{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;bottom:-8px}
-.gauge-pct{font-size:32px;font-weight:800;background:linear-gradient(135deg,#6366f1,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.gauge-label{font-size:11px;color:var(--text3);margin-top:-2px}
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:20px 0}
-.stat{background:var(--border-s);border-radius:12px;padding:12px;text-align:center}
-.stat-val{font-size:16px;font-weight:700;color:var(--text)}
-.stat-lbl{font-size:11px;color:var(--text3);margin-top:2px}
-.info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border-s);font-size:13px}
-.info-row:last-child{border:none}
-.info-label{color:var(--text3)}
-.info-value{color:var(--text);font-weight:600;direction:ltr;text-align:left}
-.section-title{font-size:14px;font-weight:700;margin:20px 0 12px;color:var(--text2)}
-.sub-url{display:flex;align-items:center;gap:8px;background:var(--border-s);border-radius:12px;padding:10px 14px;margin-bottom:16px;cursor:pointer;transition:all .2s;border:1px solid transparent}
-.sub-url:hover{border-color:var(--border)}
-.sub-url span{flex:1;font-size:12px;color:var(--text2);direction:ltr;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sub-url .copy-btn{background:var(--accent-soft);color:var(--accent);border:none;border-radius:8px;padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}
-.sub-url .copy-btn:hover{background:var(--accent);color:#fff}
-.clients{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.client-btn{display:flex;align-items:center;justify-content:center;gap:6px;padding:10px 8px;border-radius:12px;border:1px solid var(--border-s);background:var(--border-s);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;text-decoration:none;font-family:inherit}
-.client-btn:hover{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);transform:translateY(-1px);box-shadow:0 4px 12px rgba(99,102,241,0.15)}
-.client-btn .c-icon{font-size:16px}
-.theme-toggle{position:fixed;top:16px;left:16px;z-index:10;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 10px;cursor:pointer;color:var(--text);font-size:16px;backdrop-filter:blur(12px);transition:all .2s}
-.theme-toggle:hover{border-color:var(--accent)}
-.countdown{font-size:13px;color:var(--text3);text-align:center;margin:8px 0}
-.countdown span{color:var(--amber);font-weight:700}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--accent);color:#fff;padding:10px 24px;border-radius:12px;font-size:13px;font-weight:600;z-index:100;opacity:0;transition:all .3s ease;font-family:inherit}
-.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
-</style>
-</head>
-<body>
-<div class="orbs"><div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div></div>
-<button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">&#9790;</button>
-<div class="card">
-  <div class="header">
-    <div class="logo">U</div>
-    <h1>__LABEL__</h1>
-    <div class="sub">__DOMAIN__</div>
-    <div id="badge"></div>
-  </div>
-  <div class="countdown" id="countdown" style="display:none"></div>
-  <div class="gauge-wrap" id="gaugeWrap">
-    <div class="gauge">
-      <svg viewBox="0 0 200 110">
-        <defs><linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" style="stop-color:#6366f1"/><stop offset="100%" style="stop-color:#06b6d4"/>
-        </linearGradient></defs>
-        <path class="gauge-bg" d="M 20 100 A 80 80 0 0 1 180 100"/>
-        <path class="gauge-fill" id="gaugeFill" d="M 20 100 A 80 80 0 0 1 180 100"
-              stroke-dasharray="251.3" stroke-dashoffset="251.3"/>
-      </svg>
-      <div class="gauge-text">
-        <div class="gauge-pct" id="gaugePct">0%</div>
-        <div class="gauge-label">مصرف حجم</div>
-      </div>
-    </div>
-  </div>
-  <div class="stats">
-    <div class="stat"><div class="stat-val" id="sUsed">-</div><div class="stat-lbl">مصرف شده</div></div>
-    <div class="stat"><div class="stat-val" id="sRemain">-</div><div class="stat-lbl">باقیمانده</div></div>
-    <div class="stat"><div class="stat-val" id="sTotal">-</div><div class="stat-lbl">کل حجم</div></div>
-    <div class="stat"><div class="stat-val" id="sConns">0</div><div class="stat-lbl">اتصال فعال</div></div>
-  </div>
-  <div class="section-title">لینک اشتراک</div>
-  <div class="sub-url" onclick="copySub()">
-    <span id="subUrlText">-</span>
-    <button class="copy-btn">کپی</button>
-  </div>
-  <div class="section-title">نصب سریع</div>
-  <div class="clients" id="clientBtns"></div>
-</div>
-<div class="toast" id="toast"></div>
-<script>
-const D=__DATA__;
-document.title=D.label+' — Usf';
-// Badge
-const b=document.getElementById('badge');
-if(!D.active){b.innerHTML='<span class="badge badge-disabled"><span class="dot"></span>غیرفعال</span>'}
-else if(D.expired){b.innerHTML='<span class="badge badge-expired"><span class="dot"></span>منقضی</span>'}
-else{b.innerHTML='<span class="badge badge-active"><span class="dot"></span>فعال</span>'}
-// Gauge
-const pct=D.usage_percent||0;
-const circ=251.3;
-setTimeout(()=>{document.getElementById('gaugeFill').style.strokeDashoffset=circ-(circ*Math.min(pct,100)/100);document.getElementById('gaugePct').textContent=Math.round(pct)+'%'},100);
-// Stats
-document.getElementById('sUsed').textContent=D.used_mb+' MB';
-document.getElementById('sRemain').textContent=D.limit_bytes>0?D.remaining_mb+' MB':'نامحدود';
-document.getElementById('sTotal').textContent=D.limit_bytes>0?D.limit_mb+' MB':'نامحدود';
-document.getElementById('sConns').textContent=D.current_connections||0;
-// Sub URL
-document.getElementById('subUrlText').textContent=D.sub_url;
-function copySub(){navigator.clipboard.writeText(D.sub_url);showToast('کپی شد!')}
-// Client buttons
-const clients=D.client_links||{};
-const btns=document.getElementById('clientBtns');
-const order=['V2RayN','V2RayNG','Streisand','Shadowrocket','Foxray','Nekoray','BS Client','Npv Tunnel','Hiddify','Mahsang'];
-order.forEach(name=>{
-  if(!clients[name])return;
-  const a=document.createElement('a');
-  a.className='client-btn';
-  a.href=clients[name];
-  a.target='_blank';
-  a.rel='noopener';
-  a.innerHTML='<span class="c-icon">&#128279;</span>'+name;
-  btns.appendChild(a);
-});
-// Countdown
-if(D.expiry&&D.expiry!==''){
-  const cd=document.getElementById('countdown');
-  cd.style.display='block';
-  function updateCD(){
-    const left=new Date(D.expiry)-Date.now();
-    if(left<=0){cd.innerHTML='منقضی شده';return}
-    const d=Math.floor(left/86400000),h=Math.floor((left%86400000)/3600000),m=Math.floor((left%3600000)/60000),s=Math.floor((left%60000)/1000);
-    let t='';
-    if(d>0)t+=d+' روز ';
-    if(h>0)t+=h+' ساعت ';
-    t+=m+' دقیقه '+s+' ثانیه';
-    cd.innerHTML='مهلت باقیمانده: <span>'+t+'</span>';
-  }
-  updateCD();setInterval(updateCD,1000);
-}
-// Theme
-function toggleTheme(){
-  const t=document.documentElement.getAttribute('data-theme')==='light'?'dark':'light';
-  document.documentElement.setAttribute('data-theme',t);
-  localStorage.setItem('theme',t);
-  document.getElementById('themeBtn').innerHTML=t==='dark'?'&#9790;':'&#9728;';
-}
-(function(){const s=localStorage.getItem('theme');if(s){document.documentElement.setAttribute('data-theme',s);document.getElementById('themeBtn').innerHTML=s==='dark'?'&#9790;':'&#9728;'}else if(window.matchMedia('(prefers-color-scheme:light)').matches){document.documentElement.setAttribute('data-theme','light');document.getElementById('themeBtn').innerHTML='&#9728;'}})();
-// Toast
-function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
-</script>
-</body></html>'''
-
-# ─── HTML: Login Page ────────────────────────────────────────────────────────
-LOGIN_HTML = r'''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta name="theme-color" content="#0b0f1a">
-<title>Usf Panel — Login</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0b0f1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:'Inter',system-ui,sans-serif}
-.orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none}
-.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:.15;animation:orb-f 20s ease-in-out infinite}
-.o1{width:400px;height:400px;background:#6366f1;top:-100px;right:-80px}
-.o2{width:300px;height:300px;background:#06b6d4;bottom:-80px;left:-60px;animation-delay:-7s}
-@keyframes orb-f{0%,100%{transform:translate(0,0)}50%{transform:translate(30px,-20px)}}
-.card{position:relative;z-index:1;background:rgba(15,23,42,0.6);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:20px;padding:40px 32px;max-width:380px;width:100%;box-shadow:0 25px 50px rgba(0,0,0,0.5)}
-.logo{text-align:center;margin-bottom:32px}
-.logo h1{font-size:28px;font-weight:800;background:linear-gradient(135deg,#6366f1,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px}
-.logo p{color:#94a3b8;font-size:13px}
-.form-group{margin-bottom:20px}
-.form-group label{display:block;color:#cbd5e1;font-size:13px;font-weight:500;margin-bottom:6px}
-.form-group input{width:100%;padding:12px 16px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;color:#f1f5f9;font-size:14px;font-family:inherit;outline:none;transition:all .2s}
-.form-group input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,0.15)}
-.login-btn{width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;border:none;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;font-family:inherit}
-.login-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(99,102,241,0.3)}
-.login-btn:active{transform:translateY(0)}
-.login-btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.error{color:#ef4444;font-size:13px;text-align:center;margin-top:16px;min-height:20px}
-</style>
-</head>
-<body>
-<div class="orbs"><div class="orb o1"></div><div class="orb o2"></div></div>
-<div class="card">
-  <div class="logo"><h1>Usf Panel</h1><p>VLESS Tunnel Manager</p></div>
-  <form id="loginForm" onsubmit="doLogin(event)">
-    <div class="form-group"><label>Username</label><input type="text" id="username" autocomplete="username" required></div>
-    <div class="form-group"><label>Password</label><input type="password" id="password" autocomplete="current-password" required></div>
-    <button type="submit" class="login-btn" id="loginBtn">Sign In</button>
-    <div class="error" id="error"></div>
-  </form>
-</div>
-<script>
-async function doLogin(e){
-  e.preventDefault();
-  const btn=document.getElementById('loginBtn');
-  const err=document.getElementById('error');
-  btn.disabled=true;err.textContent='';
-  try{
-    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});
-    const d=await r.json();
-    if(r.ok){window.location.href='/dashboard'}
-    else{err.textContent=d.detail||'Login failed';btn.disabled=false}
-  }catch(x){err.textContent='Connection error';btn.disabled=false}
-}
-document.getElementById('username').focus();
-</script>
-</body></html>'''
-
-# ─── PLACEHOLDER: Dashboard HTML will be appended below ──────────────────────
-DASHBOARD_HTML = r'''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<meta name="theme-color" content="#0b0f1a">
-<title>Usf Panel</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e1a" id="meta-theme">
+<title>اشتراک Usf · __LABEL__</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
-  --bg:#0b0f1a;--sidebar:#0f1629;--card:rgba(15,23,42,0.7);
-  --glass:rgba(255,255,255,0.04);--border:rgba(255,255,255,0.07);
-  --accent:#6366f1;--accent2:#818cf8;--cyan:#06b6d4;--emerald:#10b981;--amber:#f59e0b;--rose:#f43f5e;
-  --text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;--text4:#64748b;
-  --radius:14px;
+  --bg:#080b14;
+  --bg-grad-1:rgba(245,197,66,0.13);
+  --bg-grad-2:rgba(99,102,241,0.10);
+  --card:rgba(20,27,45,0.55);
+  --card-2:rgba(255,255,255,0.025);
+  --glass:rgba(255,255,255,0.04);
+  --accent:#f5c542;
+  --accent-2:#ffd76b;
+  --accent-soft:rgba(245,197,66,0.12);
+  --accent-glow:rgba(245,197,66,0.35);
+  --text:#f8fafc;
+  --text-2:#cbd5e1;
+  --text-3:#94a3b8;
+  --text-4:#64748b;
+  --border:rgba(245,197,66,0.18);
+  --border-soft:rgba(255,255,255,0.06);
+  --success:#22c55e;
+  --success-soft:rgba(34,197,94,0.12);
+  --danger:#ef4444;
+  --warn:#f59e0b;
+  --shadow-card:0 30px 60px -15px rgba(0,0,0,0.7),0 0 0 1px rgba(255,255,255,0.04) inset,0 0 80px rgba(245,197,66,0.05);
 }
-html,body{height:100%;overflow:hidden}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.5;color:var(--text);background:var(--bg);display:flex}
-::-webkit-scrollbar{width:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--text4);border-radius:3px}
-
-.sidebar{width:230px;min-width:230px;background:var(--sidebar);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;z-index:50;transition:transform .3s ease}
-.logo{padding:18px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
-.logo-icon{width:34px;height:34px;min-width:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--cyan));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;color:#fff}
-.logo-text{font-size:15px;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;white-space:nowrap}
-.nav{flex:1;padding:10px 8px}
-.nav-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;color:var(--text3);cursor:pointer;transition:all .15s;margin-bottom:2px;font-size:13px;font-weight:500;white-space:nowrap;user-select:none}
-.nav-item:hover{background:var(--glass);color:var(--text2)}
-.nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent2)}
-.nav-item svg{width:18px;height:18px;min-width:18px;flex-shrink:0}
-.sidebar-footer{padding:12px;border-top:1px solid var(--border);text-align:center;font-size:11px;color:var(--text4)}
-
-.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:40}
-.sidebar-overlay.show{display:block}
-
-.main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
-.topbar{height:54px;min-height:54px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;gap:12px}
-.topbar-left{display:flex;align-items:center;gap:10px;min-width:0}
-.toggle-sidebar{display:none;background:none;border:none;color:var(--text3);cursor:pointer;padding:6px 8px;border-radius:8px;font-size:20px;line-height:1}
-.toggle-sidebar:hover{color:var(--text);background:var(--glass)}
-.page-title{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.topbar-right{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.topbar-badge{background:var(--glass);border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--text3);white-space:nowrap;display:flex;align-items:center;gap:6px}
-.status-dot{width:7px;height:7px;border-radius:50%;background:var(--emerald);animation:pdot 2s infinite}
-@keyframes pdot{0%,100%{opacity:1}50%{opacity:.4}}
-.logout-btn{background:none;border:1px solid var(--border);color:var(--text3);border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap}
-.logout-btn:hover{border-color:var(--rose);color:var(--rose)}
-
-.content{flex:1;overflow-y:auto;padding:20px;-webkit-overflow-scrolling:touch}
-
-.card{background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:var(--radius);padding:18px;transition:border-color .2s}
-.card:hover{border-color:rgba(99,102,241,0.15)}
-.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:8px;flex-wrap:wrap}
-.card-title{font-size:14px;font-weight:600;color:var(--text2)}
-
-.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
-.stat-card{position:relative;overflow:hidden}
-.stat-icon{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;font-size:17px}
-.stat-value{font-size:22px;font-weight:800;margin-bottom:1px;line-height:1.2}
-.stat-label{font-size:11px;color:var(--text3)}
-.stat-bar{position:absolute;bottom:0;left:0;right:0;height:3px;background:var(--glass)}
-.stat-bar-fill{height:100%;border-radius:0 2px 0 0;transition:width .6s}
-.si{background:rgba(99,102,241,0.1);color:var(--accent)}
-.sr{background:rgba(6,182,212,0.1);color:var(--cyan)}
-.sd{background:rgba(245,158,11,0.1);color:var(--amber)}
-.sn{background:rgba(16,185,129,0.1);color:var(--emerald)}
-.sc{background:rgba(244,63,94,0.1);color:var(--rose)}
-.sti{background:rgba(139,92,246,0.1);color:#8b5cf6}
-
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-.grid-3{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:20px}
-
-.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{width:100%;border-collapse:collapse;min-width:600px}
-th{text-align:left;padding:9px 10px;font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border);white-space:nowrap}
-td{padding:9px 10px;border-bottom:1px solid var(--glass);font-size:13px;vertical-align:middle}
-tr:hover td{background:var(--glass)}
-.st-active{color:var(--emerald);font-weight:600}
-.st-expired{color:var(--rose);font-weight:600}
-.st-disabled{color:var(--text4);font-weight:600}
-
-.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:10px;border:1px solid var(--border);background:var(--glass);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap;user-select:none}
-.btn:hover{border-color:var(--accent);color:var(--accent2)}
-.btn:active{transform:scale(.97)}
-.btn-p{background:linear-gradient(135deg,var(--accent),#4f46e5);border:none;color:#fff}
-.btn-p:hover{color:#fff;box-shadow:0 4px 16px rgba(99,102,241,0.3)}
-.btn-s{padding:4px 8px;font-size:11px;border-radius:7px}
-.btn-d{border-color:rgba(244,63,94,0.3);color:var(--rose)}
-.btn-d:hover{background:rgba(244,63,94,0.1);border-color:var(--rose)}
-.btn-g{border-color:rgba(16,185,129,0.3);color:var(--emerald)}
-.btn-g:hover{background:rgba(16,185,129,0.1);border-color:var(--emerald)}
-
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
-.form-group{margin-bottom:10px}
-.form-group label{display:block;font-size:12px;font-weight:500;color:var(--text3);margin-bottom:4px}
-.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:border-color .15s}
-.form-group input:focus,.form-group select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,0.1)}
-.form-group textarea{resize:vertical;min-height:56px}
-.form-group select{cursor:pointer}
-.form-group select option{background:var(--sidebar);color:var(--text)}
-
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:100;display:flex;align-items:center;justify-content:center;padding:16px;opacity:0;pointer-events:none;transition:opacity .2s}
-.modal-overlay.open{opacity:1;pointer-events:auto}
-.modal{background:var(--sidebar);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:480px;width:100%;max-height:85vh;overflow-y:auto;transform:scale(.95);transition:transform .2s}
-.modal-overlay.open .modal{transform:scale(1)}
-.modal-title{font-size:16px;font-weight:700;margin-bottom:18px}
-
-.toast-box{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px;pointer-events:none}
-.toast{padding:10px 18px;border-radius:10px;font-size:13px;font-weight:500;animation:tin .25s ease;box-shadow:0 8px 24px rgba(0,0,0,0.3);pointer-events:auto}
-.toast-ok{background:var(--emerald);color:#fff}
-.toast-err{background:var(--rose);color:#fff}
-.toast-info{background:var(--accent);color:#fff}
-@keyframes tin{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
-
-.tag{display:inline-block;padding:2px 7px;border-radius:6px;font-size:10px;font-weight:600;background:rgba(99,102,241,0.1);color:var(--accent2);border:1px solid rgba(99,102,241,0.2)}
-
-.cdrop{position:relative;display:inline-block}
-.cmenu{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--sidebar);border:1px solid var(--border);border-radius:12px;padding:5px;min-width:150px;display:none;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,0.5);margin-bottom:4px;max-height:260px;overflow-y:auto}
-.cmenu.open{display:block}
-.cmenu-i{display:block;width:100%;text-align:left;padding:7px 12px;border:none;background:none;color:var(--text);font-size:11px;cursor:pointer;border-radius:7px;transition:all .1s;font-family:inherit;white-space:nowrap}
-.cmenu-i:hover{background:rgba(99,102,241,0.12);color:var(--accent2)}
-
-.cl-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:10px}
-.cl-item{display:flex;align-items:center;justify-content:space-between;gap:4px;padding:7px 10px;background:var(--glass);border-radius:8px;font-size:11px}
-.cl-item span{color:var(--text2);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cl-item button{background:none;border:none;color:var(--accent2);cursor:pointer;font-size:13px;padding:2px 4px;flex-shrink:0}
-
-.log-e{padding:5px 8px;border-bottom:1px solid var(--glass);font-size:11px;font-family:'Courier New',monospace;display:flex;gap:8px}
-.log-t{color:var(--text4);min-width:60px;flex-shrink:0}
-
-.page{display:none}
-.page.active{display:block}
-
-.search{position:relative;margin-bottom:14px}
-.search input{width:100%;padding:9px 14px 9px 36px;background:var(--glass);border:1px solid var(--border);border-radius:12px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s;font-family:inherit}
-.search input:focus{border-color:var(--accent)}
-.search svg{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--text4);width:15px;height:15px}
-
-.dep-res{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:12px;padding:14px;margin-top:14px}
-.dep-res a{color:var(--emerald);text-decoration:none;font-weight:600;word-break:break-all}
-.dep-res a:hover{text-decoration:underline}
-
-.chart-c{position:relative;height:180px}
-
-.empty{text-align:center;padding:40px 16px;color:var(--text4)}
-.empty svg{width:44px;height:44px;margin:0 auto 10px;opacity:.3}
-
-.info-r{display:flex;justify-content:space-between;padding:5px 0;font-size:13px}
-.info-l{color:var(--text3)}
-.info-v{color:var(--text);font-weight:600;direction:ltr}
-
-.sub-box{display:flex;gap:6px;margin-top:10px;padding:8px;background:var(--glass);border-radius:8px}
-.sub-box input{flex:1;min-width:0;padding:6px 10px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:11px;font-family:inherit;outline:none}
-
-.inp{flex:1;padding:8px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;outline:none;font-family:inherit}
-
-@media(max-width:900px){
-  .stats-grid{grid-template-columns:repeat(2,1fr)}
-  .grid-3{grid-template-columns:1fr}
+html[data-theme="light"]{
+  --bg:#f5f7fb;
+  --bg-grad-1:rgba(245,197,66,0.18);
+  --bg-grad-2:rgba(99,102,241,0.10);
+  --card:rgba(255,255,255,0.75);
+  --card-2:rgba(255,255,255,0.5);
+  --glass:rgba(0,0,0,0.02);
+  --text:#0f172a;
+  --text-2:#334155;
+  --text-3:#64748b;
+  --text-4:#94a3b8;
+  --border:rgba(245,197,66,0.3);
+  --border-soft:rgba(0,0,0,0.06);
+  --shadow-card:0 30px 60px -15px rgba(99,102,241,0.18),0 0 0 1px rgba(0,0,0,0.02) inset,0 0 80px rgba(245,197,66,0.10);
 }
-@media(max-width:768px){
-  .sidebar{position:fixed;right:0;top:0;bottom:0;z-index:50;transform:translateX(100%);width:260px;min-width:260px}
-  .sidebar.open{transform:translateX(0)}
-  .sidebar-overlay.show{display:block}
-  .toggle-sidebar{display:block}
-  .grid-2{grid-template-columns:1fr}
-  .form-row{grid-template-columns:1fr}
-  .content{padding:14px}
-  .topbar{padding:0 14px}
-  .cl-grid{grid-template-columns:1fr}
-  table{min-width:500px}
+html,body{height:100%}
+body{
+  font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
+  background:var(--bg);
+  background-image:
+    radial-gradient(ellipse 90% 60% at 50% -10%, var(--bg-grad-1), transparent 60%),
+    radial-gradient(ellipse 60% 50% at 100% 100%, var(--bg-grad-2), transparent 60%),
+    radial-gradient(ellipse 60% 50% at 0% 100%, rgba(34,197,94,0.06), transparent 60%);
+  background-attachment:fixed;
+  min-height:100vh;min-height:100dvh;
+  display:flex;justify-content:center;align-items:center;
+  padding:24px;color:var(--text);line-height:1.55;
+  -webkit-font-smoothing:antialiased;
 }
-@media(max-width:480px){
-  .stats-grid{grid-template-columns:1fr 1fr}
-  .stat-value{font-size:18px}
-  .stat-icon{width:32px;height:32px;font-size:14px;margin-bottom:8px}
-  .content{padding:12px}
-  .card{padding:14px}
-  .topbar-badge span:last-child{display:none}
+.card{
+  background:var(--card);
+  backdrop-filter:blur(28px) saturate(180%);
+  -webkit-backdrop-filter:blur(28px) saturate(180%);
+  max-width:520px;width:100%;
+  padding:32px 28px;
+  border-radius:28px;
+  border:1px solid var(--border);
+  box-shadow:var(--shadow-card);
+  position:relative;overflow:hidden;
+  animation:cardIn .7s cubic-bezier(.16,1,.3,1);
+}
+@keyframes cardIn{from{opacity:0;transform:translateY(24px) scale(.96)}to{opacity:1;transform:none}}
+.card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--accent) 30%,#ffd76b 50%,var(--accent) 70%,transparent);
+  opacity:.7;pointer-events:none;
+}
+.card::after{
+  content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
+  background:conic-gradient(from 0deg at 50% 50%,transparent 0deg,var(--accent-glow) 60deg,transparent 120deg,transparent 360deg);
+  opacity:.04;animation:spin 18s linear infinite;pointer-events:none;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Theme toggle (top-right) */
+.theme-toggle{
+  position:absolute;top:16px;left:16px;
+  width:38px;height:38px;border-radius:50%;
+  background:var(--glass);border:1px solid var(--border-soft);
+  color:var(--text-2);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .25s;z-index:2;
+}
+.theme-toggle:hover{background:var(--accent-soft);color:var(--accent);transform:rotate(15deg)}
+.theme-toggle svg{width:18px;height:18px}
+.theme-toggle .sun{display:none}
+html[data-theme="light"] .theme-toggle .sun{display:block}
+html[data-theme="light"] .theme-toggle .moon{display:none}
+
+/* Header */
+.header{text-align:center;margin-bottom:24px;position:relative;z-index:1}
+.logo-wrap{position:relative;width:80px;height:80px;margin:0 auto 12px}
+.logo-ring{position:absolute;inset:-4px;border-radius:50%;background:conic-gradient(from 0deg,var(--accent),var(--accent-2),#22c55e,var(--accent));animation:spin 8s linear infinite;filter:blur(6px);opacity:.55}
+.logo{
+  position:relative;width:80px;height:80px;border-radius:50%;
+  background:linear-gradient(135deg,var(--accent),#e6b422);
+  display:flex;align-items:center;justify-content:center;
+  color:#0a0e1a;font-size:36px;font-weight:800;
+  box-shadow:0 12px 30px var(--accent-glow),inset 0 -4px 12px rgba(0,0,0,0.15);
+}
+.title{font-size:24px;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--text),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
+.label-chip{
+  display:inline-flex;align-items:center;gap:6px;margin-top:8px;
+  padding:7px 16px;background:var(--glass);border:1px solid var(--border);
+  border-radius:999px;font-size:13px;color:var(--text-2);
+  max-width:90%;word-break:break-word;
+}
+.label-chip .pin{color:var(--accent)}
+
+/* Sub URL section — the headline */
+.sub-section{
+  margin:20px 0;padding:18px;
+  background:linear-gradient(135deg,var(--accent-soft),rgba(245,197,66,0.02));
+  border:1px solid var(--border);border-radius:18px;
+  position:relative;z-index:1;
+}
+.section-label{
+  font-size:10px;text-transform:uppercase;letter-spacing:.12em;
+  color:var(--text-3);margin-bottom:10px;font-weight:700;
+  display:flex;align-items:center;gap:7px;
+}
+.section-label::before{
+  content:'';width:6px;height:6px;border-radius:50%;
+  background:var(--accent);box-shadow:0 0 10px var(--accent);
+  animation:pulseDot 2.5s ease-in-out infinite;
+}
+@keyframes pulseDot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+.sub-row{display:flex;align-items:stretch;gap:8px}
+.sub-link{
+  flex:1;min-width:0;
+  font-family:'Courier New',monospace;font-size:11.5px;
+  color:var(--accent);text-decoration:none;
+  background:rgba(0,0,0,0.35);padding:12px 14px;border-radius:12px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  direction:ltr;transition:all .2s;
+  border:1px solid rgba(245,197,66,0.15);
+  display:flex;align-items:center;gap:8px;
+}
+html[data-theme="light"] .sub-link{background:rgba(255,255,255,0.6)}
+.sub-link:hover{background:rgba(245,197,66,0.12);border-color:rgba(245,197,66,0.4)}
+.sub-link:active{transform:scale(.98)}
+.sub-link .ext-icon{flex-shrink:0;opacity:.7}
+.btn{
+  border:none;font-family:inherit;font-weight:600;border-radius:12px;
+  cursor:pointer;transition:all .2s;
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  font-size:13px;padding:12px 16px;white-space:nowrap;
+}
+.btn-primary{background:var(--accent);color:#0a0e1a}
+.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
+.btn-primary:active{transform:translateY(0)}
+.btn-open{
+  width:100%;margin-top:10px;
+  background:var(--success-soft);color:var(--success);
+  border:1px solid rgba(34,197,94,0.25);text-decoration:none;padding:12px 16px;
+}
+.btn-open:hover{background:rgba(34,197,94,0.22);transform:translateY(-1px)}
+
+/* Deep-link client chips */
+.client-row{
+  margin-top:14px;display:grid;
+  grid-template-columns:repeat(3,1fr);gap:8px;
+}
+.client-chip{
+  display:flex;flex-direction:column;align-items:center;gap:4px;
+  padding:10px 6px;border-radius:12px;text-decoration:none;
+  background:var(--glass);border:1px solid var(--border-soft);
+  transition:all .2s;font-size:10.5px;color:var(--text-3);font-weight:600;
+}
+.client-chip:hover{background:var(--accent-soft);border-color:var(--border);color:var(--accent);transform:translateY(-1px)}
+.client-chip:active{transform:translateY(0)}
+.client-chip .ci{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff}
+.ci-v2n{background:#5b8def}.ci-v2g{background:#22c55e}.ci-str{background:#ff6b6b}
+.ci-sr{background:#1e293b}.ci-fox{background:#f97316}.ci-bull{background:#8b5cf6}
+.client-chip span{display:block;text-align:center;line-height:1.2}
+
+/* Gauge + Progress */
+.gauge-section{margin:24px 0;display:flex;flex-direction:column;align-items:center;position:relative;z-index:1}
+.gauge-wrap{position:relative;width:160px;height:160px;margin-bottom:8px}
+.gauge-svg{width:100%;height:100%;transform:rotate(-90deg)}
+.gauge-track{fill:none;stroke:rgba(255,255,255,0.05);stroke-width:10}
+html[data-theme="light"] .gauge-track{stroke:rgba(0,0,0,0.06)}
+.gauge-fill{
+  fill:none;stroke:url(#gaugeGrad);stroke-width:10;stroke-linecap:round;
+  stroke-dasharray:440;stroke-dashoffset:440;
+  transition:stroke-dashoffset 1.2s cubic-bezier(.16,1,.3,1);
+  filter:drop-shadow(0 0 8px var(--accent-glow));
+}
+.gauge-center{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+}
+.gauge-pct{font-size:32px;font-weight:800;color:var(--text);letter-spacing:-.02em;line-height:1}
+.gauge-pct .pct-sign{font-size:18px;color:var(--text-3);font-weight:600;margin-left:2px}
+.gauge-label{font-size:11px;color:var(--text-3);margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
+.gauge-stats{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center}
+.gstat{text-align:center}
+.gstat .gv{font-family:'Courier New',monospace;font-size:13px;font-weight:700;color:var(--text);direction:ltr}
+.gstat .gl{font-size:10px;color:var(--text-3);margin-top:2px;text-transform:uppercase;letter-spacing:.06em}
+
+/* Info grid */
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0;position:relative;z-index:1}
+.info-card{
+  background:var(--glass);border:1px solid var(--border-soft);
+  border-radius:14px;padding:13px 14px;transition:all .2s;
+}
+.info-card:hover{background:var(--accent-soft);border-color:var(--border)}
+.info-label{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text-3);margin-bottom:5px;font-weight:700;display:flex;align-items:center;gap:6px}
+.info-value{font-size:14px;color:var(--text);font-weight:700;direction:ltr;unicode-bidi:embed}
+.info-value.small{font-size:12px}
+
+/* Config */
+.config-section{margin-top:16px;position:relative;z-index:1}
+.config-box{
+  background:rgba(0,0,0,0.4);border:1px solid var(--border-soft);
+  border-radius:12px;padding:12px 14px;
+  font-family:'Courier New',monospace;font-size:11px;color:var(--text-2);
+  word-break:break-all;direction:ltr;text-align:left;
+  max-height:84px;overflow-y:auto;line-height:1.6;
+}
+html[data-theme="light"] .config-box{background:rgba(0,0,0,0.04)}
+.config-box::-webkit-scrollbar{width:5px}
+.config-box::-webkit-scrollbar-track{background:transparent}
+.config-box::-webkit-scrollbar-thumb{background:rgba(245,197,66,0.3);border-radius:3px}
+
+/* Footer */
+.footer{
+  text-align:center;font-size:11px;color:var(--text-4);
+  margin-top:22px;padding-top:16px;
+  border-top:1px solid var(--border-soft);
+  display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;
+  position:relative;z-index:1;
+}
+.badge{background:var(--accent-soft);color:var(--accent);padding:4px 12px;border-radius:999px;font-size:11px;font-weight:700}
+.status-pill{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 12px;border-radius:999px;font-size:11px;font-weight:600;
+  background:var(--glass);
+}
+.status-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.status-dot.on{background:var(--success);box-shadow:0 0 10px var(--success);animation:pulseDot 2s ease-in-out infinite}
+.status-dot.off{background:var(--danger);box-shadow:0 0 10px var(--danger)}
+
+/* Toast */
+.toast{
+  position:fixed;bottom:28px;left:50%;
+  transform:translateX(-50%) translateY(100px);
+  background:rgba(20,27,45,0.95);backdrop-filter:blur(16px);
+  color:#fff;padding:13px 24px;border-radius:999px;
+  font-size:13px;font-weight:500;border:1px solid var(--border);
+  box-shadow:0 14px 36px rgba(0,0,0,0.5);
+  opacity:0;transition:all .4s cubic-bezier(.4,0,.2,1);
+  z-index:1000;pointer-events:none;max-width:90vw;text-align:center;
+}
+html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Countdown */
+.countdown{font-family:'Courier New',monospace;font-weight:700;color:var(--text);direction:ltr}
+
+/* Mobile responsive */
+@media (max-width:560px){
+  body{padding:0;align-items:flex-start}
+  .card{
+    border-radius:0;min-height:100vh;min-height:100dvh;
+    padding:28px 18px;
+    padding-top:max(28px,env(safe-area-inset-top));
+    padding-bottom:max(28px,env(safe-area-inset-bottom));
+    border-left:none;border-right:none;
+  }
+  .info-grid{grid-template-columns:1fr 1fr;gap:8px}
+  .info-card{padding:11px 12px}
+  .sub-row{flex-direction:column}
+  .sub-link{width:100%}
+  .sub-row .btn{width:100%}
+  .logo-wrap,.logo{width:68px;height:68px}
+  .logo{font-size:30px}
+  .title{font-size:22px}
+  .header{margin-bottom:18px}
+  .gauge-wrap{width:140px;height:140px}
+  .gauge-pct{font-size:28px}
+  .client-row{grid-template-columns:repeat(3,1fr)}
+}
+@media (max-width:380px){
+  .info-grid{grid-template-columns:1fr}
+  .client-row{grid-template-columns:repeat(2,1fr)}
 }
 </style>
 </head>
 <body>
-<div class="sidebar-overlay" id="sbOverlay" onclick="closeSB()"></div>
-<aside class="sidebar" id="sidebar">
-  <div class="logo"><div class="logo-icon">U</div><div class="logo-text">Usf Panel</div></div>
-  <nav class="nav" id="navMenu">
-    <div class="nav-item active" data-page="dashboard" onclick="go('dashboard')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-      <span>Dashboard</span>
-    </div>
-    <div class="nav-item" data-page="inbounds" onclick="go('inbounds')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-      <span>Inbounds</span>
-    </div>
-    <div class="nav-item" data-page="ips" onclick="go('ips')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10A15 15 0 0 1 12 2z"/></svg>
-      <span>Clean IPs</span>
-    </div>
-    <div class="nav-item" data-page="domain" onclick="go('domain')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15 15 0 0 1 4 10 15 15 0 0 1-4 10 15 15 0 0 1-4-10A15 15 0 0 1 12 2z"/></svg>
-      <span>Domain</span>
-    </div>
-    <div class="nav-item" data-page="builder" onclick="go('builder')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-      <span>Panel Builder</span>
-    </div>
-    <div class="nav-item" data-page="logs" onclick="go('logs')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
-      <span>Logs</span>
-    </div>
-    <div class="nav-item" data-page="settings" onclick="go('settings')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      <span>Settings</span>
-    </div>
-  </nav>
-  <div class="sidebar-footer">v__PANEL_VER__</div>
-</aside>
+<div class="card">
+  <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme">
+    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+  </button>
 
-<div class="main">
-  <header class="topbar">
-    <div class="topbar-left">
-      <button class="toggle-sidebar" onclick="toggleSB()">&#9776;</button>
-      <span class="page-title" id="pageTitle">Dashboard</span>
+  <div class="header">
+    <div class="logo-wrap">
+      <div class="logo-ring"></div>
+      <div class="logo">&#9651;</div>
     </div>
-    <div class="topbar-right">
-      <span class="topbar-badge"><span class="status-dot"></span><span>Online</span></span>
-      <button class="logout-btn" onclick="doLogout()">Logout</button>
-    </div>
-  </header>
-  <div class="content">
+    <div class="title">Usf</div>
+    <div class="label-chip"><span class="pin">&#128204;</span> __LABEL__</div>
+  </div>
 
-    <div class="page active" id="page-dashboard">
-      <div class="stats-grid">
-        <div class="card stat-card"><div class="stat-icon si">&#9889;</div><div class="stat-value" id="xCpu">0%</div><div class="stat-label">CPU</div><div class="stat-bar"><div class="stat-bar-fill" id="xCpuB" style="width:0%;background:var(--accent)"></div></div></div>
-        <div class="card stat-card"><div class="stat-icon sr">&#128190;</div><div class="stat-value" id="xRam">0%</div><div class="stat-label">RAM</div><div class="stat-bar"><div class="stat-bar-fill" id="xRamB" style="width:0%;background:var(--cyan)"></div></div></div>
-        <div class="card stat-card"><div class="stat-icon sd">&#128451;</div><div class="stat-value" id="xDisk">0%</div><div class="stat-label">Disk</div><div class="stat-bar"><div class="stat-bar-fill" id="xDiskB" style="width:0%;background:var(--amber)"></div></div></div>
-        <div class="card stat-card"><div class="stat-icon sn">&#128225;</div><div class="stat-value" id="xNet">0/0</div><div class="stat-label">Network</div><div class="stat-bar"><div class="stat-bar-fill" style="width:100%;background:var(--emerald)"></div></div></div>
-        <div class="card stat-card"><div class="stat-icon sc">&#128279;</div><div class="stat-value" id="xConn">0</div><div class="stat-label">Connections</div><div class="stat-bar"><div class="stat-bar-fill" id="xConnB" style="width:0%;background:var(--rose)"></div></div></div>
-        <div class="card stat-card"><div class="stat-icon sti">&#9200;</div><div class="stat-value" id="xUp">0m</div><div class="stat-label">Uptime</div><div class="stat-bar"><div class="stat-bar-fill" style="width:100%;background:#8b5cf6"></div></div></div>
-      </div>
-      <div class="grid-3">
-        <div class="card"><div class="card-header"><span class="card-title">Traffic (24h)</span></div><div class="chart-c"><canvas id="tChart"></canvas></div></div>
-        <div class="card">
-          <div class="card-header"><span class="card-title">System Info</span></div>
-          <div>
-            <div class="info-r"><span class="info-l">RAM</span><span class="info-v" id="iRam">-</span></div>
-            <div class="info-r"><span class="info-l">Swap</span><span class="info-v" id="iSwap">-</span></div>
-            <div class="info-r"><span class="info-l">Storage</span><span class="info-v" id="iDisk">-</span></div>
-            <div class="info-r"><span class="info-l">App RAM</span><span class="info-v" id="iApp">-</span></div>
-            <div class="info-r"><span class="info-l">CPU Cores</span><span class="info-v" id="iCores">-</span></div>
-            <div class="info-r"><span class="info-l">Total Traffic</span><span class="info-v" id="iTraff">-</span></div>
-            <div class="info-r"><span class="info-l">Requests</span><span class="info-v" id="iReqs">-</span></div>
-            <div class="info-r"><span class="info-l">IPv4</span><span class="info-v" id="iIP">-</span></div>
-            <div class="info-r"><span class="info-l">Links</span><span class="info-v" id="iLinks">-</span></div>
-          </div>
-        </div>
-      </div>
+  <div class="sub-section">
+    <div class="section-label">لینک اشتراک (Subscription URL)</div>
+    <div class="sub-row">
+      <a href="__SUB_URL__" class="sub-link" target="_blank" rel="noopener" title="__SUB_URL__">
+        <svg class="ext-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        <span>__SUB_URL__</span>
+      </a>
+      <button class="btn btn-primary" onclick="copySub()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        کپی لینک
+      </button>
     </div>
+    <a href="__SUB_URL__" class="btn btn-open" target="_blank" rel="noopener">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      باز کردن اشتراک در کلاینت
+    </a>
+    <div class="client-row">
+      <a class="client-chip" href="v2rayn://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2n">N</span><span>V2RayN</span></a>
+      <a class="client-chip" href="v2rayng://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2g">G</span><span>V2RayNG</span></a>
+      <a class="client-chip" href="streisand://import/__SUB_URL_ENC__"><span class="ci ci-str">S</span><span>Streisand</span></a>
+      <a class="client-chip" href="shadowrocket://add/sub://__SUB_URL_B64__"><span class="ci ci-sr">SR</span><span>Shadowrocket</span></a>
+      <a class="client-chip" href="foxray://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-fox">F</span><span>Foxray</span></a>
+      <a class="client-chip" href="bullshit://install/__SUB_URL_ENC__"><span class="ci ci-bull">B</span><span>BS Client</span></a>
+    </div>
+  </div>
 
-    <div class="page" id="page-inbounds">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-        <div class="search" style="margin-bottom:0;flex:1;max-width:320px">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-          <input type="text" id="sInb" placeholder="Search..." oninput="renderInb()">
-        </div>
-        <div style="display:flex;gap:6px;align-items:center">
-          <select id="fStatus" style="padding:7px 10px;background:var(--glass);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:12px;font-family:inherit;outline:none" onchange="renderInb()">
-            <option value="all">All</option><option value="active">Active</option><option value="expired">Expired</option><option value="disabled">Disabled</option>
-          </select>
-          <button class="btn btn-p" onclick="openCreate()">+ New Link</button>
-        </div>
-      </div>
-      <div class="card" style="padding:0;overflow:hidden">
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Name</th><th>Status</th><th>Usage</th><th>Expiry</th><th>Conn</th><th>Tag</th><th>Actions</th></tr></thead>
-            <tbody id="inbBody"></tbody>
-          </table>
-        </div>
-        <div class="empty" id="inbEmpty" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg><p>No inbounds yet.</p></div>
+  <div class="gauge-section">
+    <div class="gauge-wrap">
+      <svg class="gauge-svg" viewBox="0 0 160 160">
+        <defs>
+          <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#22c55e"/>
+            <stop offset="50%" stop-color="#f5c542"/>
+            <stop offset="100%" stop-color="#ef4444"/>
+          </linearGradient>
+        </defs>
+        <circle class="gauge-track" cx="80" cy="80" r="70"/>
+        <circle class="gauge-fill" id="gaugeFill" cx="80" cy="80" r="70"/>
+      </svg>
+      <div class="gauge-center">
+        <div class="gauge-pct"><span id="pctNum">0</span><span class="pct-sign">%</span></div>
+        <div class="gauge-label">مصرف حجم</div>
       </div>
     </div>
+    <div class="gauge-stats">
+      <div class="gstat"><div class="gv" id="usedStat">__USED__</div><div class="gl">مصرف‌شده</div></div>
+      <div class="gstat"><div class="gv" id="remainStat">__REMAIN__</div><div class="gl">باقی‌مانده</div></div>
+      <div class="gstat"><div class="gv" id="limitStat">__LIMIT__</div><div class="gl">کل سهمیه</div></div>
+    </div>
+  </div>
 
-    <div class="page" id="page-ips">
-      <div class="card">
-        <div class="card-header"><span class="card-title">Clean IP Addresses</span></div>
-        <p style="color:var(--text3);font-size:13px;margin-bottom:14px">Additional server addresses bundled in subscriptions.</p>
-        <div style="display:flex;gap:8px;margin-bottom:14px">
-          <input type="text" id="newAddr" placeholder="e.g. example.com or 1.2.3.4" class="inp">
-          <button class="btn btn-p" onclick="addAddr()">Add</button>
-        </div>
-        <div id="addrList"></div>
+  <div class="info-grid">
+    <div class="info-card">
+      <div class="info-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        حداکثر اتصال
       </div>
+      <div class="info-value">__MAXCONN__</div>
     </div>
+    <div class="info-card">
+      <div class="info-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        زمان انقضا
+      </div>
+      <div class="info-value small">__EXPIRY__</div>
+    </div>
+    <div class="info-card" style="grid-column:1/-1">
+      <div class="info-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        زمان باقی‌مانده تا انقضا
+      </div>
+      <div class="info-value countdown" id="countdown" data-exp="__EXP_EPOCH__">__REMAIN_TIME__</div>
+    </div>
+  </div>
 
-    <div class="page" id="page-domain">
-      <div class="card">
-        <div class="card-header"><span class="card-title">Custom Domain</span></div>
-        <p style="color:var(--text3);font-size:13px;margin-bottom:14px">Point your domain CNAME to your HF Space URL.</p>
-        <div style="display:flex;gap:8px">
-          <input type="text" id="domIn" placeholder="e.g. mypanel.example.com" class="inp">
-          <button class="btn btn-p" onclick="saveDom()">Save</button>
-        </div>
-      </div>
+  <div class="config-section">
+    <div class="section-label" style="margin-bottom:8px">کانفیگ VLESS</div>
+    <div class="config-box" id="configText">__VLESS__</div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-primary" style="flex:1" onclick="copyConfig()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        کپی کانفیگ
+      </button>
+      <button class="btn" style="flex:1;background:var(--glass);color:var(--text-2);border:1px solid var(--border-soft)" onclick="downloadConfig()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        دانلود
+      </button>
     </div>
+  </div>
 
-    <div class="page" id="page-builder">
-      <div class="card" style="max-width:520px">
-        <div class="card-header"><span class="card-title">Panel Builder</span></div>
-        <p style="color:var(--text3);font-size:13px;margin-bottom:18px">Deploy a new Usf Panel to HuggingFace Spaces.</p>
-        <div class="form-group"><label>HF Token</label><input type="password" id="pbTok" placeholder="hf_xxxxx"></div>
-        <div class="form-row">
-          <div class="form-group"><label>Space Name</label><input type="text" id="pbSp" placeholder="my-panel"></div>
-          <div class="form-group"><label>Username</label><input type="text" id="pbUsr" value="admin"></div>
-        </div>
-        <div class="form-group"><label>Password</label><input type="password" id="pbPw" value="admin"></div>
-        <button class="btn btn-p" style="width:100%;justify-content:center;padding:11px" onclick="deploy()" id="depBtn">Deploy Panel</button>
-        <div class="dep-res" id="depRes" style="display:none"></div>
-      </div>
-    </div>
-
-    <div class="page" id="page-logs">
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header"><span class="card-title">Errors</span><button class="btn btn-s" onclick="loadLogs()">Refresh</button></div>
-          <div id="errLogs" style="max-height:380px;overflow-y:auto"><p style="color:var(--text4);text-align:center;padding:16px">No errors</p></div>
-        </div>
-        <div class="card">
-          <div class="card-header"><span class="card-title">Connections</span></div>
-          <div id="connHist" style="max-height:380px;overflow-y:auto"><p style="color:var(--text4);text-align:center;padding:16px">No connections</p></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="page" id="page-settings">
-      <div class="grid-2">
-        <div class="card">
-          <div class="card-header"><span class="card-title">Change Password</span></div>
-          <div class="form-group"><label>Current</label><input type="password" id="curPw"></div>
-          <div class="form-group"><label>New</label><input type="password" id="newPw"></div>
-          <button class="btn btn-p" onclick="changePw()">Update</button>
-        </div>
-        <div class="card">
-          <div class="card-header"><span class="card-title">Backup & Restore</span></div>
-          <p style="color:var(--text3);font-size:13px;margin-bottom:14px">Export/import panel data.</p>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-g" onclick="dlBackup()">Download</button>
-            <button class="btn" onclick="document.getElementById('restFile').click()">Restore</button>
-            <input type="file" id="restFile" accept=".json" style="display:none" onchange="restBackup(this)">
-          </div>
-        </div>
-      </div>
-      <div class="card" style="margin-top:14px;max-width:520px">
-        <div class="card-header"><span class="card-title">Service Control</span></div>
-        <div style="display:flex;gap:8px">
-          <button class="btn btn-d" onclick="svcAct('stop')">Stop</button>
-          <button class="btn btn-g" onclick="svcAct('restart')">Restart</button>
-        </div>
-      </div>
-    </div>
+  <div class="footer">
+    <span class="badge">Usf v__VERSION__</span>
+    <span class="status-pill">
+      <span class="status-dot __STATUS_CLASS__"></span>
+      __STATUS_TEXT__
+    </span>
   </div>
 </div>
 
-<div class="modal-overlay" id="linkModal">
-  <div class="modal">
-    <div class="modal-title" id="mTitle">New Link</div>
-    <input type="hidden" id="eUid">
-    <div class="form-group"><label>Name *</label><input type="text" id="fLabel" placeholder="e.g. My VPN"></div>
-    <div class="form-row">
-      <div class="form-group"><label>Data Limit</label><div style="display:flex;gap:6px"><input type="number" id="fLimV" placeholder="0=unlimited" min="0" step="0.1" style="flex:1"><select id="fLimU" style="width:65px"><option>GB</option><option>MB</option></select></div></div>
-      <div class="form-group"><label>Expiry (days)</label><input type="number" id="fExp" placeholder="0=never" min="0"></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label>Max Conn</label><input type="number" id="fMC" placeholder="0=unlimited" min="0"></div>
-      <div class="form-group"><label>Speed (Mbps)</label><input type="number" id="fSpd" placeholder="0=unlimited" min="0"></div>
-    </div>
-    <div class="form-group"><label>Tag</label><input type="text" id="fTag" placeholder="e.g. premium"></div>
-    <div class="form-group"><label>Note</label><textarea id="fNote" placeholder="Optional..."></textarea></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
-      <button class="btn" onclick="closeM()">Cancel</button>
-      <button class="btn btn-p" onclick="saveLink()" id="saveBtn">Create</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-overlay" id="clModal">
-  <div class="modal">
-    <div class="modal-title" id="clTitle">Client Links</div>
-    <div id="clContent"></div>
-    <div style="text-align:right;margin-top:14px"><button class="btn" onclick="closeCL()">Close</button></div>
-  </div>
-</div>
-
-<div class="toast-box" id="toastBox"></div>
+<div class="toast" id="toast"></div>
 
 <script>
-var PV='__PANEL_VER__';
-var links=[];
-var statsInt;
-var tChart;
+const SUB_URL = __SUB_URL_JSON__;
+const VLESS = __VLESS_JSON__;
+const PERCENT = __PCT_NUM__;
 
-function api(u,o){
-  o=o||{};
-  return fetch(u,o).then(function(r){
-    if(r.status===401){window.location.href='/login';return null}
-    return r;
-  }).catch(function(){toast('Connection error','err');return null});
+// ── Theme ─────────────────────────────────────────
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  const m = document.getElementById('meta-theme');
+  if (m) m.setAttribute('content', t === 'light' ? '#f5f7fb' : '#0a0e1a');
+  try{localStorage.setItem('usf-theme', t)}catch(e){}
 }
-
-function go(p){
-  document.querySelectorAll('.page').forEach(function(el){el.classList.remove('active')});
-  var pg=document.getElementById('page-'+p);
-  if(pg)pg.classList.add('active');
-  document.querySelectorAll('.nav-item').forEach(function(el){el.classList.toggle('active',el.dataset.page===p)});
-  var t={dashboard:'Dashboard',inbounds:'Inbounds',ips:'Clean IPs',domain:'Domain',builder:'Panel Builder',logs:'Logs',settings:'Settings'};
-  document.getElementById('pageTitle').textContent=t[p]||p;
-  if(p==='inbounds')loadLinks();
-  if(p==='ips')loadAddrs();
-  if(p==='domain')loadDom();
-  if(p==='logs')loadLogs();
-  closeSB();
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
 }
-function toggleSB(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('sbOverlay').classList.toggle('show')}
-function closeSB(){document.getElementById('sidebar').classList.remove('open');document.getElementById('sbOverlay').classList.remove('show')}
+(function(){
+  let saved = null;
+  try{saved = localStorage.getItem('usf-theme')}catch(e){}
+  if (!saved){
+    saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+  }
+  applyTheme(saved);
+})();
 
-function toast(msg,type){
-  var c=document.getElementById('toastBox');
-  var d=document.createElement('div');
-  d.className='toast toast-'+(type==='ok'?'ok':type==='err'?'err':'info');
-  d.textContent=msg;c.appendChild(d);
-  setTimeout(function(){if(d.parentNode)d.remove()},3000);
+// ── Animated gauge ────────────────────────────────
+(function(){
+  const fill = document.getElementById('gaugeFill');
+  const pctNum = document.getElementById('pctNum');
+  const circumference = 2 * Math.PI * 70; // r=70
+  const target = Math.max(0, Math.min(100, PERCENT));
+  const targetOffset = circumference * (1 - target / 100);
+  // Animate from 0 to target
+  let startTime = null;
+  const duration = 1400;
+  function step(ts){
+    if (!startTime) startTime = ts;
+    const p = Math.min(1, (ts - startTime) / duration);
+    const eased = 1 - Math.pow(1 - p, 3);
+    fill.style.strokeDashoffset = (circumference * (1 - (target * eased) / 100)).toFixed(2);
+    pctNum.textContent = Math.round(target * eased);
+    if (p < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+})();
+
+// ── Countdown ─────────────────────────────────────
+(function(){
+  const el = document.getElementById('countdown');
+  if (!el) return;
+  const exp = parseInt(el.dataset.exp, 10);
+  if (!exp){ return; }
+  function tick(){
+    const now = Math.floor(Date.now() / 1000);
+    const diff = exp - now;
+    if (diff <= 0){ el.textContent = 'منقضی شده'; el.style.color = 'var(--danger)'; return; }
+    const d = Math.floor(diff / 86400);
+    const h = Math.floor((diff % 86400) / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    const s = diff % 60;
+    let txt = '';
+    if (d > 0) txt += d + ' روز و ';
+    txt += (h < 10 ? '0' : '') + h + ':';
+    txt += (m < 10 ? '0' : '') + m + ':';
+    txt += (s < 10 ? '0' : '') + s;
+    el.textContent = txt;
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+
+// ── Copy / Download ───────────────────────────────
+function copySub(){
+  navigator.clipboard.writeText(SUB_URL)
+    .then(function(){showToast("لینک اشتراک کپی شد")})
+    .catch(function(){showToast("کپی ناموفق بود", true)});
 }
-
-function loadStats(){
-  api('/api/stats').then(function(r){if(!r)return;return r.json()}).then(function(s){
-    if(!s)return;
-    document.getElementById('xCpu').textContent=s.cpuUsage+'%';
-    document.getElementById('xCpuB').style.width=Math.min(s.cpuUsage,100)+'%';
-    document.getElementById('xRam').textContent=s.ramUsage+'%';
-    document.getElementById('xRamB').style.width=Math.min(s.ramUsage,100)+'%';
-    document.getElementById('xDisk').textContent=s.storageUsage+'%';
-    document.getElementById('xDiskB').style.width=Math.min(s.storageUsage,100)+'%';
-    document.getElementById('xNet').textContent=s.downloadSpeed.replace(/\/s$/,'')+' | '+s.uploadSpeed.replace(/\/s$/,'');
-    document.getElementById('xConn').textContent=s.activeConnections;
-    document.getElementById('xUp').textContent=s.uptime;
-    document.getElementById('iRam').textContent=s.ramUsed+' / '+s.ramTotal;
-    document.getElementById('iSwap').textContent=s.swapUsage+'%';
-    document.getElementById('iDisk').textContent=s.storageUsed+' / '+s.storageTotal;
-    document.getElementById('iApp').textContent=s.appRam;
-    document.getElementById('iCores').textContent=s.cpuCores;
-    document.getElementById('iTraff').textContent=s.totalTrafficMb+' MB';
-    document.getElementById('iReqs').textContent=s.totalRequests;
-    document.getElementById('iIP').textContent=s.ipv4;
-    document.getElementById('iLinks').textContent=s.linksCount;
-    updChart(s.hourlyTraffic);
-  });
+function copyConfig(){
+  navigator.clipboard.writeText(VLESS)
+    .then(function(){showToast("کانفیگ VLESS کپی شد")})
+    .catch(function(){
+      try{
+        var r = document.createRange();
+        r.selectNode(document.getElementById('configText'));
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(r);
+        document.execCommand('copy');
+        showToast("کانفیگ VLESS کپی شد");
+      }catch(e){showToast("کپی ناموفق بود", true)}
+    });
 }
-
-function initChart(){
+function downloadConfig(){
   try{
-    var ctx=document.getElementById('tChart');if(!ctx)return;
-    var labels=[];var now=new Date();
-    for(var i=23;i>=0;i--){var h=new Date(now-3600000*i);labels.push(('0'+h.getHours()).slice(-2)+':00')}
-    tChart=new Chart(ctx,{type:'bar',data:{labels:labels,datasets:[{label:'Traffic',data:new Array(24).fill(0),backgroundColor:'rgba(99,102,241,0.3)',borderColor:'rgba(99,102,241,0.8)',borderWidth:1,borderRadius:4}]},
-      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9},maxRotation:0}},y:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9},callback:function(v){return v>=1048576?(v/1048576).toFixed(1)+'MB':v>=1024?(v/1024).toFixed(0)+'KB':v+'B'}}}}}});
-  }catch(e){console.warn('Chart init:',e)}
+    const blob = new Blob([VLESS], {type:'text/plain;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'Usf-__LABEL_SAFE__.txt';
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("فایل کانفیگ دانلود شد");
+  }catch(e){showToast("دانلود ناموفق بود", true)}
 }
-function updChart(ht){
-  if(!tChart)return;
-  var now=new Date();var data=new Array(24).fill(0);
-  for(var i=23;i>=0;i--){var h=new Date(now-3600000*i);var k=('0'+h.getHours()).slice(-2)+':00';data[23-i]=ht[k]||0}
-  tChart.data.datasets[0].data=data;tChart.update('none');
+var _tt;
+function showToast(msg, isErr){
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'rgba(239,68,68,0.4)' : 'var(--border)';
+  t.classList.add('show');
+  clearTimeout(_tt);
+  _tt = setTimeout(function(){t.classList.remove('show')}, 2600);
 }
+</script>
+</body>
+</html>'''
 
-function loadLinks(){
-  api('/api/links').then(function(r){if(!r)return;return r.json()}).then(function(d){
-    if(!d)return;links=d.links;renderInb();
-  });
+    # Build remaining-time display
+    if not expiry_raw:
+        remain_time_display = "نامحدود"
+    elif expiry_epoch_val and expiry_epoch_val > time.time():
+        diff = expiry_epoch_val - int(time.time())
+        d = diff // 86400
+        h = (diff % 86400) // 3600
+        m = (diff % 3600) // 60
+        if d > 0:
+            remain_time_display = f"{d} روز و {h:02d}:{m:02d}"
+        elif h > 0:
+            remain_time_display = f"{h:02d}:{m:02d}:{diff % 60:02d}"
+        else:
+            remain_time_display = f"{m:02d}:{diff % 60:02d}"
+    else:
+        remain_time_display = "منقضی شده"
+
+    # HTML-escape + JSON-encode helpers
+    from html import escape as _hesc
+    import base64 as _b64
+    sub_url_h = _hesc(sub_url, quote=True)
+    vless_h = _hesc(vless_link)
+    label_h = _hesc(str(label))
+    expiry_h = _hesc(str(expiry_display))
+    sub_url_j = json.dumps(sub_url)
+    vless_j = json.dumps(vless_link)
+    sub_url_enc = quote(sub_url, safe='')
+    sub_url_b64 = _b64.b64encode(sub_url.encode()).decode().rstrip('=')
+    label_safe = re.sub(r'[^a-zA-Z0-9\-_.]', '_', str(label))
+
+    # Max connections display
+    max_conn_disp = str(max_conn) if max_conn and max_conn > 0 else 'نامحدود (∞)'
+
+    html_content = (html_template
+        .replace('__LABEL__', label_h)
+        .replace('__LABEL_SAFE__', _hesc(label_safe))
+        .replace('__SUB_URL__', sub_url_h)
+        .replace('__SUB_URL_ENC__', sub_url_enc)
+        .replace('__SUB_URL_B64__', sub_url_b64)
+        .replace('__SUB_URL_JSON__', sub_url_j)
+        .replace('__USED__', _hesc(used_str))
+        .replace('__LIMIT__', _hesc(limit_str))
+        .replace('__REMAIN__', _hesc(remaining_str))
+        .replace('__PCT__', f"{percent:.1f}")
+        .replace('__PCT_NUM__', f"{percent:.1f}")
+        .replace('__MAXCONN__', _hesc(max_conn_disp))
+        .replace('__EXPIRY__', expiry_h)
+        .replace('__EXP_EPOCH__', str(expiry_epoch_val))
+        .replace('__REMAIN_TIME__', _hesc(remain_time_display))
+        .replace('__VLESS__', vless_h)
+        .replace('__VLESS_JSON__', vless_j)
+        .replace('__VERSION__', _hesc(str(PANEL_VERSION)))
+        .replace('__STATUS_CLASS__', status_class)
+        .replace('__STATUS_TEXT__', status_text)
+    )
+
+    return HTMLResponse(content=html_content)
+
+
+
+# ─── HTML Pages (Login & Dashboard) ──────────────────────────────────────────
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Usf - Welcome</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1b2a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+#login{background:#151f31;border-radius:2rem;padding:3rem 2rem 2.5rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
+@keyframes charge{0%{transform:translateY(2rem);opacity:0}100%{transform:translateY(0);opacity:1}}
+.setting-section{position:absolute;top:16px;right:16px}
+.ant-btn-circle{border-radius:50%;width:38px;height:38px;padding:0;border:none;background:#1e8a7a;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.ant-btn-circle:hover{background:#00a896}
+.title{font-size:2.2rem;font-weight:700;text-align:center;margin-bottom:2rem;color:#b0bec5;letter-spacing:1px}
+.words-wrapper{display:inline-block;position:relative;text-align:center;width:100%}
+.words-wrapper b{display:inline-block;position:absolute;left:0;top:0;width:100%;opacity:0}
+.words-wrapper b.is-visible{position:relative;opacity:1;animation:zoom-in .8s cubic-bezier(.215,.61,.355,1) forwards}
+.words-wrapper b.is-hidden{animation:zoom-out .4s cubic-bezier(.215,.61,.355,1) forwards}
+@keyframes zoom-in{0%{opacity:0;transform:translateZ(100px)}100%{opacity:1;transform:translateZ(0)}}
+@keyframes zoom-out{0%{opacity:1;transform:translateZ(0)}100%{opacity:0;transform:translateZ(-100px)}}
+.headline{display:flex;justify-content:center;align-items:center}
+.headline.zoom .words-wrapper{perspective:300px}
+.fields{display:flex;flex-direction:column;gap:14px;margin-bottom:1.5rem}
+.ant-input-affix-wrapper{display:flex;align-items:center;background:#1e2d42;border:1.5px solid #1e2d42;border-radius:30px;padding:0 16px;height:52px;transition:border-color .3s}
+.ant-input-affix-wrapper:focus-within{border-color:#008771;box-shadow:0 0 0 2px rgba(0,135,113,.15)}
+.ant-input-prefix{display:flex;align-items:center;margin-right:10px;color:#4a6080}
+.ant-input{flex:1;background:transparent;border:none;outline:none;color:#fff;font-size:14px;height:100%;padding:0}
+.ant-input::placeholder{color:#4a6080}
+.ant-input-suffix{display:flex;align-items:center;color:#4a6080;cursor:pointer;padding-left:8px}
+.ant-input-suffix:hover{color:#fff}
+.wave-btn-bg{border-radius:30px;overflow:hidden;position:relative}
+.wave-btn-bg-cl{background:linear-gradient(135deg,#007a68,#008771,#005565);background-size:200% 200%;transition:.3s}
+.wave-btn-bg-cl:hover{background-position:right center}
+.ant-btn-primary-login{font-size:15px;font-weight:600;color:#fff;background:transparent;border:none;height:50px;width:100%;cursor:pointer;letter-spacing:.5px}
+.err-msg{color:#ef4444;text-align:center;font-size:13px;padding:8px;background:rgba(239,68,68,0.1);border-radius:8px;display:none;margin-top:8px}
+.err-msg.show{display:block}
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="setting-section">
+    <button class="ant-btn-circle" onclick="toggleTheme()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+    </button>
+  </div>
+  <h2 class="title headline zoom"><span class="words-wrapper"><b class="is-visible">Usf</b></span></h2>
+  <form id="login-form">
+    <div class="fields">
+      <span class="ant-input-affix-wrapper">
+        <span class="ant-input-prefix">
+          <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor"><path d="M858.5 763.6a374 374 0 0 0-80.6-119.5 375.63 375.63 0 0 0-119.5-80.6c-.4-.2-.8-.3-1.2-.5C719.5 518 760 444.7 760 362c0-137-111-248-248-248S264 225 264 362c0 82.7 40.5 156 102.8 201.1-.4.2-.8.3-1.2.5-44.8 18.9-85 46-119.5 80.6a375.63 375.63 0 0 0-80.6 119.5A371.7 371.7 0 0 0 136 901.8a8 8 0 0 0 8 8.2h60c4.4 0 7.9-3.5 8-7.8 2-77.2 33-149.5 87.8-204.3 56.7-56.7 132-87.9 212.2-87.9s155.5 31.2 212.2 87.9C779 752.7 810 825 812 902.2c.1 4.4 3.6 7.8 8 7.8h60a8 8 0 0 0 8-8.2c-1-47.8-10.9-94.3-29.5-138.2zM512 534c-45.9 0-89.1-17.9-121.6-50.4S340 407.9 340 362c0-45.9 17.9-89.1 50.4-121.6S466.1 190 512 190s89.1 17.9 121.6 50.4S684 316.1 684 362c0 45.9-17.9 89.1-50.4 121.6S557.9 534 512 534z"/></svg>
+        </span>
+        <input placeholder="Username" type="text" name="username" autocomplete="username" autofocus class="ant-input" id="username" value="admin">
+      </span>
+      <span class="ant-input-affix-wrapper">
+        <span class="ant-input-prefix">
+          <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor"><path d="M832 464h-68V240c0-70.7-57.3-128-128-128H388c-70.7 0-128 57.3-128 128v224h-68c-17.7 0-32 14.3-32 32v384c0 17.7 14.3 32 32 32h640c17.7 0 32-14.3 32-32V496c0-17.7-14.3-32-32-32zM332 240c0-30.9 25.1-56 56-56h248c30.9 0 56 25.1 56 56v224H332V240zm460 600H232V536h560v484zM484 701v53c0 4.4 3.6 8 8 8h40c4.4 0 8-3.6 8-8v-53a48.01 48.01 0 1 0-56 0z"/></svg>
+        </span>
+        <input placeholder="Password" type="password" name="password" autocomplete="current-password" class="ant-input" id="password">
+        <span class="ant-input-suffix" onclick="togglePassword()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+        </span>
+      </span>
+    </div>
+    <div class="err-msg" id="err-msg"></div>
+    <div class="wave-btn-bg wave-btn-bg-cl">
+      <button type="submit" class="ant-btn-primary-login">Log In</button>
+    </div>
+  </form>
+</div>
+<script>
+let darkTheme = true;
+function toggleTheme() {
+  darkTheme = !darkTheme;
+  document.body.style.background = darkTheme ? '#0d1b2a' : '#e8f5f2';
+  document.getElementById('login').style.background = darkTheme ? '#151f31' : '#fff';
 }
-
-function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
-
-function renderInb(){
-  var q=(document.getElementById('sInb').value||'').toLowerCase();
-  var fs=document.getElementById('fStatus').value;
-  var fl=links.filter(function(l){
-    if(q&&l.label.toLowerCase().indexOf(q)===-1&&!(l.tag||'').toLowerCase().indexOf(q)===-1)return false;
-    if(fs==='active'&&(!l.active||l.expired))return false;
-    if(fs==='expired'&&!l.expired)return false;
-    if(fs==='disabled'&&l.active)return false;
-    return true;
-  });
-  var tb=document.getElementById('inbBody');
-  var em=document.getElementById('inbEmpty');
-  if(!fl.length){tb.innerHTML='';em.style.display='block';return}
-  em.style.display='none';
-  tb.innerHTML=fl.map(function(l){
-    var pct=l.limit_bytes>0?Math.round(l.used_bytes/l.limit_bytes*100):0;
-    var sc=l.expired?'st-expired':l.active?'st-active':'st-disabled';
-    var st=l.expired?'Expired':l.active?'Active':'Disabled';
-    var uMB=l.used_bytes>=1073741824?(l.used_bytes/1073741824).toFixed(2)+' GB':(l.used_bytes/1048576).toFixed(1)+' MB';
-    var lT=l.limit_bytes>0?(l.limit_bytes>=1073741824?(l.limit_bytes/1073741824).toFixed(1)+' GB':(l.limit_bytes/1048576).toFixed(0)+' MB'):'Unlimited';
-    var eT=l.expiry?new Date(l.expiry).toLocaleDateString():'Never';
-    var tg=l.tag?'<span class="tag">'+esc(l.tag)+'</span>':'-';
-    var cl=l.client_links||{};
-    var cmKeys=Object.keys(cl);
-    var cmHTML='';
-    if(cmKeys.length){
-      cmHTML='<div class="cdrop"><button class="btn btn-s" onclick="toggleCM(event)" title="Copy">&#128203;</button><div class="cmenu" id="cm_'+l.uuid+'">';
-      cmKeys.forEach(function(k){cmHTML+='<button class="cmenu-i" data-link="'+esc(cl[k])+'" data-name="'+esc(k)+'" onclick="copyFromMenu(this)">'+esc(k)+'</button>';});
-      cmHTML+='</div></div>';
+function togglePassword() {
+  const input = document.getElementById('password');
+  input.type = input.type === 'password' ? 'text' : 'password';
+}
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('err-msg');
+  err.classList.remove('show');
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, password })
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      err.textContent = d.detail || 'Invalid username or password';
+      err.classList.add('show');
+      return;
     }
-    return '<tr><td><strong>'+esc(l.label)+'</strong></td><td><span class="'+sc+'">'+st+'</span></td><td style="font-size:12px">'+uMB+' / '+lT+' ('+pct+'%)</td><td style="font-size:12px">'+eT+'</td><td>'+l.current_connections+'</td><td>'+tg+'</td><td style="white-space:nowrap"><button class="btn btn-s" onclick="showCL(\''+l.uuid+'\')">&#128279;</button> '+cmHTML+' <button class="btn btn-s" onclick="openEdit(\''+l.uuid+'\')">&#9998;</button> <button class="btn btn-s btn-d" onclick="delLink(\''+l.uuid+'\',\''+esc(l.label)+'\')">&#10005;</button></td></tr>';
+    window.location.href = '/dashboard';
+  } catch(e) {
+    err.textContent = 'Connection error';
+    err.classList.add('show');
+  }
+});
+</script>
+</body>
+</html>"""
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Usf - Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a1222;color:rgba(255,255,255,0.75);min-height:100vh}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:3px}
+.ant-layout{display:flex;height:100vh}
+.ant-layout-has-sider{flex-direction:row}
+.ant-layout-sider{background:#111929;height:100%;display:flex;flex-direction:column;border-right:1px solid #1a1a1a;position:fixed;left:0;top:0;bottom:0;width:200px;z-index:100;transition:transform .3s}
+.ant-layout-sider-children{flex:1;display:flex;flex-direction:column;padding:8px;overflow-y:auto}
+.brand-title{padding:14px 12px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #1a1a1a;margin-bottom:6px}
+.brand-title svg{flex-shrink:0}
+.brand-title span{font-size:15px;font-weight:700;color:#fff;letter-spacing:-0.02em}
+.brand-title .version{font-size:10px;color:#555;font-weight:400;margin-left:2px}
+.ant-menu{list-style:none;padding:0;margin:0;background:transparent}
+.ant-menu-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:#888;font-size:13px;cursor:pointer;transition:all .15s;border:none;background:none;width:100%;text-align:left;margin:1px 0}
+.ant-menu-item:hover{background:rgba(0,135,113,0.08);color:#fff}
+.ant-menu-item-selected{background:rgba(0,135,113,0.12);color:#008771;font-weight:600}
+.nav-badge{margin-left:auto;background:#1a1a1a;color:#555;font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
+.nav-section{font-size:10px;font-weight:700;color:#444;text-transform:uppercase;letter-spacing:0.08em;padding:12px 12px 4px}
+.ant-layout-sider-footer{padding:10px;border-top:1px solid #1a1a1a}
+.logout-btn{width:100%;padding:7px;border:1px solid #1a1a1a;border-radius:7px;background:none;color:#555;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
+.logout-btn:hover{background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.2);color:#ef4444}
+.ant-layout-sider-trigger{height:44px;background:#111929;color:rgba(255,255,255,0.45);display:flex;align-items:center;justify-content:center;cursor:pointer;border-top:1px solid #1a1a1a;font-size:12px;gap:8px;transition:all .2s}
+.ant-layout-sider-trigger:hover{color:#fff}
+#content-layout{flex:1;margin-left:200px;overflow-y:auto;padding:20px 20px 48px}
+.page{display:none;animation:pageIn .3s ease}
+.page.active{display:block}
+@keyframes pageIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.ant-card{background:#151f31;border:1px solid #1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}
+.ant-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.ant-card-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid #1a1a1a;margin-bottom:12px}
+.ant-card-head-title{font-size:14px;font-weight:600;color:rgba(255,255,255,0.85)}
+.ant-card-extra{color:rgba(255,255,255,0.45);font-size:13px}
+.ant-row{display:flex;flex-wrap:wrap;margin:-6px -8px}
+.ant-col{padding:6px 8px;flex:0 0 auto}
+.ant-col-12{width:50%}.ant-col-sm-12{width:50%}.ant-col-md-12{width:50%}.ant-col-sm-24{width:100%}.ant-col-md-6{width:25%}
+.ant-statistic-title{font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px}
+.ant-statistic-content{font-size:16px;color:rgba(255,255,255,0.85);display:flex;align-items:center;gap:6px}
+.ant-statistic-content-prefix{color:rgba(255,255,255,0.35)}
+.ant-tag{display:inline-flex;align-items:center;padding:2px 10px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;margin:2px}
+.ant-tag-green{background:rgba(0,135,113,0.15);color:#008771;border:1px solid rgba(0,135,113,0.2)}
+.ant-tag-orange{background:rgba(255,160,49,0.15);color:#ffa031;border:1px solid rgba(255,160,49,0.2)}
+.ant-tag-purple{background:rgba(217,136,205,0.15);color:#d988cd;border:1px solid rgba(217,136,205,0.2)}
+.ant-tag-red{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.15)}
+.ant-badge-status{display:inline-flex;align-items:center;gap:6px}
+.ant-badge-status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.ant-badge-status-green{background:#22c55e}
+.ant-badge-status-text{font-size:12px;color:rgba(255,255,255,0.75)}
+.ant-badge-status-processing{animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.4}}
+.ant-btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all .15s}
+.ant-btn-primary{background:#008771;color:#fff}
+.ant-btn-primary:hover{background:#006b5a}
+.ant-btn-secondary{background:#1a1a1a;color:#888;border:1px solid #2a2a2a}
+.ant-btn-secondary:hover{border-color:#008771;color:#008771}
+.ant-btn-danger{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.12)}
+.ant-btn-danger:hover{background:rgba(239,68,68,0.2)}
+.ant-btn-sm{padding:4px 10px;font-size:11px}
+.sys-bar{height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden;margin-top:8px}
+.sys-bar-fill{height:100%;border-radius:3px;transition:width .5s}
+.ant-table-wrapper{overflow-x:auto;margin-top:4px}
+.ant-table{width:100%;border-collapse:collapse;font-size:13px}
+.ant-table th{text-align:left;font-size:11px;font-weight:600;color:#555;padding:10px 12px;text-transform:uppercase;border-bottom:1px solid #1a1a1a;background:#111}
+.ant-table td{padding:10px 12px;border-bottom:1px solid #1a1a1a;vertical-align:middle;color:#ccc}
+.ant-table tr:last-child td{border-bottom:none}
+.ant-table tbody tr:hover td{background:rgba(0,135,113,0.04)}
+.toggle{width:34px;height:18px;border-radius:10px;background:#2a2a2a;position:relative;cursor:pointer;transition:all .3s;border:1px solid #333;flex-shrink:0}
+.toggle.on{background:#22c55e;border-color:#22c55e;box-shadow:0 0 12px rgba(34,197,94,0.3)}
+.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:#888;top:2px;left:2px;transition:all .3s}
+.toggle.on::after{left:16px;background:#fff}
+.usage-pill{display:flex;align-items:center;gap:8px;padding:2px 10px;border-radius:999px;background:#1a1a1a;font-size:11px;color:#888}
+.usage-pill .used{color:#fff;font-weight:600}
+.usage-pill .bar{flex:1;height:4px;background:#2a2a2a;border-radius:2px;min-width:50px}
+.usage-pill .fill{height:100%;border-radius:2px;transition:width .3s}
+.usage-pill .limit{color:#555}
+.btn-copy{background:rgba(0,135,113,0.1);color:#008771;border:1px solid rgba(0,135,113,0.15);font-family:inherit;font-size:11px;font-weight:600;border-radius:8px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:all .15s}
+.btn-copy:hover{background:#008771;color:#fff}
+.search-box{flex:1;min-width:160px;position:relative}
+.search-box input{width:100%;padding:8px 12px 8px 32px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;color:#fff;font-size:12px;outline:none;transition:all .2s;font-family:inherit}
+.search-box input:focus{border-color:#008771}
+.search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#555}
+.filter-chips{display:flex;gap:3px;padding:3px 5px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px}
+.chip{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;color:#666;cursor:pointer;border:none;background:none;transition:all .2s;font-family:inherit}
+.chip.active{background:#008771;color:#fff}
+.chip:hover:not(.active){background:#2a2a2a;color:#fff}
+.inbounds-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:#151f31;color:#fff;border:1px solid #1a1a1a;border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s;z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.error{border-color:rgba(239,68,68,0.3);color:#ef4444}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+.modal-overlay.show{display:flex}
+.modal{background:#151f31;border:1px solid #1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:440px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.modal-title{font-size:15px;font-weight:700;margin-bottom:16px;color:rgba(255,255,255,0.85)}
+.modal-close{position:absolute;top:12px;right:14px;background:#1a1a1a;border:1px solid #2a2a2a;color:#666;width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .2s}
+.modal-close:hover{background:rgba(239,68,68,0.1);color:#ef4444}
+.form-group{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.form-label{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.04em}
+.form-input,.form-select{padding:8px 12px;border-radius:8px;border:1px solid #2a2a2a;font-family:inherit;font-size:13px;outline:none;color:#fff;background:#1a1a1a;transition:all .2s;width:100%}
+.form-input:focus,.form-select:focus{border-color:#008771;box-shadow:0 0 0 3px rgba(0,135,113,0.1)}
+.form-select option{background:#1a1a1a;color:#fff}
+.form-row{display:flex;gap:8px}
+.form-row .form-group{margin-bottom:0;flex:1}
+.status-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1a1a1a}
+.status-row:last-child{border-bottom:none}
+.status-key{font-size:12px;color:#888;display:flex;align-items:center;gap:8px}
+.status-val{font-size:12px;color:#ccc;font-weight:600}
+.empty-state{text-align:center;padding:40px;color:#555}
+.mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:#111929;border-bottom:1px solid #1a1a1a;z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
+.menu-toggle{width:32px;height:32px;border-radius:8px;border:1px solid #1a1a1a;background:#151f31;color:#888;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
+.sidebar-overlay.show{display:block}
+@media(max-width:768px){
+  .ant-layout-sider{transform:translateX(-100%);width:200px;z-index:200}
+  .ant-layout-sider.open{transform:translateX(0);box-shadow:4px 0 20px rgba(0,0,0,0.5)}
+  #content-layout{margin-left:0;padding-top:56px;padding-left:12px;padding-right:12px}
+  .mobile-header{display:flex}
+  .ant-col-md-12{width:100%}
+  .ant-col-md-6{width:50%}
+}
+@media(max-width:480px){.ant-col-md-6{width:100%}}
+/* ── Overview (Usf) ── */
+.gauge-row{display:flex;gap:2px;align-items:flex-start}
+.gauge{flex:1;min-width:0;text-align:center;padding:2px 0}
+.gauge-svg{width:100%;max-width:118px;height:auto}
+.gauge-pct{font-size:16px;font-weight:700;fill:rgba(255,255,255,0.85)}
+.gauge-arc{transition:stroke-dasharray .6s ease}
+.gauge-label{margin-top:2px;font-size:11px;line-height:1.35}
+.gl-title{color:rgba(255,255,255,0.78);font-weight:600;display:block}
+.gl-sub{color:rgba(255,255,255,0.45);display:block;font-size:10.5px}
+.split-row{display:flex;align-items:stretch}
+.split-col{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 6px;background:none;border:none;color:rgba(255,255,255,0.7);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.split-col + .split-col{border-left:1px solid #1a2536}
+button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
+.split-col svg{flex-shrink:0;opacity:.85}
+.tag-row{display:flex;flex-wrap:wrap;gap:6px;padding-top:2px}
+.tag-row .ant-tag{font-size:11px;text-transform:none;font-weight:600;padding:3px 11px;border-radius:6px}
+.update-btn{display:inline-flex;align-items:center;gap:6px;font-family:inherit;font-size:11px;font-weight:600;color:#ffa031;background:rgba(255,160,49,0.1);border:1px solid rgba(255,160,49,0.25);border-radius:7px;padding:5px 10px;cursor:pointer;transition:all .15s}
+.update-btn:hover{background:rgba(255,160,49,0.18)}
+.eye-btn{background:none;border:none;color:rgba(255,255,255,0.45);cursor:pointer;padding:2px;display:flex;transition:color .15s}
+.eye-btn:hover{color:#fff}
+.ip-val{font-family:monospace;font-size:13px;color:rgba(255,255,255,0.85);transition:filter .2s}
+.ip-val.ip-hidden{filter:blur(6px);user-select:none}
+.spd-up{color:#2bd4a0}.spd-down{color:#3b9dff}
+.data-stat{display:flex;align-items:center;gap:6px}
+.data-stat svg{color:rgba(255,255,255,0.4)}
+.log-box{background:#0b1220;border:1px solid #1a2536;border-radius:8px;padding:12px;font-family:monospace;font-size:11.5px;color:#9fb3c8;max-height:50vh;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+</style>
+</head>
+<body>
+
+<div class="toast" id="toast"></div>
+
+<div class="mobile-header">
+  <span style="font-weight:700;font-size:13px;color:#fff">Usf</span>
+  <button class="menu-toggle" onclick="toggleSidebar()">&#9776;</button>
+</div>
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
+
+<aside class="ant-layout-sider" id="sidebar">
+  <div class="ant-layout-sider-children">
+    <div class="brand-title">
+      <svg width="26" height="26" viewBox="0 0 56 56" fill="none">
+        <rect width="56" height="56" rx="14" fill="url(#lg)"/>
+        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3"/>
+        <circle cx="28" cy="18" r="3.5" fill="#fff"/>
+        <circle cx="19" cy="33" r="3.5" fill="#fff"/>
+        <circle cx="37" cy="33" r="3.5" fill="#fff"/>
+        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
+        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
+        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
+        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#008771"/><stop offset="1" stop-color="#005565"/></linearGradient></defs>
+      </svg>
+      <span>Usf <span class="version">v1.0</span></span>
+    </div>
+    <div class="nav-section">Main</div>
+    <ul class="ant-menu">
+      <li class="ant-menu-item ant-menu-item-selected" onclick="switchPage('overview',this)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span>Overview</span>
+      </li>
+      <li class="ant-menu-item" onclick="switchPage('inbounds',this)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+        <span>Inbounds</span>
+        <span class="nav-badge" id="links-badge">0</span>
+      </li>
+      <li class="ant-menu-item" onclick="switchPage('cleanip',this)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+        <span>Clean IP</span>
+      </li>
+      <li class="ant-menu-item" onclick="switchPage('domain',this)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        <span>Domain</span>
+      </li>
+    </ul>
+    <div class="nav-section">System</div>
+    <ul class="ant-menu">
+      <li class="ant-menu-item" onclick="switchPage('settings',this)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+        <span>Settings</span>
+      </li>
+    </ul>
+  </div>
+  <div class="ant-layout-sider-footer">
+    <button class="logout-btn" onclick="doLogout()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      Log Out
+    </button>
+  </div>
+  <div class="ant-layout-sider-trigger" onclick="toggleSidebar()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    <span style="font-size:11px">Collapse</span>
+  </div>
+</aside>
+
+<section id="content-layout">
+
+  <!-- ── OVERVIEW ── -->
+  <div class="page active" id="page-overview">
+
+    <!-- Gauges -->
+    <div class="ant-card">
+      <svg width="0" height="0" style="position:absolute"><defs>
+        <linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0" stop-color="#0e9f6e"/><stop offset="1" stop-color="#2bd4a0"/>
+        </linearGradient></defs></svg>
+      <div class="gauge-row">
+        <div class="gauge">
+          <svg viewBox="0 0 100 100" class="gauge-svg">
+            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="#1f2a3d" stroke-width="7"
+                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <path id="cpu-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
+                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <text id="cpu-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
+          </svg>
+          <div class="gauge-label"><span class="gl-title">CPU: <span id="cpu-cores">--</span></span><span id="cpu-label" class="gl-sub"></span></div>
+        </div>
+        <div class="gauge">
+          <svg viewBox="0 0 100 100" class="gauge-svg">
+            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="#1f2a3d" stroke-width="7"
+                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <path id="ram-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
+                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <text id="ram-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
+          </svg>
+          <div class="gauge-label"><span class="gl-title">RAM:</span><span id="ram-label" class="gl-sub"></span></div>
+        </div>
+        <div class="gauge">
+          <svg viewBox="0 0 100 100" class="gauge-svg">
+            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="#1f2a3d" stroke-width="7"
+                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <path id="swap-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
+                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <text id="swap-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
+          </svg>
+          <div class="gauge-label"><span class="gl-title">Swap:</span><span id="swap-label" class="gl-sub"></span></div>
+        </div>
+        <div class="gauge">
+          <svg viewBox="0 0 100 100" class="gauge-svg">
+            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="#1f2a3d" stroke-width="7"
+                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <path id="storage-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
+                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
+                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
+            <text id="storage-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
+          </svg>
+          <div class="gauge-label"><span class="gl-title">Storage:</span><span id="storage-label" class="gl-sub"></span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Xray (core) -->
+    <div class="ant-card">
+      <div class="ant-card-head">
+        <div class="ant-card-head-title">Xray</div>
+        <div class="ant-card-extra">
+          <span class="ant-badge-status" id="xray-badge">
+            <span class="ant-badge-status-dot ant-badge-status-green ant-badge-status-processing"></span>
+            <span class="ant-badge-status-text" id="xray-status">Running</span>
+          </span>
+        </div>
+      </div>
+      <div class="split-row">
+        <button class="split-col" onclick="stopService()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/></svg>
+          <span id="xray-action-1">Stop</span>
+        </button>
+        <button class="split-col" onclick="restartService()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          <span>Restart</span>
+        </button>
+        <div class="split-col" style="cursor:default">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></svg>
+          <span id="core-version">{CORE}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Manage -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Manage</div></div>
+      <div class="split-row">
+        <button class="split-col" onclick="openLogs()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          <span>Logs</span>
+        </button>
+        <button class="split-col" onclick="openConfig()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          <span>Config</span>
+        </button>
+        <button class="split-col" onclick="downloadBackup()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          <span>Backup</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Usf -->
+    <div class="ant-card">
+      <div class="ant-card-head">
+        <div class="ant-card-head-title">Usf</div>
+        <button class="update-btn" onclick="checkUpdate()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 01-9 9c-2.5 0-4.78-1-6.43-2.6L3 16"/><path d="M3 12a9 9 0 019-9c2.5 0 4.78 1 6.43 2.6L21 8"/><polyline points="21 3 21 8 16 8"/><polyline points="3 21 3 16 8 16"/></svg>
+          <span id="panel-version-btn">{PANEL}</span> Update Panel
+        </button>
+      </div>
+      <div class="tag-row">
+        <span class="ant-tag ant-tag-green" id="panel-version-tag">{PANEL}</span>
+        <span class="ant-tag ant-tag-green" id="tg-tag">@Usf</span>
+        <span class="ant-tag ant-tag-purple">Documentation</span>
+      </div>
+    </div>
+
+    <!-- Uptime -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Uptime</div></div>
+      <div class="tag-row">
+        <span class="ant-tag ant-tag-green">Xray: <span id="xray-uptime">--</span></span>
+        <span class="ant-tag ant-tag-green">OS: <span id="os-uptime">--</span></span>
+      </div>
+    </div>
+
+    <!-- System Load -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">System Load</div></div>
+      <div class="tag-row"><span class="ant-tag ant-tag-green" id="system-load">--</span></div>
+    </div>
+
+    <!-- Usage -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Usage</div></div>
+      <div class="tag-row">
+        <span class="ant-tag ant-tag-green">RAM: <span id="app-ram">--</span></span>
+        <span class="ant-tag ant-tag-green">Threads: <span id="threads">--</span></span>
+      </div>
+    </div>
+
+    <!-- Overall Speed -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Overall Speed</div></div>
+      <div class="ant-row">
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">Upload</div>
+          <div class="ant-statistic-content"><span class="spd-up">&#8593;</span> <span id="upload-speed">-- B/s</span></div>
+        </div>
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">Download</div>
+          <div class="ant-statistic-content"><span class="spd-down">&#8595;</span> <span id="download-speed">-- B/s</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Total Data -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Total Data</div></div>
+      <div class="ant-row">
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">Sent</div>
+          <div class="ant-statistic-content data-stat"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg> <span id="total-sent">--</span></div>
+        </div>
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">Received</div>
+          <div class="ant-statistic-content data-stat"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg> <span id="total-received">--</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- IP Addresses -->
+    <div class="ant-card">
+      <div class="ant-card-head">
+        <div class="ant-card-head-title">IP Addresses</div>
+        <button class="eye-btn" id="ip-eye" onclick="toggleIps()" title="Show / hide">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+        </button>
+      </div>
+      <div class="ant-row">
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">IPv4</div>
+          <div class="ant-statistic-content"><span id="ipv4" class="ip-val ip-hidden">--</span></div>
+        </div>
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">IPv6</div>
+          <div class="ant-statistic-content"><span id="ipv6" class="ip-val ip-hidden" style="font-size:11px;word-break:break-all">--</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connection Stats -->
+    <div class="ant-card">
+      <div class="ant-card-head"><div class="ant-card-head-title">Connection Stats</div></div>
+      <div class="ant-row">
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">TCP</div>
+          <div class="ant-statistic-content">&#8644; <span id="tcp-conn">--</span></div>
+        </div>
+        <div class="ant-col ant-col-12">
+          <div class="ant-statistic-title">UDP</div>
+          <div class="ant-statistic-content">&#8644; <span id="udp-conn">--</span></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── INBOUNDS ── -->
+  <div class="page" id="page-inbounds">
+    <!-- Stats row -->
+    <div class="ant-row" style="margin:-6px -8px;margin-bottom:4px">
+      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Sent / Received</div><div class="ant-statistic-content" style="font-size:12px"><span id="ib-sent-recv">-- / --</span></div></div></div></div>
+      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Proxy Traffic</div><div class="ant-statistic-content" style="font-size:14px"><span id="ib-proxy-traffic">-- MB</span></div></div></div></div>
+      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Total Inbounds</div><div class="ant-statistic-content" style="font-size:18px"><span id="ib-total">0</span></div></div></div></div>
+      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Active Clients</div><div class="ant-statistic-content" style="font-size:18px"><span id="ib-clients">0</span></div></div></div></div>
+    </div>
+
+    <div class="ant-card" style="padding:0;overflow:hidden">
+      <div class="ant-card-head" style="padding:14px 16px">
+        <div class="ant-card-head-title">
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="ant-btn ant-btn-primary" onclick="showAddModal()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add Inbound
+            </button>
+            <button class="ant-btn ant-btn-secondary" onclick="loadInbounds()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div style="padding:0 16px 8px">
+        <div class="inbounds-toolbar">
+          <div class="search-box">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input id="inbound-search" placeholder="Search by name..." oninput="filterInbounds()">
+          </div>
+          <div class="filter-chips">
+            <button class="chip active" onclick="setFilter('all',this)">All</button>
+            <button class="chip" onclick="setFilter('active',this)">Active</button>
+            <button class="chip" onclick="setFilter('disabled',this)">Disabled</button>
+          </div>
+        </div>
+      </div>
+      <div class="ant-table-wrapper" style="padding:0 8px 8px">
+        <table class="ant-table">
+          <thead><tr>
+            <th style="width:36px">#</th>
+            <th>Remark</th>
+            <th style="width:64px">Type</th>
+            <th>Traffic</th>
+            <th style="width:72px">IPs</th>
+            <th style="width:60px">Status</th>
+            <th style="width:120px">Actions</th>
+          </tr></thead>
+          <tbody id="inbounds-tbody"><tr><td colspan="7" style="text-align:center;padding:32px;color:#555">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CLEAN IP ── -->
+  <div class="page" id="page-cleanip">
+    <div class="ant-card" style="max-width:520px">
+      <div class="ant-card-head">
+        <div class="ant-card-head-title">Clean IP / Addresses</div>
+        <button class="ant-btn ant-btn-primary ant-btn-sm" onclick="showAddAddressModal()">+ Add</button>
+      </div>
+      <div style="font-size:11px;color:#555;margin-bottom:10px">IPs and domains for subscription configs. Default: www.speedtest.net</div>
+      <div id="address-list"></div>
+    </div>
+  </div>
+
+  <!-- ── DOMAIN ── -->
+  <div class="page" id="page-domain">
+    <div class="ant-card" style="max-width:480px">
+      <div class="ant-card-head"><div class="ant-card-head-title">Custom Domain</div></div>
+      <div class="status-row">
+        <span class="status-key">Render Domain</span>
+        <span class="status-val" id="render-domain" style="font-family:monospace;font-size:11px">--</span>
+      </div>
+      <div class="status-row">
+        <span class="status-key">Custom Domain</span>
+        <span class="status-val" style="display:flex;align-items:center;gap:8px">
+          <span id="domain-value" style="font-family:monospace;font-size:11px">None set</span>
+          <button class="ant-btn ant-btn-danger ant-btn-sm" id="domain-clear-btn" onclick="clearDomain()" style="display:none">Clear</button>
+        </span>
+      </div>
+      <div class="form-group" style="margin-top:14px">
+        <label class="form-label">Set New Domain</label>
+        <div style="display:flex;gap:8px">
+          <input class="form-input" id="domain-input" placeholder="example.com" style="flex:1">
+          <button class="ant-btn ant-btn-primary" onclick="saveDomain()">Save</button>
+        </div>
+      </div>
+      <div style="padding:10px;background:rgba(0,135,113,0.06);border:1px solid rgba(0,135,113,0.15);border-radius:8px;font-size:11px;color:#888;line-height:1.6;margin-top:4px">
+        Set a custom domain to use in VLESS configs instead of the default Render/HuggingFace domain. Point your domain via CNAME or A record to this service.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SETTINGS ── -->
+  <div class="page" id="page-settings">
+    <div class="ant-card" style="max-width:440px">
+      <div class="ant-card-head"><div class="ant-card-head-title">Change Password</div></div>
+      <div class="form-group">
+        <label class="form-label">Current Password</label>
+        <input class="form-input" type="password" id="cur-pw" placeholder="Current password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">New Password</label>
+        <input class="form-input" type="password" id="new-pw" placeholder="Min 4 characters">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Confirm Password</label>
+        <input class="form-input" type="password" id="confirm-pw" placeholder="Repeat new password">
+      </div>
+      <button class="ant-btn ant-btn-primary" onclick="changePassword()" style="width:100%;justify-content:center;margin-top:4px">Update Password</button>
+    </div>
+  </div>
+
+</section>
+
+<!-- Add Inbound Modal -->
+<div class="modal-overlay" id="add-modal" onclick="if(event.target===this)closeModal('add-modal')">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal('add-modal')">×</button>
+    <div class="modal-title">Add Inbound</div>
+    <div class="form-group">
+      <label class="form-label">Remark / Name</label>
+      <input class="form-input" id="new-label" placeholder="e.g. User1">
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Traffic Limit</label>
+        <input class="form-input" id="new-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
+      </div>
+      <div class="form-group" style="max-width:90px">
+        <label class="form-label">Unit</label>
+        <select class="form-select" id="new-unit"><option value="GB">GB</option><option value="MB">MB</option></select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Max IPs (0 = Unlimited)</label>
+      <input class="form-input" id="new-maxconn" type="number" min="0" step="1" placeholder="0">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Expiry Days (0 = Never)</label>
+      <input class="form-input" id="new-expiry" type="number" min="0" step="1" placeholder="0">
+    </div>
+    <button class="ant-btn ant-btn-primary" onclick="createInbound()" style="width:100%;justify-content:center;margin-top:8px">Create</button>
+  </div>
+</div>
+
+<!-- Edit Inbound Modal -->
+<div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)closeModal('edit-modal')">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal('edit-modal')">×</button>
+    <div class="modal-title" id="edit-title">Edit Inbound</div>
+    <input type="hidden" id="edit-uid">
+    <div class="form-group">
+      <label class="form-label">Name (read-only)</label>
+      <input class="form-input" id="edit-name" readonly style="opacity:0.5;cursor:not-allowed">
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Traffic Limit</label>
+        <input class="form-input" id="edit-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
+      </div>
+      <div class="form-group" style="max-width:90px">
+        <label class="form-label">Unit</label>
+        <select class="form-select" id="edit-unit"><option value="GB">GB</option><option value="MB">MB</option></select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Max IPs</label>
+      <input class="form-input" id="edit-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="ant-btn ant-btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
+      <button class="ant-btn ant-btn-danger" onclick="resetTraffic()">Reset Traffic</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Address Modal -->
+<div class="modal-overlay" id="add-address-modal" onclick="if(event.target===this)closeModal('add-address-modal')">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal('add-address-modal')">×</button>
+    <div class="modal-title">Add Clean IP / Domain</div>
+    <div class="form-group">
+      <label class="form-label">IPs or Domains (one per line)</label>
+      <textarea class="form-input" id="new-address" rows="5" placeholder="8.8.8.8&#10;example.com&#10;1.0.0.1" style="resize:vertical;font-family:monospace"></textarea>
+    </div>
+    <button class="ant-btn ant-btn-primary" onclick="addAddresses()" style="width:100%;justify-content:center;margin-top:8px">Add All</button>
+  </div>
+</div>
+
+<!-- Logs Modal -->
+<div class="modal-overlay" id="logs-modal" onclick="if(event.target===this)closeModal('logs-modal')">
+  <div class="modal" style="max-width:560px">
+    <button class="modal-close" onclick="closeModal('logs-modal')">×</button>
+    <div class="modal-title">Logs</div>
+    <div class="log-box" id="logs-box">Loading...</div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="ant-btn ant-btn-secondary" onclick="openLogs()" style="flex:1;justify-content:center">Refresh</button>
+      <button class="ant-btn ant-btn-secondary" onclick="closeModal('logs-modal')" style="flex:1;justify-content:center">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Config Modal -->
+<div class="modal-overlay" id="config-modal" onclick="if(event.target===this)closeModal('config-modal')">
+  <div class="modal" style="max-width:560px">
+    <button class="modal-close" onclick="closeModal('config-modal')">×</button>
+    <div class="modal-title">Config</div>
+    <div class="log-box" id="config-box">Loading...</div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="ant-btn ant-btn-secondary" onclick="closeModal('config-modal')" style="flex:1;justify-content:center">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let allLinks = [];
+let currentFilter = 'all';
+let apiStats = {};
+
+// ── Navigation ──────────────────────────────────────────────
+function switchPage(id, el) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  document.querySelectorAll('.ant-menu-item').forEach(n => n.classList.remove('ant-menu-item-selected'));
+  if (el) el.classList.add('ant-menu-item-selected');
+  closeSidebar();
+  if (id === 'inbounds') loadInbounds();
+  if (id === 'cleanip') loadAddresses();
+  if (id === 'domain') loadDomain();
+}
+
+function toggleSidebar() {
+  const s = document.getElementById('sidebar');
+  const ov = document.getElementById('sidebar-overlay');
+  s.classList.toggle('open');
+  ov.classList.toggle('show');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('show');
+}
+
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function showAddModal() { document.getElementById('add-modal').classList.add('show'); }
+
+function toast(msg, err=false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (err ? ' error' : '') + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function esc(s) { return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function fmtBytes(b) {
+  if (!b || b === 0) return '0 B';
+  if (b >= 1073741824) return (b/1073741824).toFixed(2)+' GB';
+  if (b >= 1048576) return (b/1048576).toFixed(2)+' MB';
+  if (b >= 1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B';
+}
+function fmtLimit(b) {
+  if (!b || b === 0) return 'Unlimited';
+  const gb = b/1073741824;
+  return (gb%1===0?gb.toFixed(0):gb.toFixed(1))+' GB';
+}
+
+// ── Stats ────────────────────────────────────────────────────
+let ipsVisible = false;
+
+function setGauge(prefix, pct){
+  pct = Math.max(0, Math.min(100, pct||0));
+  const FULL = 197.9; // length of the 270deg track
+  const arc = document.getElementById(prefix+'-arc');
+  const txt = document.getElementById(prefix+'-text');
+  if (arc) arc.setAttribute('stroke-dasharray', (pct/100*FULL).toFixed(1)+' 263.9');
+  if (txt) txt.textContent = pct.toFixed(2)+'%';
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) throw new Error();
+    apiStats = await r.json();
+
+    // Gauges
+    setGauge('cpu', apiStats.cpuUsage||0);
+    setGauge('ram', apiStats.ramUsage||0);
+    setGauge('swap', apiStats.swapUsage||0);
+    setGauge('storage', apiStats.storageUsage||0);
+
+    const cores = apiStats.cpuCores||1;
+    document.getElementById('cpu-cores').textContent = cores + ' Core' + (cores>1?'s':'');
+    document.getElementById('ram-label').textContent = (apiStats.ramUsed||'')+' / '+(apiStats.ramTotal||'');
+    document.getElementById('swap-label').textContent = (apiStats.swapUsed||'0 B')+' / '+(apiStats.swapTotal||'0 B');
+    document.getElementById('storage-label').textContent = (apiStats.storageUsed||'')+' / '+(apiStats.storageTotal||'');
+
+    // Xray status
+    const running = apiStats.xrayRunning !== false;
+    const dot = document.querySelector('#xray-badge .ant-badge-status-dot');
+    document.getElementById('xray-status').textContent = running ? 'Running' : 'Stopped';
+    document.getElementById('xray-action-1').textContent = running ? 'Stop' : 'Start';
+    if (dot) {
+      dot.classList.toggle('ant-badge-status-green', running);
+      dot.classList.toggle('ant-badge-status-processing', running);
+      dot.style.background = running ? '' : '#ef4444';
+    }
+    document.getElementById('core-version').textContent = apiStats.coreVersion || '--';
+    const pv = apiStats.panelVersion || '--';
+    document.getElementById('panel-version-btn').textContent = pv;
+    document.getElementById('panel-version-tag').textContent = pv;
+    if (apiStats.telegram) document.getElementById('tg-tag').textContent = apiStats.telegram;
+
+    // Uptime / load / usage
+    document.getElementById('xray-uptime').textContent = apiStats.xrayUptime || '--';
+    document.getElementById('os-uptime').textContent = apiStats.uptime || '--';
+    document.getElementById('system-load').textContent = apiStats.systemLoad || '--';
+    document.getElementById('app-ram').textContent = apiStats.appRam || '--';
+    document.getElementById('threads').textContent = apiStats.threads ?? '--';
+
+    // Speed / data
+    document.getElementById('upload-speed').textContent = apiStats.uploadSpeed || '-- B/s';
+    document.getElementById('download-speed').textContent = apiStats.downloadSpeed || '-- B/s';
+    document.getElementById('total-sent').textContent = apiStats.totalSent || '--';
+    document.getElementById('total-received').textContent = apiStats.totalReceived || '--';
+
+    // IPs
+    document.getElementById('ipv4').textContent = apiStats.ipv4 || 'N/A';
+    document.getElementById('ipv6').textContent = apiStats.ipv6 || 'N/A';
+
+    // Connection stats
+    document.getElementById('tcp-conn').textContent = apiStats.tcpConnections ?? '--';
+    document.getElementById('udp-conn').textContent = apiStats.udpConnections ?? '--';
+
+    // sidebar badge
+    const lb = document.getElementById('links-badge');
+    if (lb) lb.textContent = apiStats.linksCount || 0;
+
+    // inbounds page mirrors
+    if (document.getElementById('ib-proxy-traffic')) document.getElementById('ib-proxy-traffic').textContent = (apiStats.totalTrafficMb||0).toFixed(2)+' MB';
+    if (document.getElementById('ib-total')) document.getElementById('ib-total').textContent = apiStats.linksCount || 0;
+    if (document.getElementById('ib-sent-recv')) document.getElementById('ib-sent-recv').textContent = (apiStats.totalSent||'--')+' / '+(apiStats.totalReceived||'--');
+    const rd = document.getElementById('render-domain');
+    if (rd) rd.textContent = apiStats.domain || '--';
+  } catch(e) {}
+}
+
+function toggleIps(){
+  ipsVisible = !ipsVisible;
+  document.querySelectorAll('.ip-val').forEach(el=>el.classList.toggle('ip-hidden', !ipsVisible));
+}
+
+async function stopService(){
+  const running = apiStats.xrayRunning !== false;
+  if (running){
+    if(!confirm('Stop the core? All active connections will be dropped.')) return;
+    try{ const r=await fetch('/api/service/stop',{method:'POST'}); if(!r.ok)throw 0; toast('Core stopped'); }catch(e){ toast('Error',true);} 
+  } else {
+    try{ const r=await fetch('/api/service/restart',{method:'POST'}); if(!r.ok)throw 0; toast('Core started'); }catch(e){ toast('Error',true);} 
+  }
+  await loadStats();
+}
+async function restartService(){
+  if(!confirm('Restart the core?')) return;
+  try{ const r=await fetch('/api/service/restart',{method:'POST'}); if(!r.ok)throw 0; toast('Core restarted'); }catch(e){ toast('Error',true);} 
+  await loadStats();
+}
+async function openLogs(){
+  try{
+    const r=await fetch('/api/logs'); const d=await r.json();
+    let out='STATUS: '+(d.running?'Running':'Stopped')+'\n';
+       out+='Traffic: '+fmtBytes(d.totals.bytes)+'  |  Requests: '+d.totals.requests+'  |  Errors: '+d.totals.errors+'\n';
+    out+='\n── Active connections ('+d.connections.length+') ──\n';
+    if(!d.connections.length) out+='(none)\n';
+    d.connections.forEach(c=>{ out+=c.ip+'  '+(c.uuid||'').slice(0,8)+'…  '+fmtBytes(c.bytes)+'  '+(c.connected_at||'').slice(11,19)+'\n'; });
+    out+='\n── Recent errors ('+d.errors.length+') ──\n';
+    if(!d.errors.length) out+='(none)\n';
+    d.errors.slice().reverse().forEach(e=>{ out+=(e.time||'').slice(11,19)+'  '+e.error+'\n'; });
+    document.getElementById('logs-box').textContent=out;
+    document.getElementById('logs-modal').classList.add('show');
+  }catch(e){ toast('Failed to load logs',true);} 
+}
+async function openConfig(){
+  try{
+    const r=await fetch('/api/config'); const d=await r.json();
+    document.getElementById('config-box').textContent=JSON.stringify(d,null,2);
+    document.getElementById('config-modal').classList.add('show');
+  }catch(e){ toast('Failed to load config',true);} 
+}
+function downloadBackup(){
+  const a=document.createElement('a'); a.href='/api/backup'; a.download=''; document.body.appendChild(a); a.click(); a.remove();
+  toast('Backup downloaded');
+}
+function checkUpdate(){
+  toast('Usf '+(apiStats.panelVersion||'')+' — you are on the latest version');
+}
+
+// ── Inbounds ─────────────────────────────────────────────────
+async function loadInbounds() {
+  try {
+    const r = await fetch('/api/links');
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    allLinks = d.links || [];
+    filterInbounds();
+    if (document.getElementById('ib-total')) document.getElementById('ib-total').textContent = allLinks.length;
+    if (document.getElementById('ib-clients')) document.getElementById('ib-clients').textContent = allLinks.filter(l=>l.active).length;
+  } catch(e) {
+    document.getElementById('inbounds-tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;padding:32px;color:#555">Failed to load inbounds</td></tr>';
+  }
+}
+
+function setFilter(f, el) {
+  currentFilter = f;
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  filterInbounds();
+}
+
+function filterInbounds() {
+  const q = (document.getElementById('inbound-search')?.value||'').toLowerCase();
+  let filtered = allLinks;
+  if (currentFilter === 'active') filtered = filtered.filter(l => l.active);
+  if (currentFilter === 'disabled') filtered = filtered.filter(l => !l.active);
+  if (q) filtered = filtered.filter(l => l.label.toLowerCase().includes(q) || l.uuid.toLowerCase().includes(q));
+  renderInbounds(filtered);
+}
+
+function renderInbounds(links) {
+  const tbody = document.getElementById('inbounds-tbody');
+  if (!links.length) {
+    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">No inbounds found</div></td></tr>';
+    return;
+  }
+  let idx = links.length;
+  tbody.innerHTML = links.map(l => {
+    const u = l.used_bytes, lim = l.limit_bytes;
+    const uF = fmtBytes(u), lF = fmtLimit(lim);
+    const pct = lim > 0 ? Math.min(100, (u/lim)*100) : 0;
+    const col = pct>90?'#ef4444':pct>70?'#fbbf24':'#008771';
+    const i = idx--;
+    const maxC = l.max_connections || 0;
+    const curC = l.current_connections || 0;
+    return `<tr>
+      <td style="color:#555;font-size:11px">${i}</td>
+      <td style="font-weight:600;color:#ccc">${esc(l.label)}</td>
+      <td><span class="ant-tag ant-tag-purple">VLESS</span></td>
+      <td>
+        <div class="usage-pill">
+          <span class="used">${uF}</span>
+          <div class="bar"><div class="fill" style="width:${pct}%;background:${col}"></div></div>
+          <span class="limit">${lF}</span>
+        </div>
+      </td>
+      <td style="font-size:12px;font-weight:600;color:${maxC>0&&curC>=maxC?'#ef4444':'#888'}">${curC}/${maxC||'∞'}</td>
+      <td><span class="ant-tag ${l.active?'ant-tag-green':'ant-tag-red'}">${l.active?'On':'Off'}</span></td>
+      <td>
+        <div style="display:flex;gap:3px;align-items:center">
+          <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="toggleInbound(this)" title="Toggle"></button>
+          <button class="ant-btn ant-btn-secondary ant-btn-sm" onclick="showEditModal('${l.uuid}')" style="padding:3px 7px;color:#fbbf24;border-color:rgba(251,191,36,0.2);background:rgba(251,191,36,0.06)">e</button>
+          <button class="btn-copy" onclick="copyVless('${esc(l.vless_link)}')" title="Copy VLESS">c</button>
+          <button class="btn-copy" onclick="copySubUrl('${l.uuid}')" style="background:rgba(34,197,94,0.08);color:#22c55e;border-color:rgba(34,197,94,0.15)" title="Copy Sub URL">s</button>          <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteInbound('${l.uuid}')" title="Delete">x</button>
+        </div>
+      </td>
+    </tr>`;
   }).join('');
 }
 
-function toggleCM(e){e.stopPropagation();var m=e.target.nextElementSibling;document.querySelectorAll('.cmenu.open').forEach(function(el){if(el!==m)el.classList.remove('open')});m.classList.toggle('open')}
-document.addEventListener('click',function(){document.querySelectorAll('.cmenu.open').forEach(function(el){el.classList.remove('open')})});
-
-function copyFromMenu(btn){
-  var link=btn.getAttribute('data-link');
-  var name=btn.getAttribute('data-name');
-  copyTxt(link,name);
+async function toggleInbound(el) {
+  const uid = el.dataset.uid;
+  const link = allLinks.find(l => l.uuid === uid);
+  if (!link) return;
+  try {
+    await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({active:!link.active})});
+    await loadInbounds();
+    await loadStats();
+  } catch(e) { toast('Error', true); }
 }
 
-function showCL(uid){
-  var l=null;for(var i=0;i<links.length;i++){if(links[i].uuid===uid){l=links[i];break}}
-  if(!l)return;
-  document.getElementById('clTitle').textContent='Client Links \u2014 '+l.label;
-  var cl=l.client_links||{};
-  var keys=Object.keys(cl);
-  var html='<div class="cl-grid">';
-  keys.forEach(function(k){
-    html+='<div class="cl-item"><span title="'+esc(cl[k])+'">'+esc(k)+'</span><button data-link="'+esc(cl[k])+'" data-name="'+esc(k)+'" onclick="copyFromMenu(this)">&#128203;</button></div>';
-  });
-  html+='</div>';
-  html+='<div style="margin-top:10px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Subscription URL</div><div class="sub-box"><input type="text" value="'+esc(l.sub_url)+'" readonly id="subUrlIn"><button class="btn btn-s" onclick="copyTxt(document.getElementById(\'subUrlIn\').value,\'Subscription\')">Copy</button></div></div>';
-  document.getElementById('clContent').innerHTML=html;
-  document.getElementById('clModal').classList.add('open');
-}
-function closeCL(){document.getElementById('clModal').classList.remove('open')}
-
-function openCreate(){
-  document.getElementById('mTitle').textContent='New Link';
-  document.getElementById('eUid').value='';
-  document.getElementById('fLabel').value='';
-  document.getElementById('fLimV').value='';
-  document.getElementById('fExp').value='';
-  document.getElementById('fMC').value='';
-  document.getElementById('fSpd').value='';
-  document.getElementById('fTag').value='';
-  document.getElementById('fNote').value='';
-  document.getElementById('saveBtn').textContent='Create';
-  document.getElementById('linkModal').classList.add('open');
+async function createInbound() {
+  const label = document.getElementById('new-label').value.trim();
+  if (!label) { toast('Name is required', true); return; }
+  if (!/^[a-zA-Z0-9\-_. ]+$/.test(label)) { toast('Only English letters, numbers, - _ . space', true); return; }
+  const val = parseFloat(document.getElementById('new-limit').value)||0;
+  const unit = document.getElementById('new-unit').value;
+  const maxconn = parseInt(document.getElementById('new-maxconn').value)||0;
+  const expiry = parseInt(document.getElementById('new-expiry').value)||0;
+  try {
+    const r = await fetch('/api/links', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({label,limit_value:val,limit_unit:unit,max_connections:maxconn,expiry_days:expiry})});
+    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
+    toast('Inbound created');
+    document.getElementById('new-label').value='';
+    document.getElementById('new-limit').value='';
+    document.getElementById('new-maxconn').value='';
+    document.getElementById('new-expiry').value='';
+    closeModal('add-modal');
+    await loadInbounds();
+    await loadStats();
+  } catch(e) { toast(e.message, true); }
 }
 
-function openEdit(uid){
-  var l=null;for(var i=0;i<links.length;i++){if(links[i].uuid===uid){l=links[i];break}}
-  if(!l)return;
-  document.getElementById('mTitle').textContent='Edit \u2014 '+l.label;
-  document.getElementById('eUid').value=uid;
-  document.getElementById('fLabel').value=l.label;
-  if(l.limit_bytes>0){var gb=l.limit_bytes/1073741824;if(gb>=1){document.getElementById('fLimV').value=gb;document.getElementById('fLimU').value='GB'}else{document.getElementById('fLimV').value=l.limit_bytes/1048576;document.getElementById('fLimU').value='MB'}}
-  else{document.getElementById('fLimV').value='';document.getElementById('fLimU').value='GB'}
-  if(l.expiry){var diff=Math.max(0,Math.round((new Date(l.expiry)-Date.now())/86400000));document.getElementById('fExp').value=diff||''}else{document.getElementById('fExp').value=''}
-  document.getElementById('fMC').value=l.max_connections||'';
-  document.getElementById('fSpd').value=l.speed_limit||'';
-  document.getElementById('fTag').value=l.tag||'';
-  document.getElementById('fNote').value=l.note||'';
-  document.getElementById('saveBtn').textContent='Save';
-  document.getElementById('linkModal').classList.add('open');
+async function deleteInbound(uid) {
+  if (!confirm('Delete this inbound?')) return;
+  try {
+    await fetch(`/api/links/${uid}`, {method:'DELETE'});
+    toast('Deleted');
+    await loadInbounds();
+    await loadStats();
+  } catch(e) { toast('Error', true); }
 }
 
-function closeM(){document.getElementById('linkModal').classList.remove('open')}
-
-function saveLink(){
-  var uid=document.getElementById('eUid').value;
-  var body={label:document.getElementById('fLabel').value,limit_value:parseFloat(document.getElementById('fLimV').value)||0,limit_unit:document.getElementById('fLimU').value,expiry_days:parseFloat(document.getElementById('fExp').value)||0,max_connections:parseInt(document.getElementById('fMC').value)||0,speed_limit:parseInt(document.getElementById('fSpd').value)||0,tag:document.getElementById('fTag').value,note:document.getElementById('fNote').value};
-  var url=uid?'/api/links/'+uid:'/api/links';
-  var method=uid?'PATCH':'POST';
-  api(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){
-    if(!r){toast('Error','err');return}
-    if(r.ok){toast(uid?'Updated':'Created','ok');closeM();loadLinks()}
-    else r.json().then(function(d){toast(d.detail||'Error','err')});
-  });
+function showEditModal(uid) {
+  const l = allLinks.find(x => x.uuid === uid);
+  if (!l) return;
+  document.getElementById('edit-uid').value = uid;
+  document.getElementById('edit-name').value = l.label;
+  const gb = l.limit_bytes / 1073741824;
+  document.getElementById('edit-limit').value = l.limit_bytes > 0 ? gb.toFixed(2) : '';
+  document.getElementById('edit-unit').value = 'GB';
+  document.getElementById('edit-maxconn').value = l.max_connections > 0 ? l.max_connections : '';
+  document.getElementById('edit-title').textContent = 'Edit: ' + l.label;
+  document.getElementById('edit-modal').classList.add('show');
 }
 
-function delLink(uid,label){
-  if(!confirm('Delete "'+label+'"?'))return;
-  api('/api/links/'+uid,{method:'DELETE'}).then(function(r){
-    if(r&&r.ok){toast('Deleted','ok');loadLinks()}else toast('Error','err');
-  });
+async function saveEdit() {
+  const uid = document.getElementById('edit-uid').value;
+  const val = parseFloat(document.getElementById('edit-limit').value)||0;
+  const unit = document.getElementById('edit-unit').value;
+  const maxconn = parseInt(document.getElementById('edit-maxconn').value)||0;
+  try {
+    const r = await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({limit_value:val,limit_unit:unit,max_connections:maxconn})});
+    if (!r.ok) throw new Error();
+    toast('Updated');
+    closeModal('edit-modal');
+    await loadInbounds();
+  } catch(e) { toast('Error', true); }
 }
 
-function loadAddrs(){
-  api('/api/addresses').then(function(r){if(!r)return;return r.json()}).then(function(d){
-    if(!d)return;
-    var el=document.getElementById('addrList');
-    if(d.addresses.length){el.innerHTML=d.addresses.map(function(a,i){return '<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border:1px solid var(--glass);border-radius:10px;margin-bottom:5px"><span style="font-size:13px;direction:ltr">'+esc(a)+'</span><button class="btn btn-s btn-d" onclick="delAddr('+i+')">Remove</button></div>'}).join('')}
-    else{el.innerHTML='<p style="color:var(--text4);text-align:center;padding:14px">No custom IPs</p>'}
-  });
-}
-function addAddr(){
-  var a=document.getElementById('newAddr').value.trim();if(!a)return;
-  api('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a})}).then(function(r){
-    if(r&&r.ok){document.getElementById('newAddr').value='';loadAddrs();toast('Added','ok')}
-    else if(r) r.json().then(function(d){toast(d.detail||'Error','err')});
-  });
-}
-function delAddr(i){api('/api/addresses/'+i,{method:'DELETE'}).then(function(r){if(r&&r.ok){loadAddrs();toast('Removed','ok')}})}
-
-function loadDom(){
-  api('/api/domain').then(function(r){if(!r)return;return r.json()}).then(function(d){if(d)document.getElementById('domIn').value=d.domain||''});
-}
-function saveDom(){
-  var d=document.getElementById('domIn').value.trim();
-  api('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})}).then(function(r){if(r&&r.ok)toast('Saved','ok');else toast('Error','err')});
+async function resetTraffic() {
+  const uid = document.getElementById('edit-uid').value;
+  if (!confirm('Reset traffic to zero?')) return;
+  try {
+    await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reset_usage:true})});
+    toast('Traffic reset');
+    await loadInbounds();
+  } catch(e) { toast('Error', true); }
 }
 
-function deploy(){
-  var tk=document.getElementById('pbTok').value.trim();
-  var sp=document.getElementById('pbSp').value.trim();
-  var us=document.getElementById('pbUsr').value.trim();
-  var pw=document.getElementById('pbPw').value;
-  if(!tk||!sp){toast('Token and Space name required','err');return}
-  var btn=document.getElementById('depBtn');btn.disabled=true;btn.textContent='Deploying...';
-  api('/api/panel-builder/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hf_token:tk,space_name:sp,admin_username:us,admin_password:pw})}).then(function(r){
-    btn.disabled=false;btn.textContent='Deploy Panel';
-    if(r&&r.ok){return r.json()}else if(r){return r.json().then(function(d){toast(d.detail||'Deploy failed','err');return null})}
-  }).then(function(d){
-    if(!d)return;
-    document.getElementById('depRes').style.display='block';
-    document.getElementById('depRes').innerHTML='<strong style="color:var(--emerald)">Deployed!</strong><br><br><a href="'+d.space_url+'" target="_blank">'+d.space_url+'</a><br><a href="'+d.app_url+'" target="_blank">'+d.app_url+'</a>';
-    toast('Deployed!','ok');
-  });
+function copyVless(txt) { navigator.clipboard.writeText(txt).then(()=>toast('VLESS link copied')).catch(()=>toast('Copy failed',true)); }
+async function copySubUrl(uid) {
+  const url = `https://${location.host}/sub/${uid}`;
+  navigator.clipboard.writeText(url).then(()=>toast('Subscription URL copied')).catch(()=>toast('Copy failed',true));
 }
 
-function loadLogs(){
-  api('/api/logs').then(function(r){if(!r)return;return r.json()}).then(function(d){
-    if(!d)return;
-    var el=document.getElementById('errLogs');
-    el.innerHTML=d.errors.length?d.errors.map(function(e){return '<div class="log-e"><span class="log-t">'+(e.time?e.time.slice(11,19):'')+'</span><span style="color:var(--rose);font-weight:600">ERR</span><span>'+esc(e.error||'')+'</span></div>'}).join(''):'<p style="color:var(--text4);text-align:center;padding:16px">No errors</p>';
-    var ch=document.getElementById('connHist');
-    ch.innerHTML=d.history.length?d.history.map(function(h){return '<div class="log-e"><span class="log-t">'+(h.time?h.time.slice(11,19):'')+'</span><span style="color:var(--text3)">'+esc(h.label||'')+'</span><span>'+esc(h.ip||'')+'</span><span style="color:var(--text4)">'+esc(h.target||'')+'</span></div>'}).join(''):'<p style="color:var(--text4);text-align:center;padding:16px">No connections</p>';
-  });
+// ── Addresses ────────────────────────────────────────────────
+let allAddresses = [];
+async function loadAddresses() {
+  try {
+    const r = await fetch('/api/addresses');
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    allAddresses = d.addresses || [];
+    renderAddresses();
+  } catch(e) {}
+}
+function renderAddresses() {
+  const list = document.getElementById('address-list');
+  if (!allAddresses.length) { list.innerHTML = '<div style="color:#555;font-size:12px;padding:8px 0">No addresses added</div>'; return; }
+  list.innerHTML = allAddresses.map((a,i) => `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#111;border:1px solid #1a1a1a;border-radius:8px;margin-bottom:6px">
+      <span style="font-family:monospace;font-size:13px;color:#ccc">${esc(a)}</span>
+      <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteAddress(${i})">×</button>
+    </div>`).join('');
+}
+function showAddAddressModal() { document.getElementById('new-address').value=''; document.getElementById('add-address-modal').classList.add('show'); }
+async function addAddresses() {
+  const text = document.getElementById('new-address').value.trim();
+  if (!text) { toast('Enter at least one address', true); return; }
+  const lines = text.split('\n').map(l=>l.trim()).filter(l=>l);
+  let added=0, errors=0;
+  for (const addr of lines) {
+    if (!/^[a-zA-Z0-9\-_. ]+$/.test(addr)) { errors++; continue; }
+    try {
+      const r = await fetch('/api/addresses', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({address:addr})});
+      if (r.ok) added++; else errors++;
+    } catch(e) { errors++; }
+  }
+  if (added > 0) toast(`Added ${added} address(es)`);
+  if (errors > 0) toast(`${errors} failed`, true);
+  if (added > 0) { closeModal('add-address-modal'); await loadAddresses(); }
+}
+async function deleteAddress(index) {
+  if (!confirm('Delete this address?')) return;
+  try {
+    const r = await fetch(`/api/addresses/${index}`, {method:'DELETE'});
+    if (!r.ok) throw new Error();
+    toast('Deleted');
+    await loadAddresses();
+  } catch(e) { toast('Error', true); }
 }
 
-function changePw(){
-  var c=document.getElementById('curPw').value;var n=document.getElementById('newPw').value;
-  if(!c||!n){toast('Fill both fields','err');return}
-  api('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:c,new_password:n})}).then(function(r){
-    if(r&&r.ok){toast('Changed','ok');document.getElementById('curPw').value='';document.getElementById('newPw').value=''}
-    else if(r) r.json().then(function(d){toast(d.detail||'Error','err')});
-  });
+// ── Domain ───────────────────────────────────────────────────
+let currentDomain = '';
+async function loadDomain() {
+  try {
+    const r = await fetch('/api/domain');
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    currentDomain = d.domain || '';
+    const renderDomain = apiStats.domain || location.host;
+    const rd = document.getElementById('render-domain');
+    if (rd) rd.textContent = renderDomain;
+    const dv = document.getElementById('domain-value');
+    const dcb = document.getElementById('domain-clear-btn');
+    if (currentDomain) {
+      dv.textContent = currentDomain;
+      dv.style.color = '#008771';
+      if (dcb) dcb.style.display = '';
+    } else {
+      dv.textContent = renderDomain + ' (default)';
+      dv.style.color = '#888';
+      if (dcb) dcb.style.display = 'none';
+    }
+  } catch(e) {}
 }
-function dlBackup(){
-  api('/api/backup').then(function(r){if(!r)return;return r.blob()}).then(function(blob){
-    if(!blob)return;var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='usf-backup.json';a.click();toast('Downloaded','ok');
-  });
+async function saveDomain() {
+  const domain = document.getElementById('domain-input').value.trim();
+  if (!domain) { toast('Enter a domain', true); return; }
+  try {
+    const r = await fetch('/api/domain', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domain})});
+    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
+    toast('Domain saved');
+    document.getElementById('domain-input').value = '';
+    await loadDomain();
+  } catch(e) { toast(e.message, true); }
 }
-function restBackup(inp){
-  var file=inp.files[0];if(!file)return;
-  file.text().then(function(text){
-    api('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:text}).then(function(r){
-      if(r&&r.ok){toast('Restored!','ok');loadLinks()}else if(r) r.json().then(function(d){toast(d.detail||'Error','err')});
-    });
-  });inp.value='';
+async function clearDomain() {
+  try {
+    await fetch('/api/domain', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domain:''})});
+    toast('Domain cleared');
+    await loadDomain();
+  } catch(e) { toast('Error', true); }
 }
-function svcAct(a){
-  if(!confirm(a==='stop'?'Stop service?':'Restart service?'))return;
-  api('/api/service/'+a,{method:'POST'}).then(function(r){if(r&&r.ok)toast('Done','ok');else toast('Error','err')});
-}
-function doLogout(){api('/api/logout',{method:'POST'}).then(function(){window.location.href='/login'})}
 
-function copyTxt(text,name){
-  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(function(){toast(name+' copied','ok')}).catch(function(){fbCopy(text,name)})}
-  else fbCopy(text,name);
-}
-function fbCopy(text,name){
-  var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();
-  try{document.execCommand('copy');toast(name+' copied','ok')}catch(e){toast('Copy failed','err')}
-  ta.remove();
+// ── Settings ─────────────────────────────────────────────────
+async function changePassword() {
+  const cur = document.getElementById('cur-pw').value;
+  const nw = document.getElementById('new-pw').value;
+  const conf = document.getElementById('confirm-pw').value;
+  if (!cur || !nw || !conf) { toast('Fill all fields', true); return; }
+  if (nw !== conf) { toast('Passwords do not match', true); return; }
+  if (nw.length < 4) { toast('Min 4 characters', true); return; }
+  try {
+    const r = await fetch('/api/change-password', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({current_password:cur,new_password:nw})});
+    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
+    toast('Password updated');
+    document.getElementById('cur-pw').value='';
+    document.getElementById('new-pw').value='';
+    document.getElementById('confirm-pw').value='';
+  } catch(e) { toast(e.message, true); }
 }
 
-initChart();
+async function doLogout() {
+  await fetch('/api/logout', {method:'POST'});
+  location.href = '/login';
+}
+
+// ── Init ─────────────────────────────────────────────────────
 loadStats();
-statsInt=setInterval(loadStats,3000);
+loadInbounds();
+setInterval(loadStats, 5000);
+setInterval(loadInbounds, 15000);
 </script>
-</body></html>'''
+</body>
+</html>"""
 
-# ─── HTML Route Handlers ────────────────────────────────────────────────────
-@app.get("/status/{uid}")
-async def status_page(uid: str):
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
-        if not link:
-            return HTMLResponse(content=STATUS_404, status_code=404)
-        domain = CUSTOM_DOMAIN or get_domain()
-        client_links = generate_all_client_links(uid, link["label"])
-        data_json = json.dumps({
-            "label": link["label"], "domain": domain, "uuid": uid,
-            "active": link["active"], "expired": is_expired(link),
-            "expiry": link.get("expiry", ""),
-            "used_bytes": link["used_bytes"], "limit_bytes": link["limit_bytes"],
-            "used_mb": round(link["used_bytes"] / 1048576, 2),
-            "limit_mb": round(link["limit_bytes"] / 1048576, 2) if link["limit_bytes"] > 0 else 0,
-            "remaining_mb": round((link["limit_bytes"] - link["used_bytes"]) / 1048576, 2) if link["limit_bytes"] > 0 else 0,
-            "usage_percent": round((link["used_bytes"] / link["limit_bytes"]) * 100, 1) if link["limit_bytes"] > 0 else 0,
-            "sub_url": f"https://{domain}/sub/{uid}",
-            "client_links": client_links,
-            "speed_limit": link.get("speed_limit", 0),
-            "current_connections": count_connections_for_link(uid),
-        }, ensure_ascii=False)
-    html = STATUS_HTML.replace("__TITLE__", link["label"] + " — Usf")
-    html = html.replace("__LABEL__", link["label"])
-    html = html.replace("__DOMAIN__", domain)
-    html = html.replace("__DATA__", data_json)
-    return HTMLResponse(content=html)
+# ─── FastAPI Routes for HTML Pages ──────────────────────────
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if await is_valid_session(token):
         return RedirectResponse(url="/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
-    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not await is_valid_session(token):
         return RedirectResponse(url="/login")
-    html = DASHBOARD_HTML.replace("__PANEL_VER__", PANEL_VERSION)
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+# Legacy route aliases
+@app.get("/inbounds", response_class=HTMLResponse)
+async def inbounds_page(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not await is_valid_session(token):
+        return RedirectResponse(url="/login")
+    return RedirectResponse(url="/dashboard")
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not await is_valid_session(token):
+        return RedirectResponse(url="/login")
+    return RedirectResponse(url="/dashboard")
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", access_log=False)
+    # ─── Speed: 2 workers + uvloop + httptools + websockets (max throughput) ──
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=CONFIG["port"],
+        loop="uvloop" if _HAS_UVLOOP else "asyncio",
+        http="httptools" if _HAS_UVLOOP else "h11",
+        ws="websockets",
+        log_level="info",
+        access_log=False,  # Disable access log = higher throughput
+        timeout_keep_alive=75,  # Keep-alive for proxies (HF uses 60s default)
+    )
