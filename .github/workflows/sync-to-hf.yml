@@ -19,36 +19,111 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      - name: Push to HuggingFace Space
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install huggingface_hub
+
+      - name: Sync to HuggingFace Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # Configure git for HuggingFace
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
+          python - <<'EOF'
+          import os
+          import sys
+          from huggingface_hub import HfApi, whoami
 
-          # Clone the HuggingFace Space (or create it if it doesn't exist)
-          # Replace U1sf0014 with your HuggingFace username and usf with your Space name
-          git clone https://U1sf0014:$HF_TOKEN@huggingface.co/spaces/U1sf0014/usf hf_space || {
-            # Space doesn't exist yet — create it via API
-            curl -X POST \
-              -H "Authorization: Bearer $HF_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"type":"space","name":"usf","sdk":"docker","private":false}' \
-              https://huggingface.co/api/repos/create
-            sleep 5
-            git clone https://U1sf0014:$HF_TOKEN@huggingface.co/spaces/U1sf0014/usf hf_space
-          }
+          token = os.environ.get("HF_TOKEN")
+          if not token:
+              print("ERROR: HF_TOKEN secret is not set")
+              sys.exit(1)
 
-          # Copy all files from GitHub repo to HF Space (except .git and .github)
-          cd hf_space
-          rm -rf docs/ || true
-          cp -r ../app.py ../requirements.txt ../Dockerfile ../README.md ../LICENSE ./
-          cp -r ../docs ./docs 2>/dev/null || true
-          # Don't sync .gitignore — HF doesn't need it
-          # Don't sync .github — recursive
+          # Verify token
+          try:
+              info = whoami(token=token)
+              username = info["name"]
+              print(f"Authenticated as: {username}")
+          except Exception as e:
+              print(f"ERROR: Token verification failed: {e}")
+              sys.exit(1)
 
-          # Commit and push
-          git add .
-          git commit -m "Auto-sync from GitHub: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "Nothing to commit"
-          git push
+          space_name = "usf"
+          repo_id = f"{username}/{space_name}"
+          print(f"Target Space: {repo_id}")
+
+          api = HfApi(token=token)
+
+          # Create the Space if it doesn't exist
+          try:
+              api.create_repo(
+                  repo_id=repo_id,
+                  repo_type="space",
+                  space_sdk="docker",
+                  private=False,
+                  exist_ok=True,
+              )
+              print(f"Space ready: {repo_id}")
+          except Exception as e:
+              print(f"create_repo warning: {e}")
+
+          # Upload all files (excluding .github, .git, __pycache__)
+          import fnmatch
+          EXCLUDE = [".git", ".github", "__pycache__", "*.pyc", "docs/screenshots/landing-*"]
+          def should_include(path):
+              for pat in EXCLUDE:
+                  if fnmatch.fnmatch(path, pat) or path.startswith(pat.rstrip("*")):
+                      return False
+              return True
+
+          # Walk the workspace and collect files
+          files_to_upload = []
+          for root, dirs, files in os.walk("."):
+              # Skip excluded dirs
+              dirs[:] = [d for d in dirs if d not in [".git", ".github", "__pycache__"]]
+              for f in files:
+                  if f.endswith(".pyc"):
+                      continue
+                  full_path = os.path.join(root, f)
+                  rel_path = os.path.relpath(full_path, ".")
+                  if should_include(rel_path):
+                      files_to_upload.append((full_path, rel_path))
+
+          print(f"Uploading {len(files_to_upload)} files...")
+          for full, rel in files_to_upload:
+              print(f"  → {rel}")
+              try:
+                  api.upload_file(
+                      path_or_fileobj=full,
+                      path_in_repo=rel,
+                      repo_id=repo_id,
+                      repo_type="space",
+                      token=token,
+                  )
+              except Exception as e:
+                  print(f"    WARNING: {e}")
+
+          # Set secrets (idempotent)
+          print("Setting secrets...")
+          for key, value in [
+              ("ADMIN_USERNAME", "admin"),
+              ("ADMIN_PASSWORD", "admin"),
+              ("SECRET_KEY", "Usf-prod-secret-key-2026-do-not-change-xyz789abc123def456ghi789jkl012mno345pqr678stu901vwx234yz"),
+          ]:
+              try:
+                  api.add_space_secret(repo_id=repo_id, key=key, value=value, token=token)
+                  print(f"  ✓ {key}")
+              except Exception as e:
+                  print(f"  ⚠ {key}: {e}")
+
+          # Restart the Space to pick up changes
+          try:
+              api.restart_space(repo_id=repo_id, token=token)
+              print("✓ Space restart triggered")
+          except Exception as e:
+              print(f"⚠ Restart warning: {e}")
+
+          print(f"\n✅ Sync complete! Space URL: https://{username}-{space_name}.hf.space")
+          EOF
