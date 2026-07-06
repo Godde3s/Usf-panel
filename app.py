@@ -1,3 +1,7 @@
+#  USF Panel v2.0.0 — Backend Core
+#  (Imports through WebSocket Tunnel)
+# ============================================================
+
 import asyncio
 import json
 import os
@@ -7,12 +11,15 @@ import time
 import re
 import socket
 import sqlite3
+import uuid as _uuid_mod
 import uuid
 import threading
 import psutil
+import base64
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
+from html import escape as _hesc
 
 # ─── Speed optimizations (uvloop + orjson + httptools) ─────────────────────
 try:
@@ -39,7 +46,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Usf-Gateway")
-logger.info(f"Usf starting | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
+logger.info(f"Usf v2.0.0 starting | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
 
 app = FastAPI(title="Usf", docs_url=None, redoc_url=None)
 
@@ -48,7 +55,7 @@ CONFIG = {
     "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.0.1")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v2.0.0")
 CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
@@ -60,7 +67,6 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/usf.db")
 _DB_LOCK = threading.Lock()
 
 def db_init():
-    """Initialize the SQLite database and load saved state."""
     try:
         with _DB_LOCK, sqlite3.connect(DB_PATH) as conn:
             conn.execute("""
@@ -102,16 +108,14 @@ def db_delete(key: str):
     except Exception:
         pass
 
-# ─── Rate limiting (anti brute-force) ────────────────────────────────────────
-RATE_LIMIT = defaultdict(lambda: deque(maxlen=20))  # ip -> deque of timestamps
+# ─── Rate limiting ────────────────────────────────────────────────────────────
+RATE_LIMIT = defaultdict(lambda: deque(maxlen=20))
 RATE_LIMIT_LOCK = asyncio.Lock()
 
 async def rate_limit_check(ip: str, max_requests: int = 10, window_sec: int = 60) -> bool:
-    """Return True if request is allowed, False if rate-limited."""
     now = time.time()
     async with RATE_LIMIT_LOCK:
         dq = RATE_LIMIT[ip]
-        # Drop timestamps outside the window
         while dq and now - dq[0] > window_sec:
             dq.popleft()
         if len(dq) >= max_requests:
@@ -127,20 +131,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Anti-fingerprinting: sanitize all response headers ─────────────────────
-# Removes Server, X-Powered-By, Via, X-Forwarded-*, etc. so the panel can't
-# be fingerprinted by scanners. Also adds security headers (HSTS, CSP-lite,
-# X-Content-Type-Options, Referrer-Policy) to protect end users.
+# ─── Anti-fingerprinting middleware ──────────────────────────────────────────
 @app.middleware("http")
 async def sanitize_headers_middleware(request: Request, call_next):
     response = await call_next(request)
-    # Strip identifying headers
     for h in ("server", "x-powered-by", "via", "x-aspnet-version", "x-forwarded-host"):
         if h in response.headers:
             del response.headers[h]
-    # Force a generic Server header
     response.headers["server"] = "Usf"
-    # Security headers
     response.headers["x-content-type-options"] = "nosniff"
     response.headers["x-frame-options"] = "SAMEORIGIN"
     response.headers["referrer-policy"] = "no-referrer"
@@ -149,12 +147,14 @@ async def sanitize_headers_middleware(request: Request, call_next):
         response.headers["strict-transport-security"] = "max-age=31536000; includeSubDomains"
     return response
 
+# ─── State ───────────────────────────────────────────────────────────────────
 connections: dict = {}
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
-error_logs: deque = deque(maxlen=50)
+error_logs: deque = deque(maxlen=100)
 hourly_traffic: dict = defaultdict(int)
+connection_history: deque = deque(maxlen=500)
 http_client: httpx.AsyncClient | None = None
 
 _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
@@ -221,8 +221,6 @@ async def keep_alive():
             pass
 
 async def periodic_save():
-    """Persist links/addresses/domain/auth_hash to SQLite every 30 seconds.
-    This ensures user data survives HF Space restarts (which happen every 48h)."""
     while True:
         await asyncio.sleep(30)
         try:
@@ -241,9 +239,7 @@ async def periodic_save():
 @app.on_event("startup")
 async def startup():
     global http_client, _net_baseline, CUSTOM_DOMAIN, CUSTOM_ADDRESSES, AUTH
-    # ─── Initialize SQLite and load persisted state ──────────────────────────
     db_init()
-    # Load saved links
     saved_links = db_get("links")
     if saved_links:
         try:
@@ -253,7 +249,6 @@ async def startup():
             logger.info(f"Loaded {len(parsed)} links from SQLite")
         except Exception as e:
             logger.warning(f"Failed to load links: {e}")
-    # Load saved addresses
     saved_addrs = db_get("addresses")
     if saved_addrs:
         try:
@@ -261,11 +256,9 @@ async def startup():
                 CUSTOM_ADDRESSES = json.loads(saved_addrs)
         except Exception:
             pass
-    # Load saved domain
     saved_domain = db_get("domain")
     if saved_domain is not None:
         CUSTOM_DOMAIN = saved_domain
-    # Load saved password hash (so admin password survives restarts)
     saved_pw = db_get("auth_hash")
     if saved_pw:
         AUTH["password_hash"] = saved_pw
@@ -280,14 +273,12 @@ async def startup():
     except Exception:
         _net_baseline = {"bytes_sent": 0, "bytes_recv": 0, "ts": time.time()}
 
-    logger.info(f"Usf started on port {CONFIG['port']} | uvloop={_HAS_UVLOOP} | orjson={_HAS_ORJSON}")
+    logger.info(f"Usf v2.0.0 started on port {CONFIG['port']}")
     asyncio.create_task(keep_alive())
-    # Periodic auto-save (every 30s) — ensures traffic counters survive restarts
     asyncio.create_task(periodic_save())
 
 @app.on_event("shutdown")
 async def shutdown():
-    # Final state save before shutdown (HF restarts)
     try:
         async with LINKS_LOCK:
             links_snapshot = json.dumps(LINKS, ensure_ascii=False)
@@ -302,6 +293,8 @@ async def shutdown():
         logger.warning(f"Shutdown save failed: {e}")
     if http_client:
         await http_client.aclose()
+
+# ─── Helper Functions ────────────────────────────────────────────────────────
 
 def get_domain() -> str:
     return os.environ.get("SPACE_HOST", "localhost").replace("https://", "").replace("http://", "")
@@ -324,7 +317,7 @@ def generate_vless_link(uuid: str, remark: str = "Usf", address: str = None) -> 
         "path": path,
         "sni": domain,
         "fp": "chrome",
-        "alpn": "http/1.1",
+        "alpn": "h2,http/1.1",
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
@@ -390,7 +383,12 @@ async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
             uid = generate_uuid()
-            LINKS[uid] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True, "expiry": ""}
+            LINKS[uid] = {
+                "label": "Default", "limit_bytes": 0, "used_bytes": 0,
+                "max_connections": 0, "created_at": datetime.now().isoformat(),
+                "active": True, "expiry": "", "speed_limit": 0, "tag": "",
+                "note": ""
+            }
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -477,9 +475,10 @@ def get_net_connections_count():
     except Exception:
         return 0, 0
 
+#  USF Panel v2.0.0 — API Endpoints
 # ============================================================
-#  MAIN ENDPOINTS
-# ============================================================
+
+# ─── Main Endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root(request: Request):
@@ -494,7 +493,6 @@ async def health():
 
 @app.post("/api/login")
 async def api_login(request: Request):
-    # ─── Anti brute-force: 5 attempts per IP per 60s ─────────────────────────
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else "unknown"
     if not await rate_limit_check(client_ip, max_requests=5, window_sec=60):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a minute.")
@@ -701,6 +699,7 @@ async def get_logs(_=Depends(require_auth)):
              "connected_at": info.get("connected_at"), "bytes": info.get("bytes", 0)}
             for cid, info in connections.items()
         ],
+        "history": list(connection_history)[-50:],
     }
 
 @app.get("/api/config")
@@ -766,6 +765,9 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
                 "created_at": d.get("created_at", datetime.now().isoformat()),
                 "active": bool(d.get("active", True)),
                 "expiry": d.get("expiry", ""),
+                "speed_limit": int(d.get("speed_limit", 0) or 0),
+                "tag": str(d.get("tag", "")),
+                "note": str(d.get("note", "")),
             }
     if isinstance(body.get("addresses"), list):
         async with CUSTOM_ADDRESSES_LOCK:
@@ -778,17 +780,19 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
             CUSTOM_DOMAIN = body["domain"]
     return {"ok": True, "restored": len(LINKS)}
 
+# ─── Links/Inbounds CRUD ─────────────────────────────────────────────────────
+
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
-        raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
+        raise HTTPException(status_code=400, detail="Name must contain only English letters, numbers, and: - _ . space")
     if not label:
-        raise HTTPException(status_code=400, detail="Inbound name is required")
+        raise HTTPException(status_code=400, detail="Name is required")
     async with LINKS_LOCK:
         if any(d["label"].lower() == label.lower() for d in LINKS.values()):
-            raise HTTPException(status_code=400, detail="An inbound with this name already exists")
+            raise HTTPException(status_code=400, detail="A link with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
@@ -796,17 +800,41 @@ async def create_link(request: Request, _=Depends(require_auth)):
     if max_conn < 0:
         max_conn = 0
     expiry = compute_expiry(body.get("expiry_days"))
+    speed_limit = int(body.get("speed_limit") or 0)
+    tag = str(body.get("tag") or "")[:30]
+    note = str(body.get("note") or "")[:200]
     uid = generate_uuid()
     async with LINKS_LOCK:
-        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True, "expiry": expiry}
-    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "expiry": expiry, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"Usf-{label}")}
+        LINKS[uid] = {
+            "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+            "max_connections": max_conn, "created_at": datetime.now().isoformat(),
+            "active": True, "expiry": expiry, "speed_limit": speed_limit,
+            "tag": tag, "note": note,
+        }
+    return {
+        "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+        "max_connections": max_conn, "active": True, "expiry": expiry,
+        "created_at": LINKS[uid]["created_at"],
+        "vless_link": generate_vless_link(uid, remark=f"{label}"),
+        "speed_limit": speed_limit, "tag": tag,
+    }
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "expiry": data.get("expiry", ""), "expired": is_expired(data), "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"Usf-{data['label']}")})
+            result.append({
+                "uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"],
+                "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0),
+                "active": data["active"], "expiry": data.get("expiry", ""),
+                "expired": is_expired(data), "created_at": data["created_at"],
+                "current_connections": count_connections_for_link(uid),
+                "vless_link": generate_vless_link(uid, remark=f"{data['label']}"),
+                "speed_limit": data.get("speed_limit", 0),
+                "tag": data.get("tag", ""),
+                "note": data.get("note", ""),
+            })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
@@ -816,23 +844,19 @@ async def list_inbounds(_=Depends(require_auth)):
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
             result.append({
-                "id": uid,
-                "uuid": uid,
-                "remark": data["label"],
-                "label": data["label"],
-                "protocol": "vless",
-                "enabled": data["active"],
-                "active": data["active"],
-                "limit_bytes": data["limit_bytes"],
-                "used_bytes": data["used_bytes"],
+                "id": uid, "uuid": uid, "remark": data["label"], "label": data["label"],
+                "protocol": "vless", "enabled": data["active"], "active": data["active"],
+                "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"],
                 "total_flow": data["limit_bytes"] / 1_073_741_824 if data["limit_bytes"] > 0 else 0,
                 "max_connections": data.get("max_connections", 0),
-                "expiry": data.get("expiry", ""),
-                "expired": is_expired(data),
+                "expiry": data.get("expiry", ""), "expired": is_expired(data),
                 "created_at": data["created_at"],
                 "current_connections": count_connections_for_link(uid),
-                "vless_link": generate_vless_link(uid, remark=f"Usf-{data['label']}"),
+                "vless_link": generate_vless_link(uid, remark=f"{data['label']}"),
                 "clients": [{"id": uid, "email": data["label"]}],
+                "speed_limit": data.get("speed_limit", 0),
+                "tag": data.get("tag", ""),
+                "note": data.get("note", ""),
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"items": result, "total": len(result)}
@@ -862,6 +886,12 @@ async def patch_inbound(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        if "speed_limit" in body:
+            LINKS[uid]["speed_limit"] = int(body["speed_limit"] or 0)
+        if "tag" in body:
+            LINKS[uid]["tag"] = str(body.get("tag", ""))[:30]
+        if "note" in body:
+            LINKS[uid]["note"] = str(body.get("note", ""))[:200]
     return {"ok": True}
 
 @app.delete("/api/inbounds/{uid}")
@@ -892,6 +922,12 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        if "speed_limit" in body:
+            LINKS[uid]["speed_limit"] = int(body["speed_limit"] or 0)
+        if "tag" in body:
+            LINKS[uid]["tag"] = str(body.get("tag", ""))[:30]
+        if "note" in body:
+            LINKS[uid]["note"] = str(body.get("note", ""))[:200]
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -900,6 +936,8 @@ async def delete_link(uid: str, _=Depends(require_auth)):
         LINKS.pop(uid, None)
     await close_connections_for_link(uid)
     return {"ok": True}
+
+# ─── Domain & Addresses ──────────────────────────────────────────────────────
 
 @app.get("/api/domain")
 async def get_custom_domain(_=Depends(require_auth)):
@@ -931,7 +969,7 @@ async def add_address(request: Request, _=Depends(require_auth)):
     if not address:
         raise HTTPException(status_code=400, detail="Address is required")
     if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
-        raise HTTPException(status_code=400, detail="Address must contain only English letters, numbers, and characters: - _ .")
+        raise HTTPException(status_code=400, detail="Invalid address format")
     async with CUSTOM_ADDRESSES_LOCK:
         if address in CUSTOM_ADDRESSES:
             raise HTTPException(status_code=400, detail="Address already exists")
@@ -947,47 +985,36 @@ async def delete_address(index: int, _=Depends(require_auth)):
             raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
+# ─── Subscription ─────────────────────────────────────────────────────────────
+
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         link = LINKS.get(uid)
         if link is None:
             raise HTTPException(status_code=404, detail="link not found")
-    vless_link = generate_vless_link(uid, remark=f"Usf-{link['label']}")
+    vless_link = generate_vless_link(uid, remark=f"{link['label']}")
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     used_mb = round(used / (1024 * 1024), 2)
     limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
     remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
-    import base64
-    sub_content = f"""# Usf Subscription
-# Label: {link['label']}
-# Used: {used_mb} MB / {limit_mb if limit > 0 else 'Unlimited'} MB
-# Remaining: {remaining_mb if limit > 0 else 'Unlimited'} MB
-# Usage: {pct}%
-# Status: {'Active' if link['active'] else 'Disabled'}
-# Expiry: {link.get('expiry', '')[:10] if link.get('expiry') else 'Unlimited'}
-{vless_link}"""
+    sub_content = f"vless://{uid}@{get_domain()}:443?encryption=none&security=tls&type=ws&host={get_domain()}&path=/ws/{uid}&sni={get_domain()}&fp=chrome&alpn=h2,http/1.1#{link['label']}"
     encoded = base64.b64encode(sub_content.encode()).decode()
     return {
-        "subscription_url": f"{get_domain()}/api/links/{uid}/sub",
+        "subscription_url": f"https://{get_domain()}/sub/{uid}",
         "config": vless_link,
         "label": link["label"],
-        "used_bytes": used,
-        "limit_bytes": limit,
-        "used_mb": used_mb,
-        "limit_mb": limit_mb,
-        "remaining_mb": remaining_mb,
-        "usage_percent": pct,
+        "used_bytes": used, "limit_bytes": limit,
+        "used_mb": used_mb, "limit_mb": limit_mb,
+        "remaining_mb": remaining_mb, "usage_percent": pct,
         "active": link["active"],
-        "sub_base64": encoded,
-        "sub_text": sub_content,
+        "sub_base64": encoded, "sub_text": sub_content,
     }
 
 @app.get("/sub/{uid}")
 async def subscription_endpoint(uid: str):
-    import base64
     async with LINKS_LOCK:
         link = LINKS.get(uid)
         if link is None:
@@ -999,33 +1026,102 @@ async def subscription_endpoint(uid: str):
     async with CUSTOM_ADDRESSES_LOCK:
         addresses = list(CUSTOM_ADDRESSES)
     sub_links = []
-    server_link = generate_vless_link(uid, remark=f"Usf-{link['label']}-Server")
+    server_link = generate_vless_link(uid, remark=f"{link['label']}-Server")
     sub_links.append(server_link)
     for i, addr in enumerate(addresses):
-        remark = f"Usf-{link['label']}-IP{i+1}"
+        remark = f"{link['label']}-IP{i+1}"
         vless_link = generate_vless_link(uid, remark=remark, address=addr)
         sub_links.append(vless_link)
     sub_content = "\n".join(sub_links)
     encoded = base64.b64encode(sub_content.encode()).decode()
-    # ─── Anti-leak headers ────────────────────────────────────────────────────
-    # Don't leak any identifying headers. Use only the minimum required headers
-    # for subscription clients to work.
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": "attachment; filename=\"sub.txt\"",
         "profile-update-interval": "6",
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
-        # Anti-leak hints (interpreted by modern VLESS clients like V2rayN, Nekoray):
-        # - profile-title: friendly name
-        # - profile-web-page-url: link back to status page (no IP leak — uses domain only)
-        "profile-title": f"Usf-{link['label']}",
+        "profile-title": f"{link['label']}",
     }
     return Response(content=encoded, headers=headers)
 
-# ─── WebSocket Tunnel ──────────────────────────────────────────────────────────
+# ─── Panel Builder API ────────────────────────────────────────────────────────
 
-# ─── Speed: bigger buffer = fewer syscalls = higher throughput ───────────────
-RELAY_BUF = 512 * 1024  # 512 KB (was 64 KB) — ~30% throughput boost on fast links
+@app.post("/api/panel-builder/deploy")
+async def panel_builder_deploy(request: Request, _=Depends(require_auth)):
+    """Deploy a new USF panel to the user's HuggingFace Space."""
+    try:
+        from huggingface_hub import HfApi, SpaceHardware
+    except ImportError:
+        raise HTTPException(status_code=500, detail="huggingface_hub not installed on this Space")
+
+    body = await request.json()
+    hf_token = (body.get("hf_token") or "").strip()
+    space_name = (body.get("space_name") or "").strip().lower()
+    admin_user = (body.get("admin_username") or "admin").strip()[:30]
+    admin_pass = (body.get("admin_password") or "admin").strip()
+    secret_key = secrets.token_urlsafe(32)
+
+    if not hf_token:
+        raise HTTPException(status_code=400, detail="HuggingFace token is required")
+    if not space_name or not re.match(r'^[a-z0-9][a-z0-9\-_.]{0,98}[a-z0-9]$', space_name):
+        raise HTTPException(status_code=400, detail="Invalid space name (lowercase, alphanumeric, hyphens)")
+    if len(admin_pass) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+
+    try:
+        api = HfApi(token=hf_token)
+        repo_id = f"{api.whoami()['name']}/{space_name}"
+
+        # Read current app.py as template
+        import inspect
+        caller_file = inspect.getfile(lambda: None)
+        with open(caller_file, 'r', encoding='utf-8') as f:
+            app_code = f.read()
+
+        dockerfile = """FROM python:3.11-slim
+RUN pip install --no-cache-dir fastapi uvicorn httpx psutil httptools uvloop orjson huggingface_hub
+COPY app.py .
+EXPOSE 7860
+CMD ["python", "app.py"]
+"""
+        readme = f"""---
+title: "{space_name}"
+sdk: docker
+app_port: 7860
+---
+"""
+        api.create_repo(repo_id=repo_id, repo_type="space", exist_ok=True, space_sdk="docker")
+        api.upload_file(
+            path_or_fileobj=app_code.encode('utf-8'),
+            path_in_repo="app.py",
+            repo_id=repo_id,
+            repo_type="space",
+        )
+        api.upload_file(
+            path_or_fileobj=dockerfile.encode('utf-8'),
+            path_in_repo="Dockerfile",
+            repo_id=repo_id,
+            repo_type="space",
+        )
+        api.upload_file(
+            path_or_fileobj=readme.encode('utf-8'),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="space",
+        )
+
+        return {
+            "ok": True,
+            "space_url": f"https://huggingface.co/spaces/{repo_id}",
+            "app_url": f"https://{repo_id.split('/')[1]}.hf.space",
+            "repo_id": repo_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+#  USF Panel v2.0.0 — WebSocket Tunnel (unchanged core)
+# ============================================================
+
+RELAY_BUF = 512 * 1024
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -1103,10 +1199,6 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
-    # Simple accept — let uvicorn auto-negotiate compression with the client.
-    # Forcing a Sec-WebSocket-Extensions header here would tell the client
-    # "I'm compressing" while we actually send uncompressed frames, which
-    # breaks VLESS clients that strictly follow the RFC.
     await websocket.accept()
     writer = None
     conn_id = None
@@ -1136,18 +1228,25 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
         connection_sockets[conn_id] = websocket
         link_ip_map[uuid].add(client_ip)
+
+        # Connection history
+        async with LINKS_LOCK:
+            link_label = LINKS.get(uuid, {}).get("label", "?")
+        connection_history.append({
+            "time": datetime.now().isoformat(), "uuid": uuid[:8],
+            "label": link_label, "ip": client_ip, "target": f"{address}:{port}",
+        })
+
         size = len(first_chunk)
         stats["total_bytes"] += size; stats["total_requests"] += 1
         connections[conn_id]["bytes"] += size
         hourly_traffic[datetime.now().strftime("%H:00")] += size
         await add_usage(uuid, size)
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
-        # ─── Speed: TCP_NODELAY disables Nagle's algorithm = lower latency for small packets
         try:
             sock = writer.get_extra_info('socket')
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # Increase send/recv buffers for higher throughput
                 try:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
@@ -1185,44 +1284,259 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                     if not has_other:
                         remove_ip_from_link(uid, ip)
 
-# ─── Subscription Status Page (Premium) ──────────────────────────────────────
+#  USF Panel v2.0.0 — Status Page Function
+# ============================================================
+
+STATUS_404_HTML = r'''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>لینک نامعتبر</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;font-family:system-ui,-apple-system,sans-serif}
+.box{background:rgba(20,27,45,0.7);backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);
+border-radius:24px;padding:48px 36px;text-align:center;max-width:400px;width:100%;
+box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
+.icon{width:56px;height:56px;border-radius:50%;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.2);
+display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
+.icon svg{width:24px;height:24px;stroke:#ef4444;fill:none;stroke-width:2}
+h1{color:#f1f5f9;font-size:18px;margin-bottom:8px;font-weight:700}
+p{color:#94a3b8;font-size:13px;line-height:1.7}
+</style></head><body>
+<div class="box">
+<div class="icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div>
+<h1>لینک نامعتبر است</h1>
+<p>این اشتراک وجود ندارد یا حذف شده است.</p>
+</div></body></html>'''
+
+STATUS_HTML_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f1a" id="meta-theme">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#0b0f1a;--card:rgba(15,23,42,0.6);--glass:rgba(255,255,255,0.04);--accent:#6366f1;--accent2:#818cf8;
+--accent-soft:rgba(99,102,241,0.12);--accent-glow:rgba(99,102,241,0.3);--text:#f1f5f9;--text2:#cbd5e1;
+--text3:#94a3b8;--text4:#64748b;--border:rgba(99,102,241,0.18);--border-s:rgba(255,255,255,0.06);
+--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--radius:16px}
+html[data-theme="light"]{--bg:#f1f5f9;--card:rgba(255,255,255,0.8);--glass:rgba(0,0,0,0.03);
+--text:#0f172a;--text2:#334155;--text3:#64748b;--text4:#94a3b8;--border:rgba(99,102,241,0.25);--border-s:rgba(0,0,0,0.06)}
+html,body{height:100%}
+body{font-family:'Vazirmatn',system-ui,-apple-system,sans-serif;background:var(--bg);
+background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(99,102,241,0.12),transparent 60%),radial-gradient(ellipse 60% 40% at 80% 100%,rgba(139,92,246,0.08),transparent 50%);
+background-attachment:fixed;min-height:100vh;min-height:100dvh;display:flex;justify-content:center;align-items:center;
+padding:20px;color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+.card{background:var(--card);backdrop-filter:blur(32px) saturate(180%);-webkit-backdrop-filter:blur(32px) saturate(180%);
+max-width:480px;width:100%;padding:28px 24px;border-radius:24px;border:1px solid var(--border);
+box-shadow:0 30px 60px -15px rgba(0,0,0,0.5),0 0 0 1px rgba(255,255,255,0.03) inset;
+position:relative;overflow:hidden;animation:cardIn .6s cubic-bezier(.16,1,.3,1)}
+@keyframes cardIn{from{opacity:0;transform:translateY(20px) scale(.97)}to{opacity:1;transform:none}}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+background:linear-gradient(90deg,transparent,var(--accent) 30%,#a78bfa 50%,var(--accent) 70%,transparent);opacity:.6;pointer-events:none}
+.theme-btn{position:absolute;top:14px;left:14px;width:34px;height:34px;border-radius:50%;background:var(--glass);
+border:1px solid var(--border-s);color:var(--text3);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .25s;z-index:2}
+.theme-btn:hover{background:var(--accent-soft);color:var(--accent)}
+.theme-btn svg{width:16px;height:16px}
+.theme-btn .sun{display:none}
+html[data-theme="light"] .theme-btn .sun{display:block}
+html[data-theme="light"] .theme-btn .moon{display:none}
+.header{text-align:center;margin-bottom:20px;position:relative;z-index:1}
+.logo-text{font-size:28px;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--text),var(--accent2));
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.label-chip{display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:5px 14px;background:var(--glass);
+border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--text2);max-width:90%;word-break:break-word}
+.status-banner{display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 16px;border-radius:var(--radius);
+margin-bottom:18px;font-size:13px;font-weight:600;__STATUS_STYLE__}
+.status-dot{width:8px;height:8px;border-radius:50%;__DOT_STYLE__;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+.sub-section{margin:16px 0;padding:16px;background:linear-gradient(135deg,var(--accent-soft),rgba(99,102,241,0.02));
+border:1px solid var(--border);border-radius:var(--radius);position:relative;z-index:1}
+.sec-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);margin-bottom:8px;
+font-weight:700;display:flex;align-items:center;gap:6px}
+.sec-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 2.5s ease-in-out infinite}
+.sub-row{display:flex;align-items:stretch;gap:8px}
+.sub-link{flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:11px;color:var(--accent);text-decoration:none;
+background:rgba(0,0,0,0.3);padding:10px 12px;border-radius:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+direction:ltr;transition:all .2s;border:1px solid rgba(99,102,241,0.12);display:flex;align-items:center;gap:6px}
+html[data-theme="light"] .sub-link{background:rgba(0,0,0,0.04)}
+.sub-link:hover{background:var(--accent-soft);border-color:rgba(99,102,241,0.35)}
+.btn{border:none;font-family:inherit;font-weight:600;border-radius:10px;cursor:pointer;transition:all .2s;
+display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:12px;padding:10px 14px;white-space:nowrap}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
+.client-grid{margin-top:12px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.client-chip{display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px;border-radius:10px;
+text-decoration:none;background:var(--glass);border:1px solid var(--border-s);transition:all .2s;
+font-size:9.5px;color:var(--text3);font-weight:600}
+.client-chip:hover{background:var(--accent-soft);border-color:var(--border);color:var(--accent);transform:translateY(-1px)}
+.ci{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;
+font-size:10px;font-weight:800;color:#fff;letter-spacing:-.02em}
+.ci-v2n{background:#5b8def}.ci-v2g{background:#22c55e}.ci-str{background:#ff6b6b}
+.ci-sr{background:#1e293b}.ci-fox{background:#f97316}.ci-bull{background:#8b5cf6}
+.ci-npv{background:#06b6d4}.ci-hid{background:#ec4899}.ci-mah{background:#14b8a6}
+.gauge-section{margin:20px 0;display:flex;flex-direction:column;align-items:center;position:relative;z-index:1}
+.gauge-wrap{position:relative;width:140px;height:140px;margin-bottom:6px}
+.gauge-svg{width:100%;height:100%;transform:rotate(-90deg)}
+.gauge-track{fill:none;stroke:rgba(255,255,255,0.05);stroke-width:8}
+html[data-theme="light"] .gauge-track{stroke:rgba(0,0,0,0.06)}
+.gauge-fill{fill:none;stroke:url(#gGrad);stroke-width:8;stroke-linecap:round;stroke-dasharray:377;stroke-dashoffset:377;
+transition:stroke-dashoffset 1.2s cubic-bezier(.16,1,.3,1);filter:drop-shadow(0 0 6px var(--accent-glow))}
+.gauge-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gauge-pct{font-size:28px;font-weight:800;color:var(--text);letter-spacing:-.02em;line-height:1}
+.gauge-pct .pct-s{font-size:16px;color:var(--text3);font-weight:600;margin-left:1px}
+.gauge-lbl{font-size:10px;color:var(--text3);margin-top:2px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.gauge-stats{display:flex;gap:16px;margin-top:6px;flex-wrap:wrap;justify-content:center}
+.gs{text-align:center}
+.gs .gv{font-family:ui-monospace,monospace;font-size:12px;font-weight:700;color:var(--text);direction:ltr}
+.gs .gl{font-size:9px;color:var(--text3);margin-top:1px;text-transform:uppercase;letter-spacing:.05em}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0;position:relative;z-index:1}
+.info-card{background:var(--glass);border:1px solid var(--border-s);border-radius:12px;padding:11px 12px;transition:all .2s}
+.info-card:hover{background:var(--accent-soft);border-color:var(--border)}
+.info-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);margin-bottom:3px;font-weight:700}
+.info-val{font-size:13px;color:var(--text);font-weight:700;direction:ltr;unicode-bidi:embed}
+.info-val.sm{font-size:11px}
+.config-sec{margin-top:14px;position:relative;z-index:1}
+.config-box{background:rgba(0,0,0,0.35);border:1px solid var(--border-s);border-radius:10px;padding:10px 12px;
+font-family:ui-monospace,monospace;font-size:10.5px;color:var(--text2);word-break:break-all;direction:ltr;
+text-align:left;max-height:72px;overflow-y:auto;line-height:1.5}
+html[data-theme="light"] .config-box{background:rgba(0,0,0,0.03)}
+.config-box::-webkit-scrollbar{width:4px}
+.config-box::-webkit-scrollbar-thumb{background:rgba(99,102,241,0.3);border-radius:2px}
+.btn-row{display:flex;gap:6px;margin-top:6px}
+.btn-row .btn{flex:1}
+.btn-ghost{background:var(--glass);color:var(--text2);border:1px solid var(--border-s)}
+.btn-ghost:hover{border-color:var(--border);color:var(--text)}
+.footer{text-align:center;font-size:10px;color:var(--text4);margin-top:18px;padding-top:14px;
+border-top:1px solid var(--border-s);display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;position:relative;z-index:1}
+.badge{background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:999px;font-size:10px;font-weight:700}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);
+background:rgba(15,23,42,0.95);backdrop-filter:blur(16px);color:#fff;padding:11px 20px;border-radius:999px;
+font-size:12px;font-weight:500;border:1px solid var(--border);box-shadow:0 14px 36px rgba(0,0,0,0.5);
+opacity:0;transition:all .4s cubic-bezier(.4,0,.2,1);z-index:1000;pointer-events:none;max-width:90vw}
+html[data-theme="light"] .toast{background:rgba(15,23,42,0.92)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.countdown{font-family:ui-monospace,monospace;font-weight:700;color:var(--text);direction:ltr}
+@media(max-width:560px){body{padding:0;align-items:flex-start}
+.card{border-radius:0;min-height:100vh;min-height:100dvh;padding:24px 16px;padding-top:max(24px,env(safe-area-inset-top));padding-bottom:max(24px,env(safe-area-inset-bottom))}
+.info-grid{grid-template-columns:1fr 1fr;gap:6px}.sub-row{flex-direction:column}.sub-link{width:100%}
+.logo-text{font-size:24px}.gauge-wrap{width:120px;height:120px}.gauge-pct{font-size:24px}}
+@media(max-width:380px){.info-grid{grid-template-columns:1fr}.client-grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <button class="theme-btn" onclick="toggleTheme()">
+    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+  </button>
+  <div class="header">
+    <div class="logo-text">Usf</div>
+    <div class="label-chip">__LABEL__</div>
+  </div>
+  <div class="status-banner">
+    <span class="status-dot"></span>
+    __STATUS_TEXT__
+  </div>
+  <div class="sub-section">
+    <div class="sec-label"><span class="sec-dot"></span>لینک اشتراک</div>
+    <div class="sub-row">
+      <a href="__SUB_URL__" class="sub-link" target="_blank" title="__SUB_URL__">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        <span>__SUB_URL__</span>
+      </a>
+      <button class="btn btn-primary" onclick="copySub()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        کپی
+      </button>
+    </div>
+    <div class="client-grid">
+      <a class="client-chip" href="v2rayn://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2n">N</span><span>V2RayN</span></a>
+      <a class="client-chip" href="v2rayng://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2g">G</span><span>V2RayNG</span></a>
+      <a class="client-chip" href="streisand://import/__SUB_URL_ENC__"><span class="ci ci-str">S</span><span>Streisand</span></a>
+      <a class="client-chip" href="shadowrocket://add/sub://__SUB_URL_B64__"><span class="ci ci-sr">SR</span><span>Shadowrocket</span></a>
+      <a class="client-chip" href="foxray://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-fox">F</span><span>Foxray</span></a>
+      <a class="client-chip" href="npv://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-npv">N</span><span>Npv</span></a>
+      <a class="client-chip" href="hiddify://import/__SUB_URL_ENC__"><span class="ci ci-hid">H</span><span>Hiddify</span></a>
+      <a class="client-chip" href="mahsa://import/__SUB_URL_ENC__"><span class="ci ci-mah">M</span><span>Mahsang</span></a>
+      <a class="client-chip" href="bullshit://install/__SUB_URL_ENC__"><span class="ci ci-bull">B</span><span>BS Client</span></a>
+    </div>
+  </div>
+  <div class="gauge-section">
+    <div class="gauge-wrap">
+      <svg class="gauge-svg" viewBox="0 0 140 140">
+        <defs><linearGradient id="gGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#22c55e"/><stop offset="50%" stop-color="#6366f1"/><stop offset="100%" stop-color="#ef4444"/>
+        </linearGradient></defs>
+        <circle class="gauge-track" cx="70" cy="70" r="60"/>
+        <circle class="gauge-fill" id="gf" cx="70" cy="70" r="60"/>
+      </svg>
+      <div class="gauge-center">
+        <div class="gauge-pct"><span id="pn">0</span><span class="pct-s">%</span></div>
+        <div class="gauge-lbl">مصرف حجم</div>
+      </div>
+    </div>
+    <div class="gauge-stats">
+      <div class="gs"><div class="gv">__USED__</div><div class="gl">مصرف‌شده</div></div>
+      <div class="gs"><div class="gv">__REMAIN__</div><div class="gl">باقی‌مانده</div></div>
+      <div class="gs"><div class="gv">__LIMIT__</div><div class="gl">کل سهمیه</div></div>
+    </div>
+  </div>
+  <div class="info-grid">
+    <div class="info-card"><div class="info-lbl">اتصال همزمان</div><div class="info-val">__MAXCONN__</div></div>
+    <div class="info-card"><div class="info-lbl">تاریخ انقضا</div><div class="info-val sm">__EXPIRY__</div></div>
+    <div class="info-card" style="grid-column:1/-1"><div class="info-lbl">زمان باقی‌مانده</div><div class="info-val countdown" id="cd" data-exp="__EXP_EPOCH__">__REMAIN_TIME__</div></div>
+  </div>
+  <div class="config-sec">
+    <div class="sec-label" style="margin-bottom:6px">کانفیگ VLESS</div>
+    <div class="config-box" id="cfg">__VLESS__</div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="copyCfg()">کپی کانفیگ</button>
+      <button class="btn btn-ghost" onclick="dlCfg()">دانلود</button>
+    </div>
+  </div>
+  <div class="footer">
+    <span class="badge">Usf __VERSION__</span>
+    <span style="color:__STATUS_COLOR__;font-weight:600">__STATUS_TEXT__</span>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var SU="__SUB_URL_JSON__",VL="__VLESS_JSON__",PC=__PCT_NUM__;
+function applyTheme(t){document.documentElement.setAttribute('data-theme',t);try{localStorage.setItem('usf-t',t)}catch(e){}}
+function toggleTheme(){var c=document.documentElement.getAttribute('data-theme')||'dark';applyTheme(c==='dark'?'light':'dark')}
+(function(){var s;try{s=localStorage.getItem('usf-t')}catch(e){}if(!s){s=window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark'}applyTheme(s)})();
+(function(){var f=document.getElementById('gf'),p=document.getElementById('pn'),C=2*Math.PI*60,t=Math.max(0,Math.min(100,PC)),st=null;
+function step(ts){if(!st)st=ts;var pr=Math.min(1,(ts-st)/1200),e=1-Math.pow(1-pr,3);f.style.strokeDashoffset=(C*(1-t*e/100)).toFixed(2);p.textContent=Math.round(t*e);if(pr<1)requestAnimationFrame(step)}requestAnimationFrame(step)})();
+(function(){var el=document.getElementById('cd');if(!el)return;var exp=parseInt(el.dataset.exp,10);if(!exp)return;
+function tick(){var d=exp-Math.floor(Date.now()/1000);if(d<=0){el.textContent='منقضی شده';el.style.color='var(--red)';return}
+var dd=Math.floor(d/86400),h=Math.floor((d%86400)/3600),m=Math.floor((d%3600)/60),s=d%60,txt='';if(dd>0)txt+=dd+' روز و ';
+txt+=(h<10?'0':'')+h+':';txt+=(m<10?'0':'')+m+':';txt+=(s<10?'0':'')+s;el.textContent=txt}tick();setInterval(tick,1000)})();
+function copySub(){navigator.clipboard.writeText(SU).then(function(){showToast('لینک اشتراک کپی شد')}).catch(function(){showToast('کپی ناموفق',true)})}
+function copyCfg(){navigator.clipboard.writeText(VL).then(function(){showToast('کانفیگ کپی شد')}).catch(function(){showToast('کپی ناموفق',true)})}
+function dlCfg(){try{var b=new Blob([VL],{type:'text/plain;charset=utf-8'}),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='__LABEL_SAFE__.txt';document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(u);showToast('دانلود شد')}catch(e){showToast('خطا',true)}}
+var _tt;function showToast(m,e){var t=document.getElementById('toast');t.textContent=m;t.style.borderColor=e?'rgba(239,68,68,0.4)':'var(--border)';t.classList.add('show');clearTimeout(_tt);_tt=setTimeout(function(){t.classList.remove('show')},2500)}
+</script>
+</body></html>'''
+
 
 @app.get("/status/{uuid}", response_class=HTMLResponse)
 async def subscription_status(uuid: str):
     async with LINKS_LOCK:
         link_data = LINKS.get(uuid)
         if link_data is None:
-            return HTMLResponse(
-                content='''<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>لینک نامعتبر</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,sans-serif}
-body{background:#0a0e1a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.box{background:rgba(20,27,45,0.65);backdrop-filter:blur(20px);border:1px solid rgba(245,197,66,0.18);
-border-radius:24px;padding:48px 36px;text-align:center;max-width:420px;width:100%;
-box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)}
-.icon{font-size:48px;margin-bottom:14px}
-h1{color:#f5c542;font-size:20px;margin-bottom:8px;font-weight:700}
-p{color:#94a3b8;font-size:14px;line-height:1.7}
-a{color:#f5c542;text-decoration:none;font-size:13px;margin-top:14px;display:inline-block;border-bottom:1px dashed rgba(245,197,66,0.4)}
-</style></head><body>
-<div class="box"><div class="icon">⚠️</div><h1>لینک نامعتبر است</h1>
-<p>این اشتراک وجود ندارد یا حذف شده است.<br>لطفاً با مدیر سرویس تماس بگیرید.</p>
-<a href="/">→ بازگشت به خانه</a></div></body></html>''',
-                status_code=404
-            )
+            return HTMLResponse(content=STATUS_404_HTML, status_code=404)
 
     used_bytes = int(link_data.get("used_bytes", 0))
     limit_bytes = int(link_data.get("limit_bytes", 0))
     remaining_bytes = max(0, limit_bytes - used_bytes) if limit_bytes > 0 else 0
-    vless_link = generate_vless_link(uuid, remark=f"Usf-{link_data['label']}")
-    # Build a fully-qualified https:// subscription URL (HuggingFace runs over HTTPS).
     _domain = get_domain()
     sub_url = f"https://{_domain}/sub/{uuid}" if _domain and _domain != "localhost" else f"/sub/{uuid}"
     percent = min(100, (used_bytes / limit_bytes) * 100) if limit_bytes > 0 else 0
 
-    # Build remaining / expiry display
     used_str = fmt_bytes(used_bytes)
     limit_str = fmt_bytes(limit_bytes) if limit_bytes > 0 else "نامحدود"
     remaining_str = fmt_bytes(remaining_bytes) if limit_bytes > 0 else "نامحدود"
@@ -1238,583 +1552,54 @@ a{color:#f5c542;text-decoration:none;font-size:13px;margin-top:14px;display:inli
         except (TypeError, ValueError):
             expiry_raw = ''
 
-    label = link_data.get('label', 'بدون برچسب')
+    label = link_data.get('label', 'بدون نام')
     max_conn = link_data.get('max_connections', 0)
     is_active = bool(link_data.get('active', False))
     is_exp = is_expired(link_data)
     status_text = 'فعال' if (is_active and not is_exp) else ('منقضی' if is_exp else 'غیرفعال')
-    status_class = 'on' if (is_active and not is_exp) else 'off'
+    status_color = '#22c55e' if (is_active and not is_exp) else ('#ef4444' if is_exp else '#f59e0b')
 
-    html_template = '''<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#0a0e1a" id="meta-theme">
-<title>اشتراک Usf · __LABEL__</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{
-  --bg:#080b14;
-  --bg-grad-1:rgba(245,197,66,0.13);
-  --bg-grad-2:rgba(99,102,241,0.10);
-  --card:rgba(20,27,45,0.55);
-  --card-2:rgba(255,255,255,0.025);
-  --glass:rgba(255,255,255,0.04);
-  --accent:#f5c542;
-  --accent-2:#ffd76b;
-  --accent-soft:rgba(245,197,66,0.12);
-  --accent-glow:rgba(245,197,66,0.35);
-  --text:#f8fafc;
-  --text-2:#cbd5e1;
-  --text-3:#94a3b8;
-  --text-4:#64748b;
-  --border:rgba(245,197,66,0.18);
-  --border-soft:rgba(255,255,255,0.06);
-  --success:#22c55e;
-  --success-soft:rgba(34,197,94,0.12);
-  --danger:#ef4444;
-  --warn:#f59e0b;
-  --shadow-card:0 30px 60px -15px rgba(0,0,0,0.7),0 0 0 1px rgba(255,255,255,0.04) inset,0 0 80px rgba(245,197,66,0.05);
-}
-html[data-theme="light"]{
-  --bg:#f5f7fb;
-  --bg-grad-1:rgba(245,197,66,0.18);
-  --bg-grad-2:rgba(99,102,241,0.10);
-  --card:rgba(255,255,255,0.75);
-  --card-2:rgba(255,255,255,0.5);
-  --glass:rgba(0,0,0,0.02);
-  --text:#0f172a;
-  --text-2:#334155;
-  --text-3:#64748b;
-  --text-4:#94a3b8;
-  --border:rgba(245,197,66,0.3);
-  --border-soft:rgba(0,0,0,0.06);
-  --shadow-card:0 30px 60px -15px rgba(99,102,241,0.18),0 0 0 1px rgba(0,0,0,0.02) inset,0 0 80px rgba(245,197,66,0.10);
-}
-html,body{height:100%}
-body{
-  font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
-  background:var(--bg);
-  background-image:
-    radial-gradient(ellipse 90% 60% at 50% -10%, var(--bg-grad-1), transparent 60%),
-    radial-gradient(ellipse 60% 50% at 100% 100%, var(--bg-grad-2), transparent 60%),
-    radial-gradient(ellipse 60% 50% at 0% 100%, rgba(34,197,94,0.06), transparent 60%);
-  background-attachment:fixed;
-  min-height:100vh;min-height:100dvh;
-  display:flex;justify-content:center;align-items:center;
-  padding:24px;color:var(--text);line-height:1.55;
-  -webkit-font-smoothing:antialiased;
-}
-.card{
-  background:var(--card);
-  backdrop-filter:blur(28px) saturate(180%);
-  -webkit-backdrop-filter:blur(28px) saturate(180%);
-  max-width:520px;width:100%;
-  padding:32px 28px;
-  border-radius:28px;
-  border:1px solid var(--border);
-  box-shadow:var(--shadow-card);
-  position:relative;overflow:hidden;
-  animation:cardIn .7s cubic-bezier(.16,1,.3,1);
-}
-@keyframes cardIn{from{opacity:0;transform:translateY(24px) scale(.96)}to{opacity:1;transform:none}}
-.card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,transparent,var(--accent) 30%,#ffd76b 50%,var(--accent) 70%,transparent);
-  opacity:.7;pointer-events:none;
-}
-.card::after{
-  content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
-  background:conic-gradient(from 0deg at 50% 50%,transparent 0deg,var(--accent-glow) 60deg,transparent 120deg,transparent 360deg);
-  opacity:.04;animation:spin 18s linear infinite;pointer-events:none;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* Theme toggle (top-right) */
-.theme-toggle{
-  position:absolute;top:16px;left:16px;
-  width:38px;height:38px;border-radius:50%;
-  background:var(--glass);border:1px solid var(--border-soft);
-  color:var(--text-2);cursor:pointer;
-  display:flex;align-items:center;justify-content:center;
-  transition:all .25s;z-index:2;
-}
-.theme-toggle:hover{background:var(--accent-soft);color:var(--accent);transform:rotate(15deg)}
-.theme-toggle svg{width:18px;height:18px}
-.theme-toggle .sun{display:none}
-html[data-theme="light"] .theme-toggle .sun{display:block}
-html[data-theme="light"] .theme-toggle .moon{display:none}
-
-/* Header */
-.header{text-align:center;margin-bottom:24px;position:relative;z-index:1}
-.logo-wrap{position:relative;width:80px;height:80px;margin:0 auto 12px}
-.logo-ring{position:absolute;inset:-4px;border-radius:50%;background:conic-gradient(from 0deg,var(--accent),var(--accent-2),#22c55e,var(--accent));animation:spin 8s linear infinite;filter:blur(6px);opacity:.55}
-.logo{
-  position:relative;width:80px;height:80px;border-radius:50%;
-  background:linear-gradient(135deg,var(--accent),#e6b422);
-  display:flex;align-items:center;justify-content:center;
-  color:#0a0e1a;font-size:36px;font-weight:800;
-  box-shadow:0 12px 30px var(--accent-glow),inset 0 -4px 12px rgba(0,0,0,0.15);
-}
-.title{font-size:24px;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--text),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
-.label-chip{
-  display:inline-flex;align-items:center;gap:6px;margin-top:8px;
-  padding:7px 16px;background:var(--glass);border:1px solid var(--border);
-  border-radius:999px;font-size:13px;color:var(--text-2);
-  max-width:90%;word-break:break-word;
-}
-.label-chip .pin{color:var(--accent)}
-
-/* Sub URL section — the headline */
-.sub-section{
-  margin:20px 0;padding:18px;
-  background:linear-gradient(135deg,var(--accent-soft),rgba(245,197,66,0.02));
-  border:1px solid var(--border);border-radius:18px;
-  position:relative;z-index:1;
-}
-.section-label{
-  font-size:10px;text-transform:uppercase;letter-spacing:.12em;
-  color:var(--text-3);margin-bottom:10px;font-weight:700;
-  display:flex;align-items:center;gap:7px;
-}
-.section-label::before{
-  content:'';width:6px;height:6px;border-radius:50%;
-  background:var(--accent);box-shadow:0 0 10px var(--accent);
-  animation:pulseDot 2.5s ease-in-out infinite;
-}
-@keyframes pulseDot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
-.sub-row{display:flex;align-items:stretch;gap:8px}
-.sub-link{
-  flex:1;min-width:0;
-  font-family:'Courier New',monospace;font-size:11.5px;
-  color:var(--accent);text-decoration:none;
-  background:rgba(0,0,0,0.35);padding:12px 14px;border-radius:12px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  direction:ltr;transition:all .2s;
-  border:1px solid rgba(245,197,66,0.15);
-  display:flex;align-items:center;gap:8px;
-}
-html[data-theme="light"] .sub-link{background:rgba(255,255,255,0.6)}
-.sub-link:hover{background:rgba(245,197,66,0.12);border-color:rgba(245,197,66,0.4)}
-.sub-link:active{transform:scale(.98)}
-.sub-link .ext-icon{flex-shrink:0;opacity:.7}
-.btn{
-  border:none;font-family:inherit;font-weight:600;border-radius:12px;
-  cursor:pointer;transition:all .2s;
-  display:inline-flex;align-items:center;justify-content:center;gap:7px;
-  font-size:13px;padding:12px 16px;white-space:nowrap;
-}
-.btn-primary{background:var(--accent);color:#0a0e1a}
-.btn-primary:hover{background:var(--accent-2);transform:translateY(-1px);box-shadow:0 8px 20px var(--accent-glow)}
-.btn-primary:active{transform:translateY(0)}
-.btn-open{
-  width:100%;margin-top:10px;
-  background:var(--success-soft);color:var(--success);
-  border:1px solid rgba(34,197,94,0.25);text-decoration:none;padding:12px 16px;
-}
-.btn-open:hover{background:rgba(34,197,94,0.22);transform:translateY(-1px)}
-
-/* Deep-link client chips */
-.client-row{
-  margin-top:14px;display:grid;
-  grid-template-columns:repeat(3,1fr);gap:8px;
-}
-.client-chip{
-  display:flex;flex-direction:column;align-items:center;gap:4px;
-  padding:10px 6px;border-radius:12px;text-decoration:none;
-  background:var(--glass);border:1px solid var(--border-soft);
-  transition:all .2s;font-size:10.5px;color:var(--text-3);font-weight:600;
-}
-.client-chip:hover{background:var(--accent-soft);border-color:var(--border);color:var(--accent);transform:translateY(-1px)}
-.client-chip:active{transform:translateY(0)}
-.client-chip .ci{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff}
-.ci-v2n{background:#5b8def}.ci-v2g{background:#22c55e}.ci-str{background:#ff6b6b}
-.ci-sr{background:#1e293b}.ci-fox{background:#f97316}.ci-bull{background:#8b5cf6}
-.client-chip span{display:block;text-align:center;line-height:1.2}
-
-/* Gauge + Progress */
-.gauge-section{margin:24px 0;display:flex;flex-direction:column;align-items:center;position:relative;z-index:1}
-.gauge-wrap{position:relative;width:160px;height:160px;margin-bottom:8px}
-.gauge-svg{width:100%;height:100%;transform:rotate(-90deg)}
-.gauge-track{fill:none;stroke:rgba(255,255,255,0.05);stroke-width:10}
-html[data-theme="light"] .gauge-track{stroke:rgba(0,0,0,0.06)}
-.gauge-fill{
-  fill:none;stroke:url(#gaugeGrad);stroke-width:10;stroke-linecap:round;
-  stroke-dasharray:440;stroke-dashoffset:440;
-  transition:stroke-dashoffset 1.2s cubic-bezier(.16,1,.3,1);
-  filter:drop-shadow(0 0 8px var(--accent-glow));
-}
-.gauge-center{
-  position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;
-}
-.gauge-pct{font-size:32px;font-weight:800;color:var(--text);letter-spacing:-.02em;line-height:1}
-.gauge-pct .pct-sign{font-size:18px;color:var(--text-3);font-weight:600;margin-left:2px}
-.gauge-label{font-size:11px;color:var(--text-3);margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
-.gauge-stats{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap;justify-content:center}
-.gstat{text-align:center}
-.gstat .gv{font-family:'Courier New',monospace;font-size:13px;font-weight:700;color:var(--text);direction:ltr}
-.gstat .gl{font-size:10px;color:var(--text-3);margin-top:2px;text-transform:uppercase;letter-spacing:.06em}
-
-/* Info grid */
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0;position:relative;z-index:1}
-.info-card{
-  background:var(--glass);border:1px solid var(--border-soft);
-  border-radius:14px;padding:13px 14px;transition:all .2s;
-}
-.info-card:hover{background:var(--accent-soft);border-color:var(--border)}
-.info-label{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--text-3);margin-bottom:5px;font-weight:700;display:flex;align-items:center;gap:6px}
-.info-value{font-size:14px;color:var(--text);font-weight:700;direction:ltr;unicode-bidi:embed}
-.info-value.small{font-size:12px}
-
-/* Config */
-.config-section{margin-top:16px;position:relative;z-index:1}
-.config-box{
-  background:rgba(0,0,0,0.4);border:1px solid var(--border-soft);
-  border-radius:12px;padding:12px 14px;
-  font-family:'Courier New',monospace;font-size:11px;color:var(--text-2);
-  word-break:break-all;direction:ltr;text-align:left;
-  max-height:84px;overflow-y:auto;line-height:1.6;
-}
-html[data-theme="light"] .config-box{background:rgba(0,0,0,0.04)}
-.config-box::-webkit-scrollbar{width:5px}
-.config-box::-webkit-scrollbar-track{background:transparent}
-.config-box::-webkit-scrollbar-thumb{background:rgba(245,197,66,0.3);border-radius:3px}
-
-/* Footer */
-.footer{
-  text-align:center;font-size:11px;color:var(--text-4);
-  margin-top:22px;padding-top:16px;
-  border-top:1px solid var(--border-soft);
-  display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;
-  position:relative;z-index:1;
-}
-.badge{background:var(--accent-soft);color:var(--accent);padding:4px 12px;border-radius:999px;font-size:11px;font-weight:700}
-.status-pill{
-  display:inline-flex;align-items:center;gap:6px;
-  padding:4px 12px;border-radius:999px;font-size:11px;font-weight:600;
-  background:var(--glass);
-}
-.status-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
-.status-dot.on{background:var(--success);box-shadow:0 0 10px var(--success);animation:pulseDot 2s ease-in-out infinite}
-.status-dot.off{background:var(--danger);box-shadow:0 0 10px var(--danger)}
-
-/* Toast */
-.toast{
-  position:fixed;bottom:28px;left:50%;
-  transform:translateX(-50%) translateY(100px);
-  background:rgba(20,27,45,0.95);backdrop-filter:blur(16px);
-  color:#fff;padding:13px 24px;border-radius:999px;
-  font-size:13px;font-weight:500;border:1px solid var(--border);
-  box-shadow:0 14px 36px rgba(0,0,0,0.5);
-  opacity:0;transition:all .4s cubic-bezier(.4,0,.2,1);
-  z-index:1000;pointer-events:none;max-width:90vw;text-align:center;
-}
-html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-
-/* Countdown */
-.countdown{font-family:'Courier New',monospace;font-weight:700;color:var(--text);direction:ltr}
-
-/* Mobile responsive */
-@media (max-width:560px){
-  body{padding:0;align-items:flex-start}
-  .card{
-    border-radius:0;min-height:100vh;min-height:100dvh;
-    padding:28px 18px;
-    padding-top:max(28px,env(safe-area-inset-top));
-    padding-bottom:max(28px,env(safe-area-inset-bottom));
-    border-left:none;border-right:none;
-  }
-  .info-grid{grid-template-columns:1fr 1fr;gap:8px}
-  .info-card{padding:11px 12px}
-  .sub-row{flex-direction:column}
-  .sub-link{width:100%}
-  .sub-row .btn{width:100%}
-  .logo-wrap,.logo{width:68px;height:68px}
-  .logo{font-size:30px}
-  .title{font-size:22px}
-  .header{margin-bottom:18px}
-  .gauge-wrap{width:140px;height:140px}
-  .gauge-pct{font-size:28px}
-  .client-row{grid-template-columns:repeat(3,1fr)}
-}
-@media (max-width:380px){
-  .info-grid{grid-template-columns:1fr}
-  .client-row{grid-template-columns:repeat(2,1fr)}
-}
-</style>
-</head>
-<body>
-<div class="card">
-  <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme">
-    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-  </button>
-
-  <div class="header">
-    <div class="logo-wrap">
-      <div class="logo-ring"></div>
-      <div class="logo">&#9651;</div>
-    </div>
-    <div class="title">Usf</div>
-    <div class="label-chip"><span class="pin">&#128204;</span> __LABEL__</div>
-  </div>
-
-  <div class="sub-section">
-    <div class="section-label">لینک اشتراک (Subscription URL)</div>
-    <div class="sub-row">
-      <a href="__SUB_URL__" class="sub-link" target="_blank" rel="noopener" title="__SUB_URL__">
-        <svg class="ext-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-        <span>__SUB_URL__</span>
-      </a>
-      <button class="btn btn-primary" onclick="copySub()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        کپی لینک
-      </button>
-    </div>
-    <a href="__SUB_URL__" class="btn btn-open" target="_blank" rel="noopener">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-      باز کردن اشتراک در کلاینت
-    </a>
-    <div class="client-row">
-      <a class="client-chip" href="v2rayn://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2n">N</span><span>V2RayN</span></a>
-      <a class="client-chip" href="v2rayng://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-v2g">G</span><span>V2RayNG</span></a>
-      <a class="client-chip" href="streisand://import/__SUB_URL_ENC__"><span class="ci ci-str">S</span><span>Streisand</span></a>
-      <a class="client-chip" href="shadowrocket://add/sub://__SUB_URL_B64__"><span class="ci ci-sr">SR</span><span>Shadowrocket</span></a>
-      <a class="client-chip" href="foxray://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-fox">F</span><span>Foxray</span></a>
-      <a class="client-chip" href="bullshit://install/__SUB_URL_ENC__"><span class="ci ci-bull">B</span><span>BS Client</span></a>
-    </div>
-  </div>
-
-  <div class="gauge-section">
-    <div class="gauge-wrap">
-      <svg class="gauge-svg" viewBox="0 0 160 160">
-        <defs>
-          <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stop-color="#22c55e"/>
-            <stop offset="50%" stop-color="#f5c542"/>
-            <stop offset="100%" stop-color="#ef4444"/>
-          </linearGradient>
-        </defs>
-        <circle class="gauge-track" cx="80" cy="80" r="70"/>
-        <circle class="gauge-fill" id="gaugeFill" cx="80" cy="80" r="70"/>
-      </svg>
-      <div class="gauge-center">
-        <div class="gauge-pct"><span id="pctNum">0</span><span class="pct-sign">%</span></div>
-        <div class="gauge-label">مصرف حجم</div>
-      </div>
-    </div>
-    <div class="gauge-stats">
-      <div class="gstat"><div class="gv" id="usedStat">__USED__</div><div class="gl">مصرف‌شده</div></div>
-      <div class="gstat"><div class="gv" id="remainStat">__REMAIN__</div><div class="gl">باقی‌مانده</div></div>
-      <div class="gstat"><div class="gv" id="limitStat">__LIMIT__</div><div class="gl">کل سهمیه</div></div>
-    </div>
-  </div>
-
-  <div class="info-grid">
-    <div class="info-card">
-      <div class="info-label">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        حداکثر اتصال
-      </div>
-      <div class="info-value">__MAXCONN__</div>
-    </div>
-    <div class="info-card">
-      <div class="info-label">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        زمان انقضا
-      </div>
-      <div class="info-value small">__EXPIRY__</div>
-    </div>
-    <div class="info-card" style="grid-column:1/-1">
-      <div class="info-label">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        زمان باقی‌مانده تا انقضا
-      </div>
-      <div class="info-value countdown" id="countdown" data-exp="__EXP_EPOCH__">__REMAIN_TIME__</div>
-    </div>
-  </div>
-
-  <div class="config-section">
-    <div class="section-label" style="margin-bottom:8px">کانفیگ VLESS</div>
-    <div class="config-box" id="configText">__VLESS__</div>
-    <div style="display:flex;gap:8px;margin-top:8px">
-      <button class="btn btn-primary" style="flex:1" onclick="copyConfig()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        کپی کانفیگ
-      </button>
-      <button class="btn" style="flex:1;background:var(--glass);color:var(--text-2);border:1px solid var(--border-soft)" onclick="downloadConfig()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        دانلود
-      </button>
-    </div>
-  </div>
-
-  <div class="footer">
-    <span class="badge">Usf v__VERSION__</span>
-    <span class="status-pill">
-      <span class="status-dot __STATUS_CLASS__"></span>
-      __STATUS_TEXT__
-    </span>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-const SUB_URL = __SUB_URL_JSON__;
-const VLESS = __VLESS_JSON__;
-const PERCENT = __PCT_NUM__;
-
-// ── Theme ─────────────────────────────────────────
-function applyTheme(t){
-  document.documentElement.setAttribute('data-theme', t);
-  const m = document.getElementById('meta-theme');
-  if (m) m.setAttribute('content', t === 'light' ? '#f5f7fb' : '#0a0e1a');
-  try{localStorage.setItem('usf-theme', t)}catch(e){}
-}
-function toggleTheme(){
-  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
-  applyTheme(cur === 'dark' ? 'light' : 'dark');
-}
-(function(){
-  let saved = null;
-  try{saved = localStorage.getItem('usf-theme')}catch(e){}
-  if (!saved){
-    saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-  }
-  applyTheme(saved);
-})();
-
-// ── Animated gauge ────────────────────────────────
-(function(){
-  const fill = document.getElementById('gaugeFill');
-  const pctNum = document.getElementById('pctNum');
-  const circumference = 2 * Math.PI * 70; // r=70
-  const target = Math.max(0, Math.min(100, PERCENT));
-  const targetOffset = circumference * (1 - target / 100);
-  // Animate from 0 to target
-  let startTime = null;
-  const duration = 1400;
-  function step(ts){
-    if (!startTime) startTime = ts;
-    const p = Math.min(1, (ts - startTime) / duration);
-    const eased = 1 - Math.pow(1 - p, 3);
-    fill.style.strokeDashoffset = (circumference * (1 - (target * eased) / 100)).toFixed(2);
-    pctNum.textContent = Math.round(target * eased);
-    if (p < 1) requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-})();
-
-// ── Countdown ─────────────────────────────────────
-(function(){
-  const el = document.getElementById('countdown');
-  if (!el) return;
-  const exp = parseInt(el.dataset.exp, 10);
-  if (!exp){ return; }
-  function tick(){
-    const now = Math.floor(Date.now() / 1000);
-    const diff = exp - now;
-    if (diff <= 0){ el.textContent = 'منقضی شده'; el.style.color = 'var(--danger)'; return; }
-    const d = Math.floor(diff / 86400);
-    const h = Math.floor((diff % 86400) / 3600);
-    const m = Math.floor((diff % 3600) / 60);
-    const s = diff % 60;
-    let txt = '';
-    if (d > 0) txt += d + ' روز و ';
-    txt += (h < 10 ? '0' : '') + h + ':';
-    txt += (m < 10 ? '0' : '') + m + ':';
-    txt += (s < 10 ? '0' : '') + s;
-    el.textContent = txt;
-  }
-  tick();
-  setInterval(tick, 1000);
-})();
-
-// ── Copy / Download ───────────────────────────────
-function copySub(){
-  navigator.clipboard.writeText(SUB_URL)
-    .then(function(){showToast("لینک اشتراک کپی شد")})
-    .catch(function(){showToast("کپی ناموفق بود", true)});
-}
-function copyConfig(){
-  navigator.clipboard.writeText(VLESS)
-    .then(function(){showToast("کانفیگ VLESS کپی شد")})
-    .catch(function(){
-      try{
-        var r = document.createRange();
-        r.selectNode(document.getElementById('configText'));
-        window.getSelection().removeAllRanges();
-        window.getSelection().addRange(r);
-        document.execCommand('copy');
-        showToast("کانفیگ VLESS کپی شد");
-      }catch(e){showToast("کپی ناموفق بود", true)}
-    });
-}
-function downloadConfig(){
-  try{
-    const blob = new Blob([VLESS], {type:'text/plain;charset=utf-8'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'Usf-__LABEL_SAFE__.txt';
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showToast("فایل کانفیگ دانلود شد");
-  }catch(e){showToast("دانلود ناموفق بود", true)}
-}
-var _tt;
-function showToast(msg, isErr){
-  var t = document.getElementById('toast');
-  t.textContent = msg;
-  t.style.borderColor = isErr ? 'rgba(239,68,68,0.4)' : 'var(--border)';
-  t.classList.add('show');
-  clearTimeout(_tt);
-  _tt = setTimeout(function(){t.classList.remove('show')}, 2600);
-}
-</script>
-</body>
-</html>'''
-
-    # Build remaining-time display
     if not expiry_raw:
         remain_time_display = "نامحدود"
     elif expiry_epoch_val and expiry_epoch_val > time.time():
         diff = expiry_epoch_val - int(time.time())
-        d = diff // 86400
-        h = (diff % 86400) // 3600
-        m = (diff % 3600) // 60
-        if d > 0:
-            remain_time_display = f"{d} روز و {h:02d}:{m:02d}"
-        elif h > 0:
-            remain_time_display = f"{h:02d}:{m:02d}:{diff % 60:02d}"
-        else:
-            remain_time_display = f"{m:02d}:{diff % 60:02d}"
+        d = diff // 86400; h = (diff % 86400) // 3600; m = (diff % 3600) // 60
+        if d > 0: remain_time_display = f"{d} روز و {h:02d}:{m:02d}"
+        elif h > 0: remain_time_display = f"{h:02d}:{m:02d}:{diff % 60:02d}"
+        else: remain_time_display = f"{m:02d}:{diff % 60:02d}"
     else:
         remain_time_display = "منقضی شده"
 
-    # HTML-escape + JSON-encode helpers
-    from html import escape as _hesc
-    import base64 as _b64
-    sub_url_h = _hesc(sub_url, quote=True)
-    vless_h = _hesc(vless_link)
+    max_conn_disp = str(max_conn) if max_conn and max_conn > 0 else 'نامحدود'
+    vless_link = generate_vless_link(uuid, remark=f"{label}")
+
     label_h = _hesc(str(label))
-    expiry_h = _hesc(str(expiry_display))
+    sub_url_h = _hesc(sub_url, quote=True)
     sub_url_j = json.dumps(sub_url)
-    vless_j = json.dumps(vless_link)
     sub_url_enc = quote(sub_url, safe='')
-    sub_url_b64 = _b64.b64encode(sub_url.encode()).decode().rstrip('=')
+    sub_url_b64 = base64.b64encode(sub_url.encode()).decode().rstrip('=')
+    vless_h = _hesc(vless_link)
+    vless_j = json.dumps(vless_link)
     label_safe = re.sub(r'[^a-zA-Z0-9\-_.]', '_', str(label))
 
-    # Max connections display
-    max_conn_disp = str(max_conn) if max_conn and max_conn > 0 else 'نامحدود (∞)'
+    # Status banner styles
+    if is_active and not is_exp:
+        status_style = 'background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);color:#22c55e'
+        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
+    elif is_exp:
+        status_style = 'background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:#ef4444'
+        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
+    else:
+        status_style = 'background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);color:#f59e0b'
+        dot_style = f'background:{status_color};box-shadow:0 0 10px {status_color}'
 
-    html_content = (html_template
+    html_content = (STATUS_HTML_TEMPLATE
+        .replace('__TITLE__', _hesc(f'اشتراک {label}'))
         .replace('__LABEL__', label_h)
-        .replace('__LABEL_SAFE__', _hesc(label_safe))
+        .replace('__STATUS_TEXT__', _hesc(status_text))
+        .replace('__STATUS_COLOR__', status_color)
+        .replace('__STATUS_STYLE__', status_style)
+        .replace('__DOT_STYLE__', dot_style)
         .replace('__SUB_URL__', sub_url_h)
         .replace('__SUB_URL_ENC__', sub_url_enc)
         .replace('__SUB_URL_B64__', sub_url_b64)
@@ -1822,1251 +1607,745 @@ function showToast(msg, isErr){
         .replace('__USED__', _hesc(used_str))
         .replace('__LIMIT__', _hesc(limit_str))
         .replace('__REMAIN__', _hesc(remaining_str))
-        .replace('__PCT__', f"{percent:.1f}")
         .replace('__PCT_NUM__', f"{percent:.1f}")
         .replace('__MAXCONN__', _hesc(max_conn_disp))
-        .replace('__EXPIRY__', expiry_h)
+        .replace('__EXPIRY__', _hesc(expiry_display))
         .replace('__EXP_EPOCH__', str(expiry_epoch_val))
         .replace('__REMAIN_TIME__', _hesc(remain_time_display))
         .replace('__VLESS__', vless_h)
         .replace('__VLESS_JSON__', vless_j)
         .replace('__VERSION__', _hesc(str(PANEL_VERSION)))
-        .replace('__STATUS_CLASS__', status_class)
-        .replace('__STATUS_TEXT__', status_text)
+        .replace('__LABEL_SAFE__', _hesc(label_safe))
     )
-
     return HTMLResponse(content=html_content)
 
-
-
-# ─── HTML Pages (Login & Dashboard) ──────────────────────────────────────────
+#  USF Panel v2.0.0 — Login Page
+# ============================================================
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Usf - Welcome</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Usf - Login</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1b2a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
-#login{background:#151f31;border-radius:2rem;padding:3rem 2rem 2.5rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
-@keyframes charge{0%{transform:translateY(2rem);opacity:0}100%{transform:translateY(0);opacity:1}}
-.setting-section{position:absolute;top:16px;right:16px}
-.ant-btn-circle{border-radius:50%;width:38px;height:38px;padding:0;border:none;background:#1e8a7a;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center}
-.ant-btn-circle:hover{background:#00a896}
-.title{font-size:2.2rem;font-weight:700;text-align:center;margin-bottom:2rem;color:#b0bec5;letter-spacing:1px}
-.words-wrapper{display:inline-block;position:relative;text-align:center;width:100%}
-.words-wrapper b{display:inline-block;position:absolute;left:0;top:0;width:100%;opacity:0}
-.words-wrapper b.is-visible{position:relative;opacity:1;animation:zoom-in .8s cubic-bezier(.215,.61,.355,1) forwards}
-.words-wrapper b.is-hidden{animation:zoom-out .4s cubic-bezier(.215,.61,.355,1) forwards}
-@keyframes zoom-in{0%{opacity:0;transform:translateZ(100px)}100%{opacity:1;transform:translateZ(0)}}
-@keyframes zoom-out{0%{opacity:1;transform:translateZ(0)}100%{opacity:0;transform:translateZ(-100px)}}
-.headline{display:flex;justify-content:center;align-items:center}
-.headline.zoom .words-wrapper{perspective:300px}
-.fields{display:flex;flex-direction:column;gap:14px;margin-bottom:1.5rem}
-.ant-input-affix-wrapper{display:flex;align-items:center;background:#1e2d42;border:1.5px solid #1e2d42;border-radius:30px;padding:0 16px;height:52px;transition:border-color .3s}
-.ant-input-affix-wrapper:focus-within{border-color:#008771;box-shadow:0 0 0 2px rgba(0,135,113,.15)}
-.ant-input-prefix{display:flex;align-items:center;margin-right:10px;color:#4a6080}
-.ant-input{flex:1;background:transparent;border:none;outline:none;color:#fff;font-size:14px;height:100%;padding:0}
-.ant-input::placeholder{color:#4a6080}
-.ant-input-suffix{display:flex;align-items:center;color:#4a6080;cursor:pointer;padding-left:8px}
-.ant-input-suffix:hover{color:#fff}
-.wave-btn-bg{border-radius:30px;overflow:hidden;position:relative}
-.wave-btn-bg-cl{background:linear-gradient(135deg,#007a68,#008771,#005565);background-size:200% 200%;transition:.3s}
-.wave-btn-bg-cl:hover{background-position:right center}
-.ant-btn-primary-login{font-size:15px;font-weight:600;color:#fff;background:transparent;border:none;height:50px;width:100%;cursor:pointer;letter-spacing:.5px}
-.err-msg{color:#ef4444;text-align:center;font-size:13px;padding:8px;background:rgba(239,68,68,0.1);border-radius:8px;display:none;margin-top:8px}
-.err-msg.show{display:block}
+body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:#0b0f1a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem;
+background-image:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(99,102,241,0.1),transparent 60%),radial-gradient(ellipse 60% 40% at 80% 100%,rgba(139,92,246,0.06),transparent 50%)}
+#login{background:rgba(15,23,42,0.6);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border:1px solid rgba(99,102,241,0.15);border-radius:20px;padding:2.5rem 2rem 2rem;width:100%;max-width:380px;position:relative;animation:charge .5s ease both}
+@keyframes charge{0%{transform:translateY(1.5rem);opacity:0}100%{transform:translateY(0);opacity:1}}
+#login::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#6366f1 30%,#a78bfa 50%,#6366f1 70%,transparent);opacity:.5;border-radius:20px 20px 0 0}
+.theme-btn{position:absolute;top:14px;right:14px;width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);color:#94a3b8;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .25s}
+.theme-btn:hover{background:rgba(99,102,241,0.12);color:#a78bfa}
+.theme-btn svg{width:16px;height:16px}
+.logo{font-size:2rem;font-weight:800;text-align:center;margin-bottom:.5rem;letter-spacing:-.03em;background:linear-gradient(135deg,#f1f5f9,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.subtitle{text-align:center;color:#64748b;font-size:13px;margin-bottom:2rem}
+.fields{display:flex;flex-direction:column;gap:12px;margin-bottom:1.5rem}
+.field{display:flex;align-items:center;background:rgba(255,255,255,0.03);border:1.5px solid rgba(255,255,255,0.06);border-radius:12px;padding:0 14px;height:48px;transition:border-color .3s}
+.field:focus-within{border-color:rgba(99,102,241,0.5);box-shadow:0 0 0 3px rgba(99,102,241,0.1)}
+.field svg{flex-shrink:0;color:#475569}
+.field input{flex:1;background:transparent;border:none;outline:none;color:#f1f5f9;font-size:13px;height:100%;padding:0 10px;font-family:inherit}
+.field input::placeholder{color:#475569}
+.field .eye{cursor:pointer;color:#475569;padding:0 2px;transition:color .2s}
+.field .eye:hover{color:#818cf8}
+.login-btn{width:100%;height:46px;border:none;border-radius:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:all .3s;letter-spacing:.3px;font-family:inherit}
+.login-btn:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(99,102,241,0.3)}
+.login-btn:active{transform:translateY(0)}
+.err{color:#ef4444;text-align:center;font-size:12px;padding:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.15);border-radius:8px;display:none;margin-top:8px}
+.err.show{display:block}
+html[data-theme="light"] body{background:#f1f5f9}
+html[data-theme="light"] #login{background:rgba(255,255,255,0.8);border-color:rgba(99,102,241,0.15)}
+html[data-theme="light"] .field{background:rgba(0,0,0,0.03);border-color:rgba(0,0,0,0.08)}
+html[data-theme="light"] .field input{color:#0f172a}
+html[data-theme="light"] .field svg,.html[data-theme="light"] .field .eye{color:#94a3b8}
+html[data-theme="light"] .err{background:rgba(239,68,68,0.06)}
 </style>
 </head>
 <body>
 <div id="login">
-  <div class="setting-section">
-    <button class="ant-btn-circle" onclick="toggleTheme()">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-    </button>
-  </div>
-  <h2 class="title headline zoom"><span class="words-wrapper"><b class="is-visible">Usf</b></span></h2>
+  <button class="theme-btn" onclick="toggleTheme()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+  </button>
+  <div class="logo">Usf</div>
+  <div class="subtitle">Panel Management</div>
   <form id="login-form">
     <div class="fields">
-      <span class="ant-input-affix-wrapper">
-        <span class="ant-input-prefix">
-          <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor"><path d="M858.5 763.6a374 374 0 0 0-80.6-119.5 375.63 375.63 0 0 0-119.5-80.6c-.4-.2-.8-.3-1.2-.5C719.5 518 760 444.7 760 362c0-137-111-248-248-248S264 225 264 362c0 82.7 40.5 156 102.8 201.1-.4.2-.8.3-1.2.5-44.8 18.9-85 46-119.5 80.6a375.63 375.63 0 0 0-80.6 119.5A371.7 371.7 0 0 0 136 901.8a8 8 0 0 0 8 8.2h60c4.4 0 7.9-3.5 8-7.8 2-77.2 33-149.5 87.8-204.3 56.7-56.7 132-87.9 212.2-87.9s155.5 31.2 212.2 87.9C779 752.7 810 825 812 902.2c.1 4.4 3.6 7.8 8 7.8h60a8 8 0 0 0 8-8.2c-1-47.8-10.9-94.3-29.5-138.2zM512 534c-45.9 0-89.1-17.9-121.6-50.4S340 407.9 340 362c0-45.9 17.9-89.1 50.4-121.6S466.1 190 512 190s89.1 17.9 121.6 50.4S684 316.1 684 362c0 45.9-17.9 89.1-50.4 121.6S557.9 534 512 534z"/></svg>
+      <div class="field">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <input placeholder="Username" type="text" name="username" autocomplete="username" id="username" value="admin">
+      </div>
+      <div class="field">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <input placeholder="Password" type="password" name="password" autocomplete="current-password" id="password">
+        <span class="eye" onclick="togglePw()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
         </span>
-        <input placeholder="Username" type="text" name="username" autocomplete="username" autofocus class="ant-input" id="username" value="admin">
-      </span>
-      <span class="ant-input-affix-wrapper">
-        <span class="ant-input-prefix">
-          <svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor"><path d="M832 464h-68V240c0-70.7-57.3-128-128-128H388c-70.7 0-128 57.3-128 128v224h-68c-17.7 0-32 14.3-32 32v384c0 17.7 14.3 32 32 32h640c17.7 0 32-14.3 32-32V496c0-17.7-14.3-32-32-32zM332 240c0-30.9 25.1-56 56-56h248c30.9 0 56 25.1 56 56v224H332V240zm460 600H232V536h560v484zM484 701v53c0 4.4 3.6 8 8 8h40c4.4 0 8-3.6 8-8v-53a48.01 48.01 0 1 0-56 0z"/></svg>
-        </span>
-        <input placeholder="Password" type="password" name="password" autocomplete="current-password" class="ant-input" id="password">
-        <span class="ant-input-suffix" onclick="togglePassword()">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-        </span>
-      </span>
+      </div>
     </div>
-    <div class="err-msg" id="err-msg"></div>
-    <div class="wave-btn-bg wave-btn-bg-cl">
-      <button type="submit" class="ant-btn-primary-login">Log In</button>
-    </div>
+    <div class="err" id="err-msg"></div>
+    <button type="submit" class="login-btn">Sign In</button>
   </form>
 </div>
 <script>
-let darkTheme = true;
-function toggleTheme() {
-  darkTheme = !darkTheme;
-  document.body.style.background = darkTheme ? '#0d1b2a' : '#e8f5f2';
-  document.getElementById('login').style.background = darkTheme ? '#151f31' : '#fff';
-}
-function togglePassword() {
-  const input = document.getElementById('password');
-  input.type = input.type === 'password' ? 'text' : 'password';
-}
-document.getElementById('login-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const err = document.getElementById('err-msg');
-  err.classList.remove('show');
-  const username = document.getElementById('username').value;
-  const password = document.getElementById('password').value;
-  try {
-    const res = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ username, password })
-    });
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      err.textContent = d.detail || 'Invalid username or password';
-      err.classList.add('show');
-      return;
-    }
-    window.location.href = '/dashboard';
-  } catch(e) {
-    err.textContent = 'Connection error';
-    err.classList.add('show');
-  }
+let dark=true;
+function toggleTheme(){dark=!dark;document.documentElement.setAttribute('data-theme',dark?'dark':'light')}
+function togglePw(){var i=document.getElementById('password');i.type=i.type==='password'?'text':'password'}
+document.getElementById('login-form').addEventListener('submit',async(e)=>{
+  e.preventDefault();var err=document.getElementById('err-msg');err.classList.remove('show');
+  var u=document.getElementById('username').value,p=document.getElementById('password').value;
+  try{var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:u,password:p})});
+  if(!r.ok){var d=await r.json().catch(()=>({}));err.textContent=d.detail||'Invalid credentials';err.classList.add('show');return}
+  window.location.href='/dashboard'}catch(e){err.textContent='Connection error';err.classList.add('show')}
 });
 </script>
 </body>
 </html>"""
 
+#  USF Panel v2.0.0 — Dashboard HTML
+# ============================================================
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Usf - Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a1222;color:rgba(255,255,255,0.75);min-height:100vh}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:3px}
-.ant-layout{display:flex;height:100vh}
-.ant-layout-has-sider{flex-direction:row}
-.ant-layout-sider{background:#111929;height:100%;display:flex;flex-direction:column;border-right:1px solid #1a1a1a;position:fixed;left:0;top:0;bottom:0;width:200px;z-index:100;transition:transform .3s}
-.ant-layout-sider-children{flex:1;display:flex;flex-direction:column;padding:8px;overflow-y:auto}
-.brand-title{padding:14px 12px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #1a1a1a;margin-bottom:6px}
-.brand-title svg{flex-shrink:0}
-.brand-title span{font-size:15px;font-weight:700;color:#fff;letter-spacing:-0.02em}
-.brand-title .version{font-size:10px;color:#555;font-weight:400;margin-left:2px}
-.ant-menu{list-style:none;padding:0;margin:0;background:transparent}
-.ant-menu-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:#888;font-size:13px;cursor:pointer;transition:all .15s;border:none;background:none;width:100%;text-align:left;margin:1px 0}
-.ant-menu-item:hover{background:rgba(0,135,113,0.08);color:#fff}
-.ant-menu-item-selected{background:rgba(0,135,113,0.12);color:#008771;font-weight:600}
-.nav-badge{margin-left:auto;background:#1a1a1a;color:#555;font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
-.nav-section{font-size:10px;font-weight:700;color:#444;text-transform:uppercase;letter-spacing:0.08em;padding:12px 12px 4px}
-.ant-layout-sider-footer{padding:10px;border-top:1px solid #1a1a1a}
-.logout-btn{width:100%;padding:7px;border:1px solid #1a1a1a;border-radius:7px;background:none;color:#555;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
-.logout-btn:hover{background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.2);color:#ef4444}
-.ant-layout-sider-trigger{height:44px;background:#111929;color:rgba(255,255,255,0.45);display:flex;align-items:center;justify-content:center;cursor:pointer;border-top:1px solid #1a1a1a;font-size:12px;gap:8px;transition:all .2s}
-.ant-layout-sider-trigger:hover{color:#fff}
-#content-layout{flex:1;margin-left:200px;overflow-y:auto;padding:20px 20px 48px}
-.page{display:none;animation:pageIn .3s ease}
-.page.active{display:block}
-@keyframes pageIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.ant-card{background:#151f31;border:1px solid #1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px}
-.ant-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.3)}
-.ant-card-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid #1a1a1a;margin-bottom:12px}
-.ant-card-head-title{font-size:14px;font-weight:600;color:rgba(255,255,255,0.85)}
-.ant-card-extra{color:rgba(255,255,255,0.45);font-size:13px}
-.ant-row{display:flex;flex-wrap:wrap;margin:-6px -8px}
-.ant-col{padding:6px 8px;flex:0 0 auto}
-.ant-col-12{width:50%}.ant-col-sm-12{width:50%}.ant-col-md-12{width:50%}.ant-col-sm-24{width:100%}.ant-col-md-6{width:25%}
-.ant-statistic-title{font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:4px}
-.ant-statistic-content{font-size:16px;color:rgba(255,255,255,0.85);display:flex;align-items:center;gap:6px}
-.ant-statistic-content-prefix{color:rgba(255,255,255,0.35)}
-.ant-tag{display:inline-flex;align-items:center;padding:2px 10px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;margin:2px}
-.ant-tag-green{background:rgba(0,135,113,0.15);color:#008771;border:1px solid rgba(0,135,113,0.2)}
-.ant-tag-orange{background:rgba(255,160,49,0.15);color:#ffa031;border:1px solid rgba(255,160,49,0.2)}
-.ant-tag-purple{background:rgba(217,136,205,0.15);color:#d988cd;border:1px solid rgba(217,136,205,0.2)}
-.ant-tag-red{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.15)}
-.ant-badge-status{display:inline-flex;align-items:center;gap:6px}
-.ant-badge-status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.ant-badge-status-green{background:#22c55e}
-.ant-badge-status-text{font-size:12px;color:rgba(255,255,255,0.75)}
-.ant-badge-status-processing{animation:pulse 1.2s ease-in-out infinite}
-@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.4}}
-.ant-btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:all .15s}
-.ant-btn-primary{background:#008771;color:#fff}
-.ant-btn-primary:hover{background:#006b5a}
-.ant-btn-secondary{background:#1a1a1a;color:#888;border:1px solid #2a2a2a}
-.ant-btn-secondary:hover{border-color:#008771;color:#008771}
-.ant-btn-danger{background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.12)}
-.ant-btn-danger:hover{background:rgba(239,68,68,0.2)}
-.ant-btn-sm{padding:4px 10px;font-size:11px}
-.sys-bar{height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden;margin-top:8px}
-.sys-bar-fill{height:100%;border-radius:3px;transition:width .5s}
-.ant-table-wrapper{overflow-x:auto;margin-top:4px}
-.ant-table{width:100%;border-collapse:collapse;font-size:13px}
-.ant-table th{text-align:left;font-size:11px;font-weight:600;color:#555;padding:10px 12px;text-transform:uppercase;border-bottom:1px solid #1a1a1a;background:#111}
-.ant-table td{padding:10px 12px;border-bottom:1px solid #1a1a1a;vertical-align:middle;color:#ccc}
-.ant-table tr:last-child td{border-bottom:none}
-.ant-table tbody tr:hover td{background:rgba(0,135,113,0.04)}
-.toggle{width:34px;height:18px;border-radius:10px;background:#2a2a2a;position:relative;cursor:pointer;transition:all .3s;border:1px solid #333;flex-shrink:0}
-.toggle.on{background:#22c55e;border-color:#22c55e;box-shadow:0 0 12px rgba(34,197,94,0.3)}
-.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:#888;top:2px;left:2px;transition:all .3s}
-.toggle.on::after{left:16px;background:#fff}
-.usage-pill{display:flex;align-items:center;gap:8px;padding:2px 10px;border-radius:999px;background:#1a1a1a;font-size:11px;color:#888}
-.usage-pill .used{color:#fff;font-weight:600}
-.usage-pill .bar{flex:1;height:4px;background:#2a2a2a;border-radius:2px;min-width:50px}
-.usage-pill .fill{height:100%;border-radius:2px;transition:width .3s}
-.usage-pill .limit{color:#555}
-.btn-copy{background:rgba(0,135,113,0.1);color:#008771;border:1px solid rgba(0,135,113,0.15);font-family:inherit;font-size:11px;font-weight:600;border-radius:8px;padding:4px 10px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;transition:all .15s}
-.btn-copy:hover{background:#008771;color:#fff}
-.search-box{flex:1;min-width:160px;position:relative}
-.search-box input{width:100%;padding:8px 12px 8px 32px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;color:#fff;font-size:12px;outline:none;transition:all .2s;font-family:inherit}
-.search-box input:focus{border-color:#008771}
-.search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#555}
-.filter-chips{display:flex;gap:3px;padding:3px 5px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px}
-.chip{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;color:#666;cursor:pointer;border:none;background:none;transition:all .2s;font-family:inherit}
-.chip.active{background:#008771;color:#fff}
-.chip:hover:not(.active){background:#2a2a2a;color:#fff}
-.inbounds-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:#151f31;color:#fff;border:1px solid #1a1a1a;border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s;z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.toast.error{border-color:rgba(239,68,68,0.3);color:#ef4444}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
-.modal-overlay.show{display:flex}
-.modal{background:#151f31;border:1px solid #1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:440px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-.modal-title{font-size:15px;font-weight:700;margin-bottom:16px;color:rgba(255,255,255,0.85)}
-.modal-close{position:absolute;top:12px;right:14px;background:#1a1a1a;border:1px solid #2a2a2a;color:#666;width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .2s}
-.modal-close:hover{background:rgba(239,68,68,0.1);color:#ef4444}
-.form-group{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
-.form-label{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:0.04em}
-.form-input,.form-select{padding:8px 12px;border-radius:8px;border:1px solid #2a2a2a;font-family:inherit;font-size:13px;outline:none;color:#fff;background:#1a1a1a;transition:all .2s;width:100%}
-.form-input:focus,.form-select:focus{border-color:#008771;box-shadow:0 0 0 3px rgba(0,135,113,0.1)}
-.form-select option{background:#1a1a1a;color:#fff}
-.form-row{display:flex;gap:8px}
-.form-row .form-group{margin-bottom:0;flex:1}
-.status-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1a1a1a}
-.status-row:last-child{border-bottom:none}
-.status-key{font-size:12px;color:#888;display:flex;align-items:center;gap:8px}
-.status-val{font-size:12px;color:#ccc;font-weight:600}
-.empty-state{text-align:center;padding:40px;color:#555}
-.mobile-header{display:none;position:fixed;top:0;left:0;right:0;height:44px;background:#111929;border-bottom:1px solid #1a1a1a;z-index:90;align-items:center;justify-content:space-between;padding:0 14px}
-.menu-toggle{width:32px;height:32px;border-radius:8px;border:1px solid #1a1a1a;background:#151f31;color:#888;display:flex;align-items:center;justify-content:center;cursor:pointer}
-.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
-.sidebar-overlay.show{display:block}
-@media(max-width:768px){
-  .ant-layout-sider{transform:translateX(-100%);width:200px;z-index:200}
-  .ant-layout-sider.open{transform:translateX(0);box-shadow:4px 0 20px rgba(0,0,0,0.5)}
-  #content-layout{margin-left:0;padding-top:56px;padding-left:12px;padding-right:12px}
-  .mobile-header{display:flex}
-  .ant-col-md-12{width:100%}
-  .ant-col-md-6{width:50%}
+:root{
+  --bg:#0b0f1a;--surface:#111827;--surface2:#1e293b;--border:rgba(99,102,241,0.12);
+  --border2:rgba(255,255,255,0.06);--text:#f1f5f9;--text2:#cbd5e1;--text3:#94a3b8;
+  --text4:#64748b;--accent:#6366f1;--accent2:#818cf8;--accent-soft:rgba(99,102,241,0.1);
+  --green:#22c55e;--red:#ef4444;--amber:#f59e0b;--purple:#a78bfa;
+  --radius:12px;--sidebar-w:220px;
 }
-@media(max-width:480px){.ant-col-md-6{width:100%}}
-/* ── Overview (Usf) ── */
-.gauge-row{display:flex;gap:2px;align-items:flex-start}
-.gauge{flex:1;min-width:0;text-align:center;padding:2px 0}
-.gauge-svg{width:100%;max-width:118px;height:auto}
-.gauge-pct{font-size:16px;font-weight:700;fill:rgba(255,255,255,0.85)}
-.gauge-arc{transition:stroke-dasharray .6s ease}
-.gauge-label{margin-top:2px;font-size:11px;line-height:1.35}
-.gl-title{color:rgba(255,255,255,0.78);font-weight:600;display:block}
-.gl-sub{color:rgba(255,255,255,0.45);display:block;font-size:10.5px}
-.split-row{display:flex;align-items:stretch}
-.split-col{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:11px 6px;background:none;border:none;color:rgba(255,255,255,0.7);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
-.split-col + .split-col{border-left:1px solid #1a2536}
-button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
-.split-col svg{flex-shrink:0;opacity:.85}
-.tag-row{display:flex;flex-wrap:wrap;gap:6px;padding-top:2px}
-.tag-row .ant-tag{font-size:11px;text-transform:none;font-weight:600;padding:3px 11px;border-radius:6px}
-.update-btn{display:inline-flex;align-items:center;gap:6px;font-family:inherit;font-size:11px;font-weight:600;color:#ffa031;background:rgba(255,160,49,0.1);border:1px solid rgba(255,160,49,0.25);border-radius:7px;padding:5px 10px;cursor:pointer;transition:all .15s}
-.update-btn:hover{background:rgba(255,160,49,0.18)}
-.eye-btn{background:none;border:none;color:rgba(255,255,255,0.45);cursor:pointer;padding:2px;display:flex;transition:color .15s}
-.eye-btn:hover{color:#fff}
-.ip-val{font-family:monospace;font-size:13px;color:rgba(255,255,255,0.85);transition:filter .2s}
-.ip-val.ip-hidden{filter:blur(6px);user-select:none}
-.spd-up{color:#2bd4a0}.spd-down{color:#3b9dff}
-.data-stat{display:flex;align-items:center;gap:6px}
-.data-stat svg{color:rgba(255,255,255,0.4)}
-.log-box{background:#0b1220;border:1px solid #1a2536;border-radius:8px;padding:12px;font-family:monospace;font-size:11.5px;color:#9fb3c8;max-height:50vh;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.6}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text2);min-height:100vh;display:flex}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface2);border-radius:3px}
+
+/* Sidebar */
+.sidebar{width:var(--sidebar-w);height:100vh;background:var(--surface);border-right:1px solid var(--border2);
+  position:fixed;left:0;top:0;bottom:0;z-index:100;display:flex;flex-direction:column;transition:transform .3s ease}
+.sidebar-header{padding:16px;border-bottom:1px solid var(--border2)}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;color:#fff}
+.brand-name{font-size:15px;font-weight:700;color:var(--text)}
+.brand-ver{font-size:9px;color:var(--text4);background:var(--accent-soft);padding:2px 7px;border-radius:4px;margin-left:auto;font-weight:600}
+.sidebar-nav{flex:1;padding:8px;overflow-y:auto}
+.nav-section{font-size:9px;font-weight:700;color:var(--text4);text-transform:uppercase;letter-spacing:.1em;padding:12px 12px 4px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--text3);font-size:13px;cursor:pointer;transition:all .15s;border:none;background:none;width:100%;text-align:left;margin:1px 0;font-family:inherit}
+.nav-item:hover{background:var(--accent-soft);color:var(--text)}
+.nav-item.active{background:var(--accent-soft);color:var(--accent2);font-weight:600}
+.nav-item svg{width:16px;height:16px;flex-shrink:0}
+.nav-badge{margin-left:auto;background:var(--surface2);color:var(--text4);font-size:10px;padding:1px 7px;border-radius:6px;font-weight:600}
+.sidebar-footer{padding:10px;border-top:1px solid var(--border2)}
+.logout-btn{width:100%;padding:8px;border:1px solid var(--border2);border-radius:8px;background:none;color:var(--text4);font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
+.logout-btn:hover{background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.2);color:var(--red)}
+.hamburger{display:none;position:fixed;top:12px;left:12px;z-index:200;width:36px;height:36px;border-radius:8px;background:var(--surface);border:1px solid var(--border2);color:var(--text2);cursor:pointer;align-items:center;justify-content:center}
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99}
+.overlay.show{display:block}
+
+/* Main content */
+.main{flex:1;margin-left:var(--sidebar-w);padding:20px 24px 48px;min-height:100vh}
+.page{display:none;animation:pageIn .3s ease}.page.active{display:block}
+@keyframes pageIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* Cards */
+.card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:16px;margin-bottom:12px;transition:box-shadow .2s}
+.card:hover{box-shadow:0 2px 12px rgba(0,0,0,.2)}
+.card-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid var(--border2);margin-bottom:12px}
+.card-title{font-size:14px;font-weight:600;color:var(--text)}
+.card-extra{color:var(--text4);font-size:12px}
+
+/* Stat grid */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
+.stat-card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:14px;position:relative;overflow:hidden}
+.stat-card::after{content:'';position:absolute;top:0;right:0;width:40px;height:40px;border-radius:0 0 0 40px;opacity:.06}
+.stat-card:nth-child(1)::after{background:var(--accent)}.stat-card:nth-child(2)::after{background:var(--green)}
+.stat-card:nth-child(3)::after{background:var(--amber)}.stat-card:nth-child(4)::after{background:var(--purple)}
+.stat-label{font-size:10px;color:var(--text4);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
+.stat-value{font-size:18px;font-weight:700;color:var(--text);font-family:'JetBrains Mono',monospace}
+.stat-sub{font-size:10px;color:var(--text4);margin-top:4px}
+
+/* Gauge row */
+.gauge-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
+.gauge-card{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius);padding:14px;text-align:center}
+.gauge-card svg{width:80px;height:80px;margin:0 auto 6px;display:block}
+.gauge-card .g-label{font-size:10px;color:var(--text4);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.gauge-card .g-value{font-size:11px;color:var(--text3);margin-top:2px;font-family:'JetBrains Mono',monospace}
+
+/* Tags & Badges */
+.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.tag-green{background:rgba(34,197,94,0.12);color:#22c55e;border:1px solid rgba(34,197,94,0.15)}
+.tag-red{background:rgba(239,68,68,0.08);color:#ef4444;border:1px solid rgba(239,68,68,0.12)}
+.tag-purple{background:rgba(167,139,250,0.12);color:#a78bfa;border:1px solid rgba(167,139,250,0.15)}
+.tag-amber{background:rgba(245,158,11,0.12);color:#f59e0b;border:1px solid rgba(245,158,11,0.15)}
+.badge-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.badge-dot.green{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.2s ease-in-out infinite}
+.badge-dot.red{background:var(--red)}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.4}}
+
+/* Buttons */
+.btn{font-family:inherit;font-size:12px;font-weight:600;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
+.btn-secondary{background:var(--surface2);color:var(--text3);border:1px solid var(--border2)}.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+.btn-danger{background:rgba(239,68,68,0.08);color:var(--red);border:1px solid rgba(239,68,68,0.1)}.btn-danger:hover{background:rgba(239,68,68,0.15)}
+.btn-sm{padding:4px 9px;font-size:11px}
+.btn-icon{width:28px;height:28px;padding:0;justify-content:center;border-radius:6px;font-size:12px;font-weight:700}
+
+/* Table */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--text4);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:10px 12px;border-bottom:1px solid var(--border2)}
+td{padding:10px 12px;border-bottom:1px solid var(--border2);color:var(--text2);vertical-align:middle}
+tr:hover td{background:rgba(99,102,241,0.03)}
+
+/* Usage bar */
+.usage-pill{display:flex;align-items:center;gap:8px;min-width:140px}
+.usage-pill .used{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text);white-space:nowrap;min-width:55px}
+.usage-pill .bar{flex:1;height:4px;background:var(--surface2);border-radius:2px;overflow:hidden;min-width:40px}
+.usage-pill .bar .fill{height:100%;border-radius:2px;transition:width .5s}
+.usage-pill .limit{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text4);white-space:nowrap}
+
+/* Filter chips */
+.chips{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.chip{padding:5px 12px;border-radius:8px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border2);background:transparent;color:var(--text4);transition:all .15s;font-family:inherit}
+.chip:hover{border-color:var(--accent);color:var(--text2)}
+.chip.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent2)}
+.search-box{display:flex;align-items:center;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;height:34px;margin-bottom:12px;transition:border-color .2s}
+.search-box:focus-within{border-color:var(--accent)}
+.search-box svg{width:14px;height:14px;color:var(--text4);flex-shrink:0}
+.search-box input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:12px;padding:0 8px;font-family:inherit}
+.search-box input::placeholder{color:var(--text4)}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:300;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:16px;padding:24px;width:100%;max-width:440px;max-height:90vh;overflow-y:auto;animation:modalIn .25s ease}
+@keyframes modalIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
+.modal-close{position:absolute;top:12px;right:12px;width:28px;height:28px;border-radius:6px;background:var(--surface2);border:none;color:var(--text4);cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.modal-close:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.modal-title{font-size:16px;font-weight:700;color:var(--text);margin-bottom:16px;position:relative}
+.form-group{margin-bottom:12px}
+.form-label{display:block;font-size:11px;font-weight:600;color:var(--text3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em}
+.form-input{width:100%;height:40px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--accent)}
+.form-select{width:100%;height:40px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:0 12px;color:var(--text);font-size:13px;font-family:inherit;outline:none;appearance:none;cursor:pointer}
+.form-row{display:flex;gap:8px}
+.form-row .form-group{flex:1}
+
+/* Info rows */
+.info-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border2)}
+.info-row:last-child{border-bottom:none}
+.info-label{font-size:12px;color:var(--text3)}
+.info-value{font-size:13px;color:var(--text);font-weight:600;font-family:'JetBrains Mono',monospace}
+
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:10px;font-size:12px;font-weight:500;z-index:1000;transform:translateY(80px);opacity:0;transition:all .3s ease;pointer-events:none}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.success{background:rgba(34,197,94,0.15);color:var(--green);border:1px solid rgba(34,197,94,0.2)}
+.toast.error{background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.2)}
+
+/* Chart container */
+.chart-container{position:relative;height:200px;margin-top:8px}
+
+/* Address item */
+.addr-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border:1px solid var(--border2);border-radius:8px;margin-bottom:6px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text2)}
+
+/* IP blur */
+.ip-val{filter:blur(4px);cursor:pointer;transition:filter .2s}.ip-val.visible{filter:none}
+
+/* Panel builder */
+.builder-card{background:linear-gradient(135deg,var(--surface),rgba(99,102,241,0.05));border:1px solid var(--border);border-radius:var(--radius);padding:24px;margin-bottom:12px}
+.builder-title{font-size:16px;font-weight:700;color:var(--text);margin-bottom:4px}
+.builder-desc{font-size:12px;color:var(--text3);margin-bottom:16px;line-height:1.6}
+.builder-steps{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.builder-step{flex:1;min-width:120px;padding:12px;background:var(--surface2);border:1px solid var(--border2);border-radius:10px;text-align:center}
+.builder-step .step-num{width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;margin-bottom:6px}
+.builder-step .step-text{font-size:11px;color:var(--text3)}
+
+/* Responsive */
+@media(max-width:1024px){.stat-grid{grid-template-columns:repeat(2,1fr)}.gauge-row{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:768px){
+  .sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}
+  .hamburger{display:flex}.main{margin-left:0;padding:16px}
+  .stat-grid{grid-template-columns:1fr 1fr}.gauge-row{grid-template-columns:1fr 1fr}
+}
+@media(max-width:480px){.stat-grid,.gauge-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 
-<div class="toast" id="toast"></div>
+<button class="hamburger" onclick="toggleSidebar()">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+</button>
+<div class="overlay" id="overlay" onclick="closeSidebar()"></div>
 
-<div class="mobile-header">
-  <span style="font-weight:700;font-size:13px;color:#fff">Usf</span>
-  <button class="menu-toggle" onclick="toggleSidebar()">&#9776;</button>
-</div>
-<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
-
-<aside class="ant-layout-sider" id="sidebar">
-  <div class="ant-layout-sider-children">
-    <div class="brand-title">
-      <svg width="26" height="26" viewBox="0 0 56 56" fill="none">
-        <rect width="56" height="56" rx="14" fill="url(#lg)"/>
-        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3"/>
-        <circle cx="28" cy="18" r="3.5" fill="#fff"/>
-        <circle cx="19" cy="33" r="3.5" fill="#fff"/>
-        <circle cx="37" cy="33" r="3.5" fill="#fff"/>
-        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#008771"/><stop offset="1" stop-color="#005565"/></linearGradient></defs>
-      </svg>
-      <span>Usf <span class="version">v1.0</span></span>
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <div class="brand">
+      <div class="brand-logo">U</div>
+      <span class="brand-name">Usf</span>
+      <span class="brand-ver" id="ver-badge">v2.0.0</span>
     </div>
+  </div>
+  <nav class="sidebar-nav">
     <div class="nav-section">Main</div>
-    <ul class="ant-menu">
-      <li class="ant-menu-item ant-menu-item-selected" onclick="switchPage('overview',this)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-        <span>Overview</span>
-      </li>
-      <li class="ant-menu-item" onclick="switchPage('inbounds',this)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
-        <span>Inbounds</span>
-        <span class="nav-badge" id="links-badge">0</span>
-      </li>
-      <li class="ant-menu-item" onclick="switchPage('cleanip',this)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-        <span>Clean IP</span>
-      </li>
-      <li class="ant-menu-item" onclick="switchPage('domain',this)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        <span>Domain</span>
-      </li>
-    </ul>
-    <div class="nav-section">System</div>
-    <ul class="ant-menu">
-      <li class="ant-menu-item" onclick="switchPage('settings',this)">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-        <span>Settings</span>
-      </li>
-    </ul>
-  </div>
-  <div class="ant-layout-sider-footer">
-    <button class="logout-btn" onclick="doLogout()">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      Log Out
+    <button class="nav-item active" onclick="go('overview',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      Overview
     </button>
-  </div>
-  <div class="ant-layout-sider-trigger" onclick="toggleSidebar()">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-    <span style="font-size:11px">Collapse</span>
+    <button class="nav-item" onclick="go('inbounds',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
+      Inbounds
+      <span class="nav-badge" id="links-badge">0</span>
+    </button>
+    <div class="nav-section">Network</div>
+    <button class="nav-item" onclick="go('cleanip',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+      Clean IP
+    </button>
+    <button class="nav-item" onclick="go('domain',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+      Domain
+    </button>
+    <div class="nav-section">Tools</div>
+    <button class="nav-item" onclick="go('builder',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+      Panel Builder
+    </button>
+    <button class="nav-item" onclick="go('settings',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Settings
+    </button>
+  </nav>
+  <div class="sidebar-footer">
+    <button class="logout-btn" onclick="doLogout()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      Sign Out
+    </button>
   </div>
 </aside>
 
-<section id="content-layout">
+<!-- Main -->
+<div class="main">
 
-  <!-- ── OVERVIEW ── -->
-  <div class="page active" id="page-overview">
-
-    <!-- Gauges -->
-    <div class="ant-card">
-      <svg width="0" height="0" style="position:absolute"><defs>
-        <linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
-          <stop offset="0" stop-color="#0e9f6e"/><stop offset="1" stop-color="#2bd4a0"/>
-        </linearGradient></defs></svg>
-      <div class="gauge-row">
-        <div class="gauge">
-          <svg viewBox="0 0 100 100" class="gauge-svg">
-            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="#1f2a3d" stroke-width="7"
-                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <path id="cpu-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
-                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <text id="cpu-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
-          </svg>
-          <div class="gauge-label"><span class="gl-title">CPU: <span id="cpu-cores">--</span></span><span id="cpu-label" class="gl-sub"></span></div>
-        </div>
-        <div class="gauge">
-          <svg viewBox="0 0 100 100" class="gauge-svg">
-            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="#1f2a3d" stroke-width="7"
-                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <path id="ram-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
-                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <text id="ram-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
-          </svg>
-          <div class="gauge-label"><span class="gl-title">RAM:</span><span id="ram-label" class="gl-sub"></span></div>
-        </div>
-        <div class="gauge">
-          <svg viewBox="0 0 100 100" class="gauge-svg">
-            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="#1f2a3d" stroke-width="7"
-                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <path id="swap-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
-                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <text id="swap-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
-          </svg>
-          <div class="gauge-label"><span class="gl-title">Swap:</span><span id="swap-label" class="gl-sub"></span></div>
-        </div>
-        <div class="gauge">
-          <svg viewBox="0 0 100 100" class="gauge-svg">
-            <path class="gauge-track" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="#1f2a3d" stroke-width="7"
-                  stroke-dasharray="197.9 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <path id="storage-arc" class="gauge-arc" d="M 50 50 m 0 -42 a 42 42 0 1 1 0 84 a 42 42 0 1 1 0 -84"
-                  fill="none" stroke="url(#gaugeGrad)" stroke-width="7"
-                  stroke-dasharray="0 263.9" transform="rotate(135 50 50)" stroke-linecap="round"/>
-            <text id="storage-text" x="50" y="54" text-anchor="middle" class="gauge-pct">0%</text>
-          </svg>
-          <div class="gauge-label"><span class="gl-title">Storage:</span><span id="storage-label" class="gl-sub"></span></div>
-        </div>
-      </div>
+<!-- Overview Page -->
+<section class="page active" id="page-overview">
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-label">Active Connections</div>
+      <div class="stat-value" id="s-conn">0</div>
+      <div class="stat-sub" id="s-tcp-udp">TCP: 0 | UDP: 0</div>
     </div>
-
-    <!-- Xray (core) -->
-    <div class="ant-card">
-      <div class="ant-card-head">
-        <div class="ant-card-head-title">Xray</div>
-        <div class="ant-card-extra">
-          <span class="ant-badge-status" id="xray-badge">
-            <span class="ant-badge-status-dot ant-badge-status-green ant-badge-status-processing"></span>
-            <span class="ant-badge-status-text" id="xray-status">Running</span>
-          </span>
-        </div>
-      </div>
-      <div class="split-row">
-        <button class="split-col" onclick="stopService()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/></svg>
-          <span id="xray-action-1">Stop</span>
-        </button>
-        <button class="split-col" onclick="restartService()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-          <span>Restart</span>
-        </button>
-        <div class="split-col" style="cursor:default">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></svg>
-          <span id="core-version">{CORE}</span>
-        </div>
-      </div>
+    <div class="stat-card">
+      <div class="stat-label">Upload / Download</div>
+      <div class="stat-value" style="font-size:14px"><span id="s-up">--</span> / <span id="s-down">--</span></div>
+      <div class="stat-sub">per second</div>
     </div>
-
-    <!-- Manage -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Manage</div></div>
-      <div class="split-row">
-        <button class="split-col" onclick="openLogs()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-          <span>Logs</span>
-        </button>
-        <button class="split-col" onclick="openConfig()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-          <span>Config</span>
-        </button>
-        <button class="split-col" onclick="downloadBackup()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-          <span>Backup</span>
-        </button>
-      </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Traffic</div>
+      <div class="stat-value" id="s-traffic">0 MB</div>
+      <div class="stat-sub">Sent: <span id="s-sent">--</span> | Recv: <span id="s-recv">--</span></div>
     </div>
-
-    <!-- Usf -->
-    <div class="ant-card">
-      <div class="ant-card-head">
-        <div class="ant-card-head-title">Usf</div>
-        <button class="update-btn" onclick="checkUpdate()">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 01-9 9c-2.5 0-4.78-1-6.43-2.6L3 16"/><path d="M3 12a9 9 0 019-9c2.5 0 4.78 1 6.43 2.6L21 8"/><polyline points="21 3 21 8 16 8"/><polyline points="3 21 3 16 8 16"/></svg>
-          <span id="panel-version-btn">{PANEL}</span> Update Panel
-        </button>
+    <div class="stat-card">
+      <div class="stat-label">Service Status</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+        <span class="badge-dot green" id="xray-dot"></span>
+        <span style="font-weight:600;color:var(--text)" id="xray-status-text">Running</span>
       </div>
-      <div class="tag-row">
-        <span class="ant-tag ant-tag-green" id="panel-version-tag">{PANEL}</span>
-        <span class="ant-tag ant-tag-green" id="tg-tag">@Usf</span>
-        <span class="ant-tag ant-tag-purple">Documentation</span>
-      </div>
-    </div>
-
-    <!-- Uptime -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Uptime</div></div>
-      <div class="tag-row">
-        <span class="ant-tag ant-tag-green">Xray: <span id="xray-uptime">--</span></span>
-        <span class="ant-tag ant-tag-green">OS: <span id="os-uptime">--</span></span>
-      </div>
-    </div>
-
-    <!-- System Load -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">System Load</div></div>
-      <div class="tag-row"><span class="ant-tag ant-tag-green" id="system-load">--</span></div>
-    </div>
-
-    <!-- Usage -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Usage</div></div>
-      <div class="tag-row">
-        <span class="ant-tag ant-tag-green">RAM: <span id="app-ram">--</span></span>
-        <span class="ant-tag ant-tag-green">Threads: <span id="threads">--</span></span>
-      </div>
-    </div>
-
-    <!-- Overall Speed -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Overall Speed</div></div>
-      <div class="ant-row">
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">Upload</div>
-          <div class="ant-statistic-content"><span class="spd-up">&#8593;</span> <span id="upload-speed">-- B/s</span></div>
-        </div>
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">Download</div>
-          <div class="ant-statistic-content"><span class="spd-down">&#8595;</span> <span id="download-speed">-- B/s</span></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Total Data -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Total Data</div></div>
-      <div class="ant-row">
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">Sent</div>
-          <div class="ant-statistic-content data-stat"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg> <span id="total-sent">--</span></div>
-        </div>
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">Received</div>
-          <div class="ant-statistic-content data-stat"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/><polyline points="8 12 12 16 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg> <span id="total-received">--</span></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- IP Addresses -->
-    <div class="ant-card">
-      <div class="ant-card-head">
-        <div class="ant-card-head-title">IP Addresses</div>
-        <button class="eye-btn" id="ip-eye" onclick="toggleIps()" title="Show / hide">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-        </button>
-      </div>
-      <div class="ant-row">
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">IPv4</div>
-          <div class="ant-statistic-content"><span id="ipv4" class="ip-val ip-hidden">--</span></div>
-        </div>
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">IPv6</div>
-          <div class="ant-statistic-content"><span id="ipv6" class="ip-val ip-hidden" style="font-size:11px;word-break:break-all">--</span></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Connection Stats -->
-    <div class="ant-card">
-      <div class="ant-card-head"><div class="ant-card-head-title">Connection Stats</div></div>
-      <div class="ant-row">
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">TCP</div>
-          <div class="ant-statistic-content">&#8644; <span id="tcp-conn">--</span></div>
-        </div>
-        <div class="ant-col ant-col-12">
-          <div class="ant-statistic-title">UDP</div>
-          <div class="ant-statistic-content">&#8644; <span id="udp-conn">--</span></div>
-        </div>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- ── INBOUNDS ── -->
-  <div class="page" id="page-inbounds">
-    <!-- Stats row -->
-    <div class="ant-row" style="margin:-6px -8px;margin-bottom:4px">
-      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Sent / Received</div><div class="ant-statistic-content" style="font-size:12px"><span id="ib-sent-recv">-- / --</span></div></div></div></div>
-      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Proxy Traffic</div><div class="ant-statistic-content" style="font-size:14px"><span id="ib-proxy-traffic">-- MB</span></div></div></div></div>
-      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Total Inbounds</div><div class="ant-statistic-content" style="font-size:18px"><span id="ib-total">0</span></div></div></div></div>
-      <div class="ant-col ant-col-md-6 ant-col-sm-12"><div class="ant-card"><div class="ant-statistic"><div class="ant-statistic-title">Active Clients</div><div class="ant-statistic-content" style="font-size:18px"><span id="ib-clients">0</span></div></div></div></div>
-    </div>
-
-    <div class="ant-card" style="padding:0;overflow:hidden">
-      <div class="ant-card-head" style="padding:14px 16px">
-        <div class="ant-card-head-title">
-          <div style="display:flex;align-items:center;gap:8px">
-            <button class="ant-btn ant-btn-primary" onclick="showAddModal()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              Add Inbound
-            </button>
-            <button class="ant-btn ant-btn-secondary" onclick="loadInbounds()">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-            </button>
-          </div>
-        </div>
-      </div>
-      <div style="padding:0 16px 8px">
-        <div class="inbounds-toolbar">
-          <div class="search-box">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-            <input id="inbound-search" placeholder="Search by name..." oninput="filterInbounds()">
-          </div>
-          <div class="filter-chips">
-            <button class="chip active" onclick="setFilter('all',this)">All</button>
-            <button class="chip" onclick="setFilter('active',this)">Active</button>
-            <button class="chip" onclick="setFilter('disabled',this)">Disabled</button>
-          </div>
-        </div>
-      </div>
-      <div class="ant-table-wrapper" style="padding:0 8px 8px">
-        <table class="ant-table">
-          <thead><tr>
-            <th style="width:36px">#</th>
-            <th>Remark</th>
-            <th style="width:64px">Type</th>
-            <th>Traffic</th>
-            <th style="width:72px">IPs</th>
-            <th style="width:60px">Status</th>
-            <th style="width:120px">Actions</th>
-          </tr></thead>
-          <tbody id="inbounds-tbody"><tr><td colspan="7" style="text-align:center;padding:32px;color:#555">Loading...</td></tr></tbody>
-        </table>
-      </div>
+      <div class="stat-sub">Uptime: <span id="s-uptime">--</span></div>
     </div>
   </div>
 
-  <!-- ── CLEAN IP ── -->
-  <div class="page" id="page-cleanip">
-    <div class="ant-card" style="max-width:520px">
-      <div class="ant-card-head">
-        <div class="ant-card-head-title">Clean IP / Addresses</div>
-        <button class="ant-btn ant-btn-primary ant-btn-sm" onclick="showAddAddressModal()">+ Add</button>
-      </div>
-      <div style="font-size:11px;color:#555;margin-bottom:10px">IPs and domains for subscription configs. Default: www.speedtest.net</div>
-      <div id="address-list"></div>
+  <div class="gauge-row">
+    <div class="gauge-card">
+      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-cpu" cx="40" cy="40" r="32" fill="none" stroke="var(--accent)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
+      <div class="g-label">CPU</div>
+      <div class="g-value" id="g-cpu-t">0%</div>
+    </div>
+    <div class="gauge-card">
+      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-ram" cx="40" cy="40" r="32" fill="none" stroke="var(--green)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
+      <div class="g-label">RAM</div>
+      <div class="g-value" id="g-ram-t">0%</div>
+    </div>
+    <div class="gauge-card">
+      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-swap" cx="40" cy="40" r="32" fill="none" stroke="var(--amber)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
+      <div class="g-label">Swap</div>
+      <div class="g-value" id="g-swap-t">0%</div>
+    </div>
+    <div class="gauge-card">
+      <svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="32" fill="none" stroke="var(--surface2)" stroke-width="5"/><circle id="g-disk" cx="40" cy="40" r="32" fill="none" stroke="var(--purple)" stroke-width="5" stroke-linecap="round" stroke-dasharray="201" stroke-dashoffset="201" transform="rotate(-90 40 40)" style="transition:stroke-dashoffset .5s"/></svg>
+      <div class="g-label">Disk</div>
+      <div class="g-value" id="g-disk-t">0%</div>
     </div>
   </div>
 
-  <!-- ── DOMAIN ── -->
-  <div class="page" id="page-domain">
-    <div class="ant-card" style="max-width:480px">
-      <div class="ant-card-head"><div class="ant-card-head-title">Custom Domain</div></div>
-      <div class="status-row">
-        <span class="status-key">Render Domain</span>
-        <span class="status-val" id="render-domain" style="font-family:monospace;font-size:11px">--</span>
-      </div>
-      <div class="status-row">
-        <span class="status-key">Custom Domain</span>
-        <span class="status-val" style="display:flex;align-items:center;gap:8px">
-          <span id="domain-value" style="font-family:monospace;font-size:11px">None set</span>
-          <button class="ant-btn ant-btn-danger ant-btn-sm" id="domain-clear-btn" onclick="clearDomain()" style="display:none">Clear</button>
-        </span>
-      </div>
-      <div class="form-group" style="margin-top:14px">
-        <label class="form-label">Set New Domain</label>
-        <div style="display:flex;gap:8px">
-          <input class="form-input" id="domain-input" placeholder="example.com" style="flex:1">
-          <button class="ant-btn ant-btn-primary" onclick="saveDomain()">Save</button>
-        </div>
-      </div>
-      <div style="padding:10px;background:rgba(0,135,113,0.06);border:1px solid rgba(0,135,113,0.15);border-radius:8px;font-size:11px;color:#888;line-height:1.6;margin-top:4px">
-        Set a custom domain to use in VLESS configs instead of the default Render/HuggingFace domain. Point your domain via CNAME or A record to this service.
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">Traffic (24h)</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-sm btn-secondary" onclick="openLogs()">Logs</button>
+        <button class="btn btn-sm btn-secondary" onclick="openConfig()">Config</button>
+        <button class="btn btn-sm btn-primary" onclick="downloadBackup()">Backup</button>
       </div>
     </div>
+    <div class="chart-container"><canvas id="trafficChart"></canvas></div>
   </div>
 
-  <!-- ── SETTINGS ── -->
-  <div class="page" id="page-settings">
-    <div class="ant-card" style="max-width:440px">
-      <div class="ant-card-head"><div class="ant-card-head-title">Change Password</div></div>
-      <div class="form-group">
-        <label class="form-label">Current Password</label>
-        <input class="form-input" type="password" id="cur-pw" placeholder="Current password">
-      </div>
-      <div class="form-group">
-        <label class="form-label">New Password</label>
-        <input class="form-input" type="password" id="new-pw" placeholder="Min 4 characters">
-      </div>
-      <div class="form-group">
-        <label class="form-label">Confirm Password</label>
-        <input class="form-input" type="password" id="confirm-pw" placeholder="Repeat new password">
-      </div>
-      <button class="ant-btn ant-btn-primary" onclick="changePassword()" style="width:100%;justify-content:center;margin-top:4px">Update Password</button>
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">System Info</div>
+      <div class="card-extra"><span class="tag tag-purple">Panel <span id="pv-tag">v2.0.0</span></span> <span class="tag tag-green" id="tg-tag"></span></div>
     </div>
+    <div class="info-row"><span class="info-label">Domain</span><span class="info-value" id="s-domain">--</span></div>
+    <div class="info-row"><span class="info-label">IPv4</span><span class="info-value ip-val" id="s-ipv4" onclick="toggleIps()">N/A</span></div>
+    <div class="info-row"><span class="info-label">IPv6</span><span class="info-value ip-val" id="s-ipv6" onclick="toggleIps()">N/A</span></div>
+    <div class="info-row"><span class="info-label">System Load</span><span class="info-value" id="s-load">--</span></div>
+    <div class="info-row"><span class="info-label">App RAM / Threads</span><span class="info-value" id="s-ram-th">--</span></div>
+    <div class="info-row"><span class="info-label">OS Uptime</span><span class="info-value" id="s-os-up">--</span></div>
   </div>
-
 </section>
 
-<!-- Add Inbound Modal -->
+<!-- Inbounds Page -->
+<section class="page" id="page-inbounds">
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-head">
+      <div class="card-title">Inbounds</div>
+      <button class="btn btn-primary btn-sm" onclick="showModal('add-modal')">+ New Inbound</button>
+    </div>
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px">
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-total">0</div><div style="font-size:10px;color:var(--text4)">Total</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--green)" id="ib-active">0</div><div style="font-size:10px;color:var(--text4)">Active</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-traffic">0 MB</div><div style="font-size:10px;color:var(--text4)">Proxy Traffic</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text)" id="ib-requests">0</div><div style="font-size:10px;color:var(--text4)">Requests</div></div>
+    </div>
+    <div class="chips">
+      <button class="chip active" onclick="setFilter('all',this)">All</button>
+      <button class="chip" onclick="setFilter('active',this)">Active</button>
+      <button class="chip" onclick="setFilter('disabled',this)">Disabled</button>
+      <button class="chip" onclick="setFilter('expired',this)">Expired</button>
+    </div>
+    <div class="search-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input placeholder="Search by name or UUID..." id="inbound-search" oninput="filterInbounds()">
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Traffic</th><th>Connections</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="inbounds-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Clean IP Page -->
+<section class="page" id="page-cleanip">
+  <div class="card">
+    <div class="card-head">
+      <div class="card-title">Clean IP / Domain Addresses</div>
+      <button class="btn btn-primary btn-sm" onclick="showModal('addr-modal')">+ Add</button>
+    </div>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:12px">These addresses are used as the connection address in VLESS links. The actual SNI/host remains your domain.</p>
+    <div id="address-list"></div>
+  </div>
+</section>
+
+<!-- Domain Page -->
+<section class="page" id="page-domain">
+  <div class="card">
+    <div class="card-head"><div class="card-title">Custom Domain</div></div>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:12px">Set a custom domain for generating VLESS links. Leave empty to use the default HF domain.</p>
+    <div class="info-row"><span class="info-label">Render Domain</span><span class="info-value" id="rd-domain">--</span></div>
+    <div class="info-row"><span class="info-label">Custom Domain</span><span class="info-value" id="dv-domain" style="cursor:pointer">--</span></div>
+    <div style="margin-top:12px">
+      <div class="form-row">
+        <div class="form-group" style="flex:3"><input class="form-input" id="domain-input" placeholder="e.g. mypanel.com"></div>
+        <button class="btn btn-primary" style="height:40px" onclick="saveDomain()">Save</button>
+      </div>
+      <button class="btn btn-danger btn-sm" id="domain-clear-btn" style="display:none;margin-top:6px" onclick="clearDomain()">Clear Custom Domain</button>
+    </div>
+  </div>
+</section>
+
+<!-- Panel Builder Page -->
+<section class="page" id="page-builder">
+  <div class="builder-card">
+    <div class="builder-title">Panel Builder</div>
+    <div class="builder-desc">Create a new Usf panel on your HuggingFace account with just a few clicks. Your HF token must have write access to Spaces.</div>
+    <div class="builder-steps">
+      <div class="builder-step"><div class="step-num">1</div><div class="step-text">Enter HF Token</div></div>
+      <div class="builder-step"><div class="step-num">2</div><div class="step-text">Choose Space Name</div></div>
+      <div class="builder-step"><div class="step-num">3</div><div class="step-text">Set Credentials</div></div>
+      <div class="builder-step"><div class="step-num">4</div><div class="step-text">Deploy</div></div>
+    </div>
+    <div class="form-group"><label class="form-label">HuggingFace Token</label><input class="form-input" id="pb-token" type="password" placeholder="hf_xxxxxxxxxxxxxxxxxx"></div>
+    <div class="form-group"><label class="form-label">Space Name (lowercase)</label><input class="form-input" id="pb-space" placeholder="my-usf-panel"></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Admin Username</label><input class="form-input" id="pb-user" value="admin"></div>
+      <div class="form-group"><label class="form-label">Admin Password</label><input class="form-input" id="pb-pass" type="password" value="admin" placeholder="min 4 chars"></div>
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;height:44px;font-size:14px;margin-top:4px" onclick="deployPanel()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      Deploy Panel
+    </button>
+    <div id="pb-result" style="margin-top:12px;display:none"></div>
+  </div>
+</section>
+
+<!-- Settings Page -->
+<section class="page" id="page-settings">
+  <div class="card">
+    <div class="card-head"><div class="card-title">Change Password</div></div>
+    <div class="form-group"><label class="form-label">Current Password</label><input class="form-input" id="cur-pw" type="password"></div>
+    <div class="form-group"><label class="form-label">New Password</label><input class="form-input" id="new-pw" type="password"></div>
+    <div class="form-group"><label class="form-label">Confirm New Password</label><input class="form-input" id="cfm-pw" type="password"></div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="changePassword()">Update Password</button>
+  </div>
+</section>
+
+</div>
+
+<!-- Modals -->
 <div class="modal-overlay" id="add-modal" onclick="if(event.target===this)closeModal('add-modal')">
-  <div class="modal">
-    <button class="modal-close" onclick="closeModal('add-modal')">×</button>
-    <div class="modal-title">Add Inbound</div>
-    <div class="form-group">
-      <label class="form-label">Remark / Name</label>
-      <input class="form-input" id="new-label" placeholder="e.g. User1">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="closeModal('add-modal')">&times;</button>
+    <div class="modal-title">New Inbound</div>
+    <div class="form-group"><label class="form-label">Name</label><input class="form-input" id="n-label" placeholder="e.g. User1"></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Traffic Limit</label><input class="form-input" id="n-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited"></div>
+      <div class="form-group" style="max-width:90px"><label class="form-label">Unit</label><select class="form-select" id="n-unit"><option value="GB">GB</option><option value="MB">MB</option></select></div>
     </div>
     <div class="form-row">
-      <div class="form-group">
-        <label class="form-label">Traffic Limit</label>
-        <input class="form-input" id="new-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
-      </div>
-      <div class="form-group" style="max-width:90px">
-        <label class="form-label">Unit</label>
-        <select class="form-select" id="new-unit"><option value="GB">GB</option><option value="MB">MB</option></select>
-      </div>
+      <div class="form-group"><label class="form-label">Max Connections (0 = Unlimited)</label><input class="form-input" id="n-maxconn" type="number" min="0" placeholder="0"></div>
+      <div class="form-group"><label class="form-label">Expiry Days (0 = Never)</label><input class="form-input" id="n-expiry" type="number" min="0" placeholder="0"></div>
     </div>
-    <div class="form-group">
-      <label class="form-label">Max IPs (0 = Unlimited)</label>
-      <input class="form-input" id="new-maxconn" type="number" min="0" step="1" placeholder="0">
-    </div>
-    <div class="form-group">
-      <label class="form-label">Expiry Days (0 = Never)</label>
-      <input class="form-input" id="new-expiry" type="number" min="0" step="1" placeholder="0">
-    </div>
-    <button class="ant-btn ant-btn-primary" onclick="createInbound()" style="width:100%;justify-content:center;margin-top:8px">Create</button>
+    <div class="form-group"><label class="form-label">Tag (optional)</label><input class="form-input" id="n-tag" placeholder="e.g. VIP, Trial"></div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="createInbound()">Create Inbound</button>
   </div>
 </div>
 
-<!-- Edit Inbound Modal -->
 <div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)closeModal('edit-modal')">
-  <div class="modal">
-    <button class="modal-close" onclick="closeModal('edit-modal')">×</button>
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="closeModal('edit-modal')">&times;</button>
     <div class="modal-title" id="edit-title">Edit Inbound</div>
     <input type="hidden" id="edit-uid">
-    <div class="form-group">
-      <label class="form-label">Name (read-only)</label>
-      <input class="form-input" id="edit-name" readonly style="opacity:0.5;cursor:not-allowed">
+    <div class="form-group"><label class="form-label">Name (read-only)</label><input class="form-input" id="e-name" readonly style="opacity:.5;cursor:not-allowed"></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Traffic Limit</label><input class="form-input" id="e-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited"></div>
+      <div class="form-group" style="max-width:90px"><label class="form-label">Unit</label><select class="form-select" id="e-unit"><option value="GB">GB</option><option value="MB">MB</option></select></div>
     </div>
     <div class="form-row">
-      <div class="form-group">
-        <label class="form-label">Traffic Limit</label>
-        <input class="form-input" id="edit-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
-      </div>
-      <div class="form-group" style="max-width:90px">
-        <label class="form-label">Unit</label>
-        <select class="form-select" id="edit-unit"><option value="GB">GB</option><option value="MB">MB</option></select>
-      </div>
+      <div class="form-group"><label class="form-label">Max Connections</label><input class="form-input" id="e-maxconn" type="number" min="0" placeholder="0"></div>
+      <div class="form-group"><label class="form-label">Expiry Days</label><input class="form-input" id="e-expiry" type="number" min="0" placeholder="0 = Keep current"></div>
     </div>
-    <div class="form-group">
-      <label class="form-label">Max IPs</label>
-      <input class="form-input" id="edit-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
-    </div>
+    <div class="form-group"><label class="form-label">Tag</label><input class="form-input" id="e-tag" placeholder="e.g. VIP"></div>
     <div style="display:flex;gap:8px;margin-top:12px">
-      <button class="ant-btn ant-btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
-      <button class="ant-btn ant-btn-danger" onclick="resetTraffic()">Reset Traffic</button>
+      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
+      <button class="btn btn-danger" onclick="resetTraffic()">Reset Traffic</button>
     </div>
   </div>
 </div>
 
-<!-- Add Address Modal -->
-<div class="modal-overlay" id="add-address-modal" onclick="if(event.target===this)closeModal('add-address-modal')">
-  <div class="modal">
-    <button class="modal-close" onclick="closeModal('add-address-modal')">×</button>
+<div class="modal-overlay" id="addr-modal" onclick="if(event.target===this)closeModal('addr-modal')">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="closeModal('addr-modal')">&times;</button>
     <div class="modal-title">Add Clean IP / Domain</div>
-    <div class="form-group">
-      <label class="form-label">IPs or Domains (one per line)</label>
-      <textarea class="form-input" id="new-address" rows="5" placeholder="8.8.8.8&#10;example.com&#10;1.0.0.1" style="resize:vertical;font-family:monospace"></textarea>
-    </div>
-    <button class="ant-btn ant-btn-primary" onclick="addAddresses()" style="width:100%;justify-content:center;margin-top:8px">Add All</button>
+    <div class="form-group"><label class="form-label">Addresses (one per line)</label><textarea class="form-input" id="n-addr" rows="5" placeholder="8.8.8.8&#10;example.com" style="resize:vertical;font-family:'JetBrains Mono',monospace;height:auto;padding:10px 12px"></textarea></div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="addAddresses()">Add All</button>
   </div>
 </div>
 
-<!-- Logs Modal -->
 <div class="modal-overlay" id="logs-modal" onclick="if(event.target===this)closeModal('logs-modal')">
-  <div class="modal" style="max-width:560px">
-    <button class="modal-close" onclick="closeModal('logs-modal')">×</button>
-    <div class="modal-title">Logs</div>
-    <div class="log-box" id="logs-box">Loading...</div>
-    <div style="display:flex;gap:8px;margin-top:14px">
-      <button class="ant-btn ant-btn-secondary" onclick="openLogs()" style="flex:1;justify-content:center">Refresh</button>
-      <button class="ant-btn ant-btn-secondary" onclick="closeModal('logs-modal')" style="flex:1;justify-content:center">Close</button>
-    </div>
+  <div class="modal" style="max-width:560px;position:relative">
+    <button class="modal-close" onclick="closeModal('logs-modal')">&times;</button>
+    <div class="modal-title">Logs &amp; Connections</div>
+    <div style="background:var(--surface2);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6" id="logs-box">Loading...</div>
+    <button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:10px" onclick="openLogs()">Refresh</button>
   </div>
 </div>
 
-<!-- Config Modal -->
 <div class="modal-overlay" id="config-modal" onclick="if(event.target===this)closeModal('config-modal')">
-  <div class="modal" style="max-width:560px">
-    <button class="modal-close" onclick="closeModal('config-modal')">×</button>
-    <div class="modal-title">Config</div>
-    <div class="log-box" id="config-box">Loading...</div>
-    <div style="display:flex;gap:8px;margin-top:14px">
-      <button class="ant-btn ant-btn-secondary" onclick="closeModal('config-modal')" style="flex:1;justify-content:center">Close</button>
-    </div>
+  <div class="modal" style="max-width:560px;position:relative">
+    <button class="modal-close" onclick="closeModal('config-modal')">&times;</button>
+    <div class="modal-title">Runtime Config</div>
+    <div style="background:var(--surface2);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:400px;overflow-y:auto;white-space:pre-wrap" id="config-box">Loading...</div>
   </div>
 </div>
+
+<div class="toast" id="toast"></div>
 
 <script>
-let allLinks = [];
-let currentFilter = 'all';
-let apiStats = {};
+var allLinks=[],curFilter='all',apiStats={},trafficChart=null;
+function go(id,el){document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active')});document.getElementById('page-'+id).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});if(el)el.classList.add('active');closeSidebar();if(id==='inbounds')loadInbounds();if(id==='cleanip')loadAddresses();if(id==='domain')loadDomain()}
+function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
+function closeSidebar(){document.getElementById('sidebar').classList.remove('open');document.getElementById('overlay').classList.remove('show')}
+function closeModal(id){document.getElementById(id).classList.remove('show')}
+function showModal(id){document.getElementById(id).classList.add('show')}
+function toast(m,e){var t=document.getElementById('toast');t.textContent=m;t.className='toast '+(e?'error':'success')+' show';setTimeout(function(){t.classList.remove('show')},3000)}
+function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function fmtB(b){if(!b||b===0)return '0 B';if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B'}
+function fmtL(b){if(!b||b===0)return 'Unlimited';var g=b/1073741824;return(g%1===0?g.toFixed(0):g.toFixed(1))+' GB'}
 
-// ── Navigation ──────────────────────────────────────────────
-function switchPage(id, el) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.getElementById('page-' + id).classList.add('active');
-  document.querySelectorAll('.ant-menu-item').forEach(n => n.classList.remove('ant-menu-item-selected'));
-  if (el) el.classList.add('ant-menu-item-selected');
-  closeSidebar();
-  if (id === 'inbounds') loadInbounds();
-  if (id === 'cleanip') loadAddresses();
-  if (id === 'domain') loadDomain();
+function setGauge(id,pct){pct=Math.max(0,Math.min(100,pct||0));var el=document.getElementById(id);if(el)el.setAttribute('stroke-dashoffset',(201*(1-pct/100)).toFixed(1))}
+
+async function loadStats(){
+  try{
+    var r=await fetch('/api/stats');if(!r.ok)throw 0;apiStats=await r.json();
+    setGauge('g-cpu',apiStats.cpuUsage);setGauge('g-ram',apiStats.ramUsage);setGauge('g-swap',apiStats.swapUsage);setGauge('g-disk',apiStats.storageUsage);
+    document.getElementById('g-cpu-t').textContent=(apiStats.cpuUsage||0).toFixed(1)+'%';
+    document.getElementById('g-ram-t').textContent=(apiStats.ramUsage||0).toFixed(1)+'%';
+    document.getElementById('g-swap-t').textContent=(apiStats.swapUsage||0).toFixed(1)+'%';
+    document.getElementById('g-disk-t').textContent=(apiStats.storageUsage||0).toFixed(1)+'%';
+    var run=apiStats.xrayRunning!==false;
+    document.getElementById('xray-dot').className='badge-dot '+(run?'green':'red');
+    document.getElementById('xray-status-text').textContent=run?'Running':'Stopped';
+    document.getElementById('s-conn').textContent=apiStats.activeConnections||0;
+    document.getElementById('s-up').textContent=apiStats.uploadSpeed||'--';
+    document.getElementById('s-down').textContent=apiStats.downloadSpeed||'--';
+    document.getElementById('s-traffic').textContent=(apiStats.totalTrafficMb||0).toFixed(2)+' MB';
+    document.getElementById('s-sent').textContent=apiStats.totalSent||'--';
+    document.getElementById('s-recv').textContent=apiStats.totalReceived||'--';
+    document.getElementById('s-uptime').textContent=apiStats.xrayUptime||'--';
+    document.getElementById('s-tcp-udp').textContent='TCP: '+(apiStats.tcpConnections||0)+' | UDP: '+(apiStats.udpConnections||0);
+    document.getElementById('s-domain').textContent=apiStats.domain||'--';
+    document.getElementById('s-ipv4').textContent=apiStats.ipv4||'N/A';
+    document.getElementById('s-ipv6').textContent=apiStats.ipv6||'N/A';
+    document.getElementById('s-load').textContent=apiStats.systemLoad||'--';
+    document.getElementById('s-ram-th').textContent=(apiStats.appRam||'--')+' / '+(apiStats.threads||'--')+' threads';
+    document.getElementById('s-os-up').textContent=apiStats.uptime||'--';
+    document.getElementById('pv-tag').textContent=apiStats.panelVersion||'v2.0.0';
+    document.getElementById('ver-badge').textContent=apiStats.panelVersion||'v2.0.0';
+    if(apiStats.telegram)document.getElementById('tg-tag').textContent=apiStats.telegram;
+    var lb=document.getElementById('links-badge');if(lb)lb.textContent=apiStats.linksCount||0;
+    if(document.getElementById('ib-total'))document.getElementById('ib-total').textContent=apiStats.linksCount||0;
+    if(document.getElementById('ib-traffic'))document.getElementById('ib-traffic').textContent=(apiStats.totalTrafficMb||0).toFixed(2)+' MB';
+    if(document.getElementById('ib-requests'))document.getElementById('ib-requests').textContent=apiStats.totalRequests||0;
+    var rd=document.getElementById('rd-domain');if(rd)rd.textContent=apiStats.domain||'--';
+    updateChart(apiStats.hourlyTraffic||{});
+  }catch(e){}
 }
 
-function toggleSidebar() {
-  const s = document.getElementById('sidebar');
-  const ov = document.getElementById('sidebar-overlay');
-  s.classList.toggle('open');
-  ov.classList.toggle('show');
-}
-function closeSidebar() {
-  document.getElementById('sidebar').classList.remove('open');
-  document.getElementById('sidebar-overlay').classList.remove('show');
-}
+var ipsVis=false;function toggleIps(){ipsVis=!ipsVis;document.querySelectorAll('.ip-val').forEach(function(el){el.classList.toggle('visible',ipsVis)})}
 
-function closeModal(id) { document.getElementById(id).classList.remove('show'); }
-function showAddModal() { document.getElementById('add-modal').classList.add('show'); }
-
-function toast(msg, err=false) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast' + (err ? ' error' : '') + ' show';
-  setTimeout(() => t.classList.remove('show'), 3000);
+function initChart(){
+  var ctx=document.getElementById('trafficChart');if(!ctx)return;
+  var labels=[];for(var i=0;i<24;i++){var h=(new Date().getHours()-23+i+24)%24;labels.push((h<10?'0':'')+h+':00')}
+  trafficChart=new Chart(ctx,{type:'bar',data:{labels:labels,datasets:[{label:'Traffic',data:new Array(24).fill(0),backgroundColor:'rgba(99,102,241,0.3)',borderColor:'#6366f1',borderWidth:1,borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9}}},y:{grid:{color:'rgba(255,255,255,0.03)'},ticks:{color:'#64748b',font:{size:9},callback:function(v){return fmtB(v)}}}}}});
+}
+function updateChart(ht){
+  if(!trafficChart)return;
+  var data=[];for(var i=0;i<24;i++){var h=(new Date().getHours()-23+i+24)%24;var key=(h<10?'0':'')+h+':00';data.push(((ht[key]||0)/1048576))}
+  trafficChart.data.datasets[0].data=data;trafficChart.update('none');
 }
 
-function esc(s) { return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-function fmtBytes(b) {
-  if (!b || b === 0) return '0 B';
-  if (b >= 1073741824) return (b/1073741824).toFixed(2)+' GB';
-  if (b >= 1048576) return (b/1048576).toFixed(2)+' MB';
-  if (b >= 1024) return (b/1024).toFixed(1)+' KB';
-  return b+' B';
-}
-function fmtLimit(b) {
-  if (!b || b === 0) return 'Unlimited';
-  const gb = b/1073741824;
-  return (gb%1===0?gb.toFixed(0):gb.toFixed(1))+' GB';
-}
-
-// ── Stats ────────────────────────────────────────────────────
-let ipsVisible = false;
-
-function setGauge(prefix, pct){
-  pct = Math.max(0, Math.min(100, pct||0));
-  const FULL = 197.9; // length of the 270deg track
-  const arc = document.getElementById(prefix+'-arc');
-  const txt = document.getElementById(prefix+'-text');
-  if (arc) arc.setAttribute('stroke-dasharray', (pct/100*FULL).toFixed(1)+' 263.9');
-  if (txt) txt.textContent = pct.toFixed(2)+'%';
-}
-
-async function loadStats() {
-  try {
-    const r = await fetch('/api/stats');
-    if (!r.ok) throw new Error();
-    apiStats = await r.json();
-
-    // Gauges
-    setGauge('cpu', apiStats.cpuUsage||0);
-    setGauge('ram', apiStats.ramUsage||0);
-    setGauge('swap', apiStats.swapUsage||0);
-    setGauge('storage', apiStats.storageUsage||0);
-
-    const cores = apiStats.cpuCores||1;
-    document.getElementById('cpu-cores').textContent = cores + ' Core' + (cores>1?'s':'');
-    document.getElementById('ram-label').textContent = (apiStats.ramUsed||'')+' / '+(apiStats.ramTotal||'');
-    document.getElementById('swap-label').textContent = (apiStats.swapUsed||'0 B')+' / '+(apiStats.swapTotal||'0 B');
-    document.getElementById('storage-label').textContent = (apiStats.storageUsed||'')+' / '+(apiStats.storageTotal||'');
-
-    // Xray status
-    const running = apiStats.xrayRunning !== false;
-    const dot = document.querySelector('#xray-badge .ant-badge-status-dot');
-    document.getElementById('xray-status').textContent = running ? 'Running' : 'Stopped';
-    document.getElementById('xray-action-1').textContent = running ? 'Stop' : 'Start';
-    if (dot) {
-      dot.classList.toggle('ant-badge-status-green', running);
-      dot.classList.toggle('ant-badge-status-processing', running);
-      dot.style.background = running ? '' : '#ef4444';
-    }
-    document.getElementById('core-version').textContent = apiStats.coreVersion || '--';
-    const pv = apiStats.panelVersion || '--';
-    document.getElementById('panel-version-btn').textContent = pv;
-    document.getElementById('panel-version-tag').textContent = pv;
-    if (apiStats.telegram) document.getElementById('tg-tag').textContent = apiStats.telegram;
-
-    // Uptime / load / usage
-    document.getElementById('xray-uptime').textContent = apiStats.xrayUptime || '--';
-    document.getElementById('os-uptime').textContent = apiStats.uptime || '--';
-    document.getElementById('system-load').textContent = apiStats.systemLoad || '--';
-    document.getElementById('app-ram').textContent = apiStats.appRam || '--';
-    document.getElementById('threads').textContent = apiStats.threads ?? '--';
-
-    // Speed / data
-    document.getElementById('upload-speed').textContent = apiStats.uploadSpeed || '-- B/s';
-    document.getElementById('download-speed').textContent = apiStats.downloadSpeed || '-- B/s';
-    document.getElementById('total-sent').textContent = apiStats.totalSent || '--';
-    document.getElementById('total-received').textContent = apiStats.totalReceived || '--';
-
-    // IPs
-    document.getElementById('ipv4').textContent = apiStats.ipv4 || 'N/A';
-    document.getElementById('ipv6').textContent = apiStats.ipv6 || 'N/A';
-
-    // Connection stats
-    document.getElementById('tcp-conn').textContent = apiStats.tcpConnections ?? '--';
-    document.getElementById('udp-conn').textContent = apiStats.udpConnections ?? '--';
-
-    // sidebar badge
-    const lb = document.getElementById('links-badge');
-    if (lb) lb.textContent = apiStats.linksCount || 0;
-
-    // inbounds page mirrors
-    if (document.getElementById('ib-proxy-traffic')) document.getElementById('ib-proxy-traffic').textContent = (apiStats.totalTrafficMb||0).toFixed(2)+' MB';
-    if (document.getElementById('ib-total')) document.getElementById('ib-total').textContent = apiStats.linksCount || 0;
-    if (document.getElementById('ib-sent-recv')) document.getElementById('ib-sent-recv').textContent = (apiStats.totalSent||'--')+' / '+(apiStats.totalReceived||'--');
-    const rd = document.getElementById('render-domain');
-    if (rd) rd.textContent = apiStats.domain || '--';
-  } catch(e) {}
-}
-
-function toggleIps(){
-  ipsVisible = !ipsVisible;
-  document.querySelectorAll('.ip-val').forEach(el=>el.classList.toggle('ip-hidden', !ipsVisible));
-}
-
-async function stopService(){
-  const running = apiStats.xrayRunning !== false;
-  if (running){
-    if(!confirm('Stop the core? All active connections will be dropped.')) return;
-    try{ const r=await fetch('/api/service/stop',{method:'POST'}); if(!r.ok)throw 0; toast('Core stopped'); }catch(e){ toast('Error',true);} 
-  } else {
-    try{ const r=await fetch('/api/service/restart',{method:'POST'}); if(!r.ok)throw 0; toast('Core started'); }catch(e){ toast('Error',true);} 
-  }
-  await loadStats();
-}
-async function restartService(){
-  if(!confirm('Restart the core?')) return;
-  try{ const r=await fetch('/api/service/restart',{method:'POST'}); if(!r.ok)throw 0; toast('Core restarted'); }catch(e){ toast('Error',true);} 
-  await loadStats();
-}
 async function openLogs(){
-  try{
-    const r=await fetch('/api/logs'); const d=await r.json();
-    let out='STATUS: '+(d.running?'Running':'Stopped')+'\n';
-       out+='Traffic: '+fmtBytes(d.totals.bytes)+'  |  Requests: '+d.totals.requests+'  |  Errors: '+d.totals.errors+'\n';
-    out+='\n── Active connections ('+d.connections.length+') ──\n';
-    if(!d.connections.length) out+='(none)\n';
-    d.connections.forEach(c=>{ out+=c.ip+'  '+(c.uuid||'').slice(0,8)+'…  '+fmtBytes(c.bytes)+'  '+(c.connected_at||'').slice(11,19)+'\n'; });
-    out+='\n── Recent errors ('+d.errors.length+') ──\n';
-    if(!d.errors.length) out+='(none)\n';
-    d.errors.slice().reverse().forEach(e=>{ out+=(e.time||'').slice(11,19)+'  '+e.error+'\n'; });
-    document.getElementById('logs-box').textContent=out;
-    document.getElementById('logs-modal').classList.add('show');
-  }catch(e){ toast('Failed to load logs',true);} 
+  try{var r=await fetch('/api/logs');var d=await r.json();
+  var out='STATUS: '+(d.running?'Running':'Stopped')+'\nTraffic: '+fmtB(d.totals.bytes)+'  |  Requests: '+d.totals.requests+'  |  Errors: '+d.totals.errors+'\n\n';
+  out+='── Active connections ('+d.connections.length+') ──\n';
+  if(!d.connections.length)out+='(none)\n';
+  d.connections.forEach(function(c){out+=c.ip+'  '+(c.uuid||'').slice(0,8)+'...  '+fmtB(c.bytes)+'  '+(c.connected_at||'').slice(11,19)+'\n'});
+  if(d.history&&d.history.length){out+='\n── Recent history ('+d.history.length+') ──\n';d.history.slice(-20).forEach(function(h){out+=(h.time||'').slice(11,19)+'  '+(h.label||'?')+'  '+h.ip+'  -> '+h.target+'\n'})}
+  out+='\n── Recent errors ('+d.errors.length+') ──\n';
+  if(!d.errors.length)out+='(none)\n';
+  d.errors.slice().reverse().forEach(function(e){out+=(e.time||'').slice(11,19)+'  '+e.error+'\n'});
+  document.getElementById('logs-box').textContent=out;showModal('logs-modal')}catch(e){toast('Failed to load logs',true)}
 }
-async function openConfig(){
-  try{
-    const r=await fetch('/api/config'); const d=await r.json();
-    document.getElementById('config-box').textContent=JSON.stringify(d,null,2);
-    document.getElementById('config-modal').classList.add('show');
-  }catch(e){ toast('Failed to load config',true);} 
-}
-function downloadBackup(){
-  const a=document.createElement('a'); a.href='/api/backup'; a.download=''; document.body.appendChild(a); a.click(); a.remove();
-  toast('Backup downloaded');
-}
-function checkUpdate(){
-  toast('Usf '+(apiStats.panelVersion||'')+' — you are on the latest version');
-}
+async function openConfig(){try{var r=await fetch('/api/config');var d=await r.json();document.getElementById('config-box').textContent=JSON.stringify(d,null,2);showModal('config-modal')}catch(e){toast('Failed',true)}}
+function downloadBackup(){var a=document.createElement('a');a.href='/api/backup';a.download='';document.body.appendChild(a);a.click();a.remove();toast('Backup downloaded')}
 
-// ── Inbounds ─────────────────────────────────────────────────
-async function loadInbounds() {
-  try {
-    const r = await fetch('/api/links');
-    if (!r.ok) throw new Error();
-    const d = await r.json();
-    allLinks = d.links || [];
-    filterInbounds();
-    if (document.getElementById('ib-total')) document.getElementById('ib-total').textContent = allLinks.length;
-    if (document.getElementById('ib-clients')) document.getElementById('ib-clients').textContent = allLinks.filter(l=>l.active).length;
-  } catch(e) {
-    document.getElementById('inbounds-tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;padding:32px;color:#555">Failed to load inbounds</td></tr>';
-  }
+/* Inbounds */
+async function loadInbounds(){
+  try{var r=await fetch('/api/links');if(!r.ok)throw 0;var d=await r.json();allLinks=d.links||[];filterInbounds();
+  if(document.getElementById('ib-total'))document.getElementById('ib-total').textContent=allLinks.length;
+  if(document.getElementById('ib-active'))document.getElementById('ib-active').textContent=allLinks.filter(function(l){return l.active}).length;
+  }catch(e){document.getElementById('inbounds-tbody').innerHTML='<tr><td colspan="7" style="text-align:center;padding:32px;color:var(--text4)">Failed to load</td></tr>'}
 }
-
-function setFilter(f, el) {
-  currentFilter = f;
-  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-  el.classList.add('active');
-  filterInbounds();
-}
-
-function filterInbounds() {
-  const q = (document.getElementById('inbound-search')?.value||'').toLowerCase();
-  let filtered = allLinks;
-  if (currentFilter === 'active') filtered = filtered.filter(l => l.active);
-  if (currentFilter === 'disabled') filtered = filtered.filter(l => !l.active);
-  if (q) filtered = filtered.filter(l => l.label.toLowerCase().includes(q) || l.uuid.toLowerCase().includes(q));
+function setFilter(f,el){curFilter=f;document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active')});el.classList.add('active');filterInbounds()}
+function filterInbounds(){
+  var q=(document.getElementById('inbound-search')?document.getElementById('inbound-search').value:'').toLowerCase();
+  var filtered=allLinks;
+  if(curFilter==='active')filtered=filtered.filter(function(l){return l.active});
+  if(curFilter==='disabled')filtered=filtered.filter(function(l){return !l.active});
+  if(curFilter==='expired')filtered=filtered.filter(function(l){return l.expired});
+  if(q)filtered=filtered.filter(function(l){return l.label.toLowerCase().indexOf(q)!==-1||l.uuid.toLowerCase().indexOf(q)!==-1});
   renderInbounds(filtered);
 }
-
-function renderInbounds(links) {
-  const tbody = document.getElementById('inbounds-tbody');
-  if (!links.length) {
-    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">No inbounds found</div></td></tr>';
-    return;
-  }
-  let idx = links.length;
-  tbody.innerHTML = links.map(l => {
-    const u = l.used_bytes, lim = l.limit_bytes;
-    const uF = fmtBytes(u), lF = fmtLimit(lim);
-    const pct = lim > 0 ? Math.min(100, (u/lim)*100) : 0;
-    const col = pct>90?'#ef4444':pct>70?'#fbbf24':'#008771';
-    const i = idx--;
-    const maxC = l.max_connections || 0;
-    const curC = l.current_connections || 0;
-    return `<tr>
-      <td style="color:#555;font-size:11px">${i}</td>
-      <td style="font-weight:600;color:#ccc">${esc(l.label)}</td>
-      <td><span class="ant-tag ant-tag-purple">VLESS</span></td>
-      <td>
-        <div class="usage-pill">
-          <span class="used">${uF}</span>
-          <div class="bar"><div class="fill" style="width:${pct}%;background:${col}"></div></div>
-          <span class="limit">${lF}</span>
-        </div>
-      </td>
-      <td style="font-size:12px;font-weight:600;color:${maxC>0&&curC>=maxC?'#ef4444':'#888'}">${curC}/${maxC||'∞'}</td>
-      <td><span class="ant-tag ${l.active?'ant-tag-green':'ant-tag-red'}">${l.active?'On':'Off'}</span></td>
-      <td>
-        <div style="display:flex;gap:3px;align-items:center">
-          <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="toggleInbound(this)" title="Toggle"></button>
-          <button class="ant-btn ant-btn-secondary ant-btn-sm" onclick="showEditModal('${l.uuid}')" style="padding:3px 7px;color:#fbbf24;border-color:rgba(251,191,36,0.2);background:rgba(251,191,36,0.06)">e</button>
-          <button class="btn-copy" onclick="copyVless('${esc(l.vless_link)}')" title="Copy VLESS">c</button>
-          <button class="btn-copy" onclick="copySubUrl('${l.uuid}')" style="background:rgba(34,197,94,0.08);color:#22c55e;border-color:rgba(34,197,94,0.15)" title="Copy Sub URL">s</button>          <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteInbound('${l.uuid}')" title="Delete">x</button>
-        </div>
-      </td>
-    </tr>`;
+function renderInbounds(links){
+  var tbody=document.getElementById('inbounds-tbody');if(!links.length){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:32px;color:var(--text4)">No inbounds found</td></tr>';return}
+  var idx=links.length;
+  tbody.innerHTML=links.map(function(l){
+    var u=l.used_bytes,lim=l.limit_bytes,uF=fmtB(u),lF=fmtL(lim);
+    var pct=lim>0?Math.min(100,(u/lim)*100):0;
+    var col=pct>90?'#ef4444':pct>70?'#f59e0b':'#6366f1';
+    var i=idx--;var mc=l.max_connections||0;var cc=l.current_connections||0;
+    var statusTag=l.expired?'<span class="tag tag-amber">Expired</span>':(l.active?'<span class="tag tag-green">Active</span>':'<span class="tag tag-red">Disabled</span>');
+    var tag=l.tag?'<span class="tag tag-purple" style="margin-right:4px">'+esc(l.tag)+'</span>':'';
+    return '<tr><td style="color:var(--text4);font-size:10px">'+i+'</td><td style="font-weight:600;color:var(--text)">'+tag+esc(l.label)+'</td><td><span class="tag tag-purple">VLESS</span></td><td><div class="usage-pill"><span class="used">'+uF+'</span><div class="bar"><div class="fill" style="width:'+pct+'%;background:'+col+'"></div></div><span class="limit">'+lF+'</span></div></td><td style="font-size:11px;font-weight:600;color:'+(mc>0&&cc>=mc?'var(--red)':'var(--text3)')+'">'+cc+'/'+(mc||'&infin;')+'</td><td>'+statusTag+'</td><td><div style="display:flex;gap:3px;align-items:center"><button class="btn-icon btn-secondary" data-uid="'+l.uuid+'" onclick="toggleInbound(this)" title="Toggle">'+(l.active?'ON':'OFF')+'</button><button class="btn-icon btn-secondary" onclick="showEditModal(\''+l.uuid+'\')" title="Edit" style="color:var(--amber)">E</button><button class="btn-icon btn-secondary" onclick="copyVless(\''+esc(l.vless_link).replace(/'/g,"\\'")+'\')" title="Copy Config">C</button><button class="btn-icon btn-secondary" onclick="copySubUrl(\''+l.uuid+'\')" title="Copy Sub URL" style="color:var(--green)">S</button><button class="btn-icon btn-danger" onclick="deleteInbound(\''+l.uuid+'\')" title="Delete">X</button></div></td></tr>';
   }).join('');
 }
-
-async function toggleInbound(el) {
-  const uid = el.dataset.uid;
-  const link = allLinks.find(l => l.uuid === uid);
-  if (!link) return;
-  try {
-    await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({active:!link.active})});
-    await loadInbounds();
-    await loadStats();
-  } catch(e) { toast('Error', true); }
+async function toggleInbound(el){var uid=el.dataset.uid;var link=allLinks.find(function(l){return l.uuid===uid});if(!link)return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!link.active})});await loadInbounds();await loadStats()}catch(e){toast('Error',true)}}
+async function createInbound(){
+  var label=document.getElementById('n-label').value.trim();if(!label){toast('Name required',true);return}
+  if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Invalid name',true);return}
+  var val=parseFloat(document.getElementById('n-limit').value)||0;
+  var unit=document.getElementById('n-unit').value;
+  var mc=parseInt(document.getElementById('n-maxconn').value)||0;
+  var exp=parseInt(document.getElementById('n-expiry').value)||0;
+  var tag=document.getElementById('n-tag').value.trim();
+  try{var r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label,limit_value:val,limit_unit:unit,max_connections:mc,expiry_days:exp,tag:tag})});
+  if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Error')}
+  toast('Inbound created');document.getElementById('n-label').value='';document.getElementById('n-limit').value='';document.getElementById('n-maxconn').value='';document.getElementById('n-expiry').value='';document.getElementById('n-tag').value='';closeModal('add-modal');await loadInbounds();await loadStats()}catch(e){toast(e.message,true)}
 }
+async function deleteInbound(uid){if(!confirm('Delete this inbound?'))return;try{await fetch('/api/links/'+uid,{method:'DELETE'});toast('Deleted');await loadInbounds();await loadStats()}catch(e){toast('Error',true)}}
+function showEditModal(uid){var l=allLinks.find(function(x){return x.uuid===uid});if(!l)return;document.getElementById('edit-uid').value=uid;document.getElementById('e-name').value=l.label;document.getElementById('e-limit').value=l.limit_bytes>0?(l.limit_bytes/1073741824).toFixed(2):'';document.getElementById('e-unit').value='GB';document.getElementById('e-maxconn').value=l.max_connections>0?l.max_connections:'';document.getElementById('e-expiry').value='';document.getElementById('e-tag').value=l.tag||'';document.getElementById('edit-title').textContent='Edit: '+l.label;showModal('edit-modal')}
+async function saveEdit(){var uid=document.getElementById('edit-uid').value;var val=parseFloat(document.getElementById('e-limit').value)||0;var unit=document.getElementById('e-unit').value;var mc=parseInt(document.getElementById('e-maxconn').value)||0;var exp=parseInt(document.getElementById('e-expiry').value)||0;var tag=document.getElementById('e-tag').value.trim();var body={limit_value:val,limit_unit:unit,max_connections:mc,tag:tag};if(exp>0)body.expiry_days=exp;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Updated');closeModal('edit-modal');await loadInbounds()}catch(e){toast('Error',true)}}
+async function resetTraffic(){var uid=document.getElementById('edit-uid').value;if(!confirm('Reset traffic?'))return;try{await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Traffic reset');await loadInbounds()}catch(e){toast('Error',true)}}
+function copyVless(t){navigator.clipboard.writeText(t).then(function(){toast('Config copied')}).catch(function(){toast('Copy failed',true)})}
+async function copySubUrl(uid){var url='https://'+location.host+'/sub/'+uid;navigator.clipboard.writeText(url).then(function(){toast('Sub URL copied')}).catch(function(){toast('Copy failed',true)})}
 
-async function createInbound() {
-  const label = document.getElementById('new-label').value.trim();
-  if (!label) { toast('Name is required', true); return; }
-  if (!/^[a-zA-Z0-9\-_. ]+$/.test(label)) { toast('Only English letters, numbers, - _ . space', true); return; }
-  const val = parseFloat(document.getElementById('new-limit').value)||0;
-  const unit = document.getElementById('new-unit').value;
-  const maxconn = parseInt(document.getElementById('new-maxconn').value)||0;
-  const expiry = parseInt(document.getElementById('new-expiry').value)||0;
-  try {
-    const r = await fetch('/api/links', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({label,limit_value:val,limit_unit:unit,max_connections:maxconn,expiry_days:expiry})});
-    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
-    toast('Inbound created');
-    document.getElementById('new-label').value='';
-    document.getElementById('new-limit').value='';
-    document.getElementById('new-maxconn').value='';
-    document.getElementById('new-expiry').value='';
-    closeModal('add-modal');
-    await loadInbounds();
-    await loadStats();
-  } catch(e) { toast(e.message, true); }
-}
+/* Addresses */
+var allAddrs=[];
+async function loadAddresses(){try{var r=await fetch('/api/addresses');if(!r.ok)throw 0;var d=await r.json();allAddrs=d.addresses||[];renderAddrs()}catch(e){}}
+function renderAddrs(){var el=document.getElementById('address-list');if(!allAddrs.length){el.innerHTML='<div style="color:var(--text4);font-size:12px;padding:8px 0">No addresses added</div>';return}
+el.innerHTML=allAddrs.map(function(a,i){return '<div class="addr-item"><span>'+esc(a)+'</span><button class="btn btn-danger btn-sm" onclick="delAddr('+i+')">Remove</button></div>'}).join('')}
+async function addAddresses(){var text=document.getElementById('n-addr').value.trim();if(!text){toast('Enter address',true);return}var lines=text.split('\n').map(function(l){return l.trim()}).filter(function(l){return l});var added=0,errors=0;for(var i=0;i<lines.length;i++){var addr=lines[i];if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){errors++;continue}try{var r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});if(r.ok)added++;else errors++}catch(e){errors++}}if(added>0)toast('Added '+added+' address(es)');if(errors>0)toast(errors+' failed',true);if(added>0){closeModal('addr-modal');await loadAddresses()}}
+async function delAddr(i){if(!confirm('Remove this address?'))return;try{var r=await fetch('/api/addresses/'+i,{method:'DELETE'});if(!r.ok)throw 0;toast('Removed');await loadAddresses()}catch(e){toast('Error',true)}}
 
-async function deleteInbound(uid) {
-  if (!confirm('Delete this inbound?')) return;
-  try {
-    await fetch(`/api/links/${uid}`, {method:'DELETE'});
-    toast('Deleted');
-    await loadInbounds();
-    await loadStats();
-  } catch(e) { toast('Error', true); }
-}
+/* Domain */
+var curDomain='';
+async function loadDomain(){try{var r=await fetch('/api/domain');if(!r.ok)throw 0;var d=await r.json();curDomain=d.domain||'';var rd=document.getElementById('rd-domain');if(rd)rd.textContent=apiStats.domain||location.host;var dv=document.getElementById('dv-domain');var cb=document.getElementById('domain-clear-btn');if(curDomain){dv.textContent=curDomain;dv.style.color='var(--accent)';if(cb)cb.style.display=''}else{dv.textContent=(apiStats.domain||location.host)+' (default)';dv.style.color='var(--text3)';if(cb)cb.style.display='none'}}catch(e){}}
+async function saveDomain(){var d=document.getElementById('domain-input').value.trim();if(!d){toast('Enter domain',true);return}try{var r=await fetch('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:d})});if(!r.ok){var j=await r.json().catch(function(){return{}});throw new Error(j.detail||'Error')}toast('Domain saved');document.getElementById('domain-input').value='';await loadDomain()}catch(e){toast(e.message,true)}}
+async function clearDomain(){try{await fetch('/api/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:''})});toast('Domain cleared');await loadDomain()}catch(e){toast('Error',true)}}
 
-function showEditModal(uid) {
-  const l = allLinks.find(x => x.uuid === uid);
-  if (!l) return;
-  document.getElementById('edit-uid').value = uid;
-  document.getElementById('edit-name').value = l.label;
-  const gb = l.limit_bytes / 1073741824;
-  document.getElementById('edit-limit').value = l.limit_bytes > 0 ? gb.toFixed(2) : '';
-  document.getElementById('edit-unit').value = 'GB';
-  document.getElementById('edit-maxconn').value = l.max_connections > 0 ? l.max_connections : '';
-  document.getElementById('edit-title').textContent = 'Edit: ' + l.label;
-  document.getElementById('edit-modal').classList.add('show');
+/* Panel Builder */
+async function deployPanel(){
+  var token=document.getElementById('pb-token').value.trim();var space=document.getElementById('pb-space').value.trim();var user=document.getElementById('pb-user').value.trim();var pass=document.getElementById('pb-pass').value;
+  if(!token){toast('HF token required',true);return}if(!space){toast('Space name required',true);return}if(pass.length<4){toast('Password min 4 chars',true);return}
+  var res=document.getElementById('pb-result');res.style.display='block';res.innerHTML='<div style="color:var(--text3);font-size:12px">Deploying... please wait</div>';
+  try{var r=await fetch('/api/panel-builder/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hf_token:token,space_name:space,admin_username:user,admin_password:pass})});
+  if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Deploy failed')}
+  var d=await r.json();res.innerHTML='<div style="color:var(--green);font-size:13px;font-weight:600">Panel deployed successfully!</div><div style="margin-top:8px"><a href="'+esc(d.space_url)+'" target="_blank" style="color:var(--accent);font-size:12px">'+esc(d.space_url)+'</a></div><div style="margin-top:4px"><a href="'+esc(d.app_url)+'/dashboard" target="_blank" style="color:var(--accent2);font-size:12px">'+esc(d.app_url)+'/dashboard</a></div>';toast('Panel deployed!')}catch(e){res.innerHTML='<div style="color:var(--red);font-size:12px">'+esc(e.message)+'</div>';toast(e.message,true)}
 }
 
-async function saveEdit() {
-  const uid = document.getElementById('edit-uid').value;
-  const val = parseFloat(document.getElementById('edit-limit').value)||0;
-  const unit = document.getElementById('edit-unit').value;
-  const maxconn = parseInt(document.getElementById('edit-maxconn').value)||0;
-  try {
-    const r = await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({limit_value:val,limit_unit:unit,max_connections:maxconn})});
-    if (!r.ok) throw new Error();
-    toast('Updated');
-    closeModal('edit-modal');
-    await loadInbounds();
-  } catch(e) { toast('Error', true); }
-}
+/* Settings */
+async function changePassword(){var cur=document.getElementById('cur-pw').value;var nw=document.getElementById('new-pw').value;var cf=document.getElementById('cfm-pw').value;if(!cur||!nw||!cf){toast('Fill all fields',true);return}if(nw!==cf){toast('Passwords dont match',true);return}if(nw.length<4){toast('Min 4 characters',true);return}try{var r=await fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});if(!r.ok){var d=await r.json().catch(function(){return{}});throw new Error(d.detail||'Error')}toast('Password updated');document.getElementById('cur-pw').value='';document.getElementById('new-pw').value='';document.getElementById('cfm-pw').value=''}catch(e){toast(e.message,true)}}
+async function doLogout(){await fetch('/api/logout',{method:'POST'});location.href='/login'}
 
-async function resetTraffic() {
-  const uid = document.getElementById('edit-uid').value;
-  if (!confirm('Reset traffic to zero?')) return;
-  try {
-    await fetch(`/api/links/${uid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reset_usage:true})});
-    toast('Traffic reset');
-    await loadInbounds();
-  } catch(e) { toast('Error', true); }
-}
-
-function copyVless(txt) { navigator.clipboard.writeText(txt).then(()=>toast('VLESS link copied')).catch(()=>toast('Copy failed',true)); }
-async function copySubUrl(uid) {
-  const url = `https://${location.host}/sub/${uid}`;
-  navigator.clipboard.writeText(url).then(()=>toast('Subscription URL copied')).catch(()=>toast('Copy failed',true));
-}
-
-// ── Addresses ────────────────────────────────────────────────
-let allAddresses = [];
-async function loadAddresses() {
-  try {
-    const r = await fetch('/api/addresses');
-    if (!r.ok) throw new Error();
-    const d = await r.json();
-    allAddresses = d.addresses || [];
-    renderAddresses();
-  } catch(e) {}
-}
-function renderAddresses() {
-  const list = document.getElementById('address-list');
-  if (!allAddresses.length) { list.innerHTML = '<div style="color:#555;font-size:12px;padding:8px 0">No addresses added</div>'; return; }
-  list.innerHTML = allAddresses.map((a,i) => `
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#111;border:1px solid #1a1a1a;border-radius:8px;margin-bottom:6px">
-      <span style="font-family:monospace;font-size:13px;color:#ccc">${esc(a)}</span>
-      <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteAddress(${i})">×</button>
-    </div>`).join('');
-}
-function showAddAddressModal() { document.getElementById('new-address').value=''; document.getElementById('add-address-modal').classList.add('show'); }
-async function addAddresses() {
-  const text = document.getElementById('new-address').value.trim();
-  if (!text) { toast('Enter at least one address', true); return; }
-  const lines = text.split('\n').map(l=>l.trim()).filter(l=>l);
-  let added=0, errors=0;
-  for (const addr of lines) {
-    if (!/^[a-zA-Z0-9\-_. ]+$/.test(addr)) { errors++; continue; }
-    try {
-      const r = await fetch('/api/addresses', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({address:addr})});
-      if (r.ok) added++; else errors++;
-    } catch(e) { errors++; }
-  }
-  if (added > 0) toast(`Added ${added} address(es)`);
-  if (errors > 0) toast(`${errors} failed`, true);
-  if (added > 0) { closeModal('add-address-modal'); await loadAddresses(); }
-}
-async function deleteAddress(index) {
-  if (!confirm('Delete this address?')) return;
-  try {
-    const r = await fetch(`/api/addresses/${index}`, {method:'DELETE'});
-    if (!r.ok) throw new Error();
-    toast('Deleted');
-    await loadAddresses();
-  } catch(e) { toast('Error', true); }
-}
-
-// ── Domain ───────────────────────────────────────────────────
-let currentDomain = '';
-async function loadDomain() {
-  try {
-    const r = await fetch('/api/domain');
-    if (!r.ok) throw new Error();
-    const d = await r.json();
-    currentDomain = d.domain || '';
-    const renderDomain = apiStats.domain || location.host;
-    const rd = document.getElementById('render-domain');
-    if (rd) rd.textContent = renderDomain;
-    const dv = document.getElementById('domain-value');
-    const dcb = document.getElementById('domain-clear-btn');
-    if (currentDomain) {
-      dv.textContent = currentDomain;
-      dv.style.color = '#008771';
-      if (dcb) dcb.style.display = '';
-    } else {
-      dv.textContent = renderDomain + ' (default)';
-      dv.style.color = '#888';
-      if (dcb) dcb.style.display = 'none';
-    }
-  } catch(e) {}
-}
-async function saveDomain() {
-  const domain = document.getElementById('domain-input').value.trim();
-  if (!domain) { toast('Enter a domain', true); return; }
-  try {
-    const r = await fetch('/api/domain', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domain})});
-    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
-    toast('Domain saved');
-    document.getElementById('domain-input').value = '';
-    await loadDomain();
-  } catch(e) { toast(e.message, true); }
-}
-async function clearDomain() {
-  try {
-    await fetch('/api/domain', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domain:''})});
-    toast('Domain cleared');
-    await loadDomain();
-  } catch(e) { toast('Error', true); }
-}
-
-// ── Settings ─────────────────────────────────────────────────
-async function changePassword() {
-  const cur = document.getElementById('cur-pw').value;
-  const nw = document.getElementById('new-pw').value;
-  const conf = document.getElementById('confirm-pw').value;
-  if (!cur || !nw || !conf) { toast('Fill all fields', true); return; }
-  if (nw !== conf) { toast('Passwords do not match', true); return; }
-  if (nw.length < 4) { toast('Min 4 characters', true); return; }
-  try {
-    const r = await fetch('/api/change-password', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({current_password:cur,new_password:nw})});
-    if (!r.ok) { const d=await r.json().catch(()=>({})); throw new Error(d.detail||'Error'); }
-    toast('Password updated');
-    document.getElementById('cur-pw').value='';
-    document.getElementById('new-pw').value='';
-    document.getElementById('confirm-pw').value='';
-  } catch(e) { toast(e.message, true); }
-}
-
-async function doLogout() {
-  await fetch('/api/logout', {method:'POST'});
-  location.href = '/login';
-}
-
-// ── Init ─────────────────────────────────────────────────────
-loadStats();
-loadInbounds();
-setInterval(loadStats, 5000);
-setInterval(loadInbounds, 15000);
+/* Init */
+initChart();loadStats();loadInbounds();
+setInterval(loadStats,5000);setInterval(loadInbounds,15000);
 </script>
 </body>
 </html>"""
 
-# ─── FastAPI Routes for HTML Pages ──────────────────────────
+#  USF Panel v2.0.0 — Routes & Main
+# ============================================================
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
@@ -3082,7 +2361,6 @@ async def dashboard_page(request: Request):
         return RedirectResponse(url="/login")
     return HTMLResponse(content=DASHBOARD_HTML)
 
-# Legacy route aliases
 @app.get("/inbounds", response_class=HTMLResponse)
 async def inbounds_page(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -3098,7 +2376,6 @@ async def settings_page(request: Request):
     return RedirectResponse(url="/dashboard")
 
 if __name__ == "__main__":
-    # ─── Speed: 2 workers + uvloop + httptools + websockets (max throughput) ──
     uvicorn.run(
         app,
         host="0.0.0.0",
@@ -3107,6 +2384,6 @@ if __name__ == "__main__":
         http="httptools" if _HAS_UVLOOP else "h11",
         ws="websockets",
         log_level="info",
-        access_log=False,  # Disable access log = higher throughput
-        timeout_keep_alive=75,  # Keep-alive for proxies (HF uses 60s default)
+        access_log=False,
+        timeout_keep_alive=75,
     )
