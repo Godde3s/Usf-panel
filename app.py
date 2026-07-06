@@ -1091,7 +1091,6 @@ async def parse_vless_header(first_chunk: bytes):
     pos += 1; pos += 16
     addon_len = first_chunk[pos]; pos += 1; pos += addon_len
     command = first_chunk[pos]; pos += 1
-    port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
     addr_type = first_chunk[pos]; pos += 1
     if addr_type == 1:
         addr_bytes = first_chunk[pos:pos + 4]; pos += 4
@@ -1104,6 +1103,7 @@ async def parse_vless_header(first_chunk: bytes):
         address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
     else:
         raise ValueError(f"unknown address type: {addr_type}")
+    port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
     return command, address, port, first_chunk[pos:]
 
 async def check_quota(uid: str, extra_bytes: int) -> bool:
