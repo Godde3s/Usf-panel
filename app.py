@@ -1881,9 +1881,8 @@ function showClientLinks(uid,label){
   const l=links.find(x=>x.uuid===uid);if(!l)return;
   document.getElementById('clientModalTitle').textContent='Client Links — '+label;
   const c=document.getElementById('clientLinksContent');
-  c.innerHTML='<div class="client-links-grid">'+
-    Object.entries(l.client_links||{}).map(([k,v])=>`<div class="cl-item"><span>${k}</span><button onclick="copyText('${esc(v)}','${k}')" title="Copy">&#128203;</button></div>`).join('')+
-    '</div><div style="margin-top:12px;padding:10px;background:var(--glass);border-radius:8px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Subscription URL</div><div style="display:flex;gap:6px"><input type="text" value="'+esc(l.sub_url)+'" readonly style="flex:1;padding:6px 10px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit;outline:none"><button class="btn btn-sm" onclick="copyText('${esc(l.sub_url)}','Subscription')">Copy</button></div></div>';
+  const items=Object.entries(l.client_links||{}).map(([k,v])=>`<div class="cl-item"><span>${k}</span><button onclick="copyText('${esc(v)}','${k}')" title="Copy">&#128203;</button></div>`).join('');
+  c.innerHTML=`<div class="client-links-grid">${items}</div><div style="margin-top:12px;padding:10px;background:var(--glass);border-radius:8px"><div style="font-size:11px;color:var(--text3);margin-bottom:4px">Subscription URL</div><div style="display:flex;gap:6px"><input type="text" value="${esc(l.sub_url)}" readonly style="flex:1;padding:6px 10px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit;outline:none"><button class="btn btn-sm" onclick="copyText('${esc(l.sub_url)}','Subscription')">Copy</button></div></div>`;
   document.getElementById('clientModal').classList.add('open');
 }
 
@@ -2054,7 +2053,7 @@ function copyText(text,name){
 }
 
 // ── Init ──
-initChart();
+try{initChart()}catch(e){console.warn('Chart.js init skipped:',e)}
 loadStats();
 statsInterval=setInterval(loadStats,3000);
 </script>
