@@ -48,7 +48,7 @@ CONFIG = {
     "secret": os.environ.get("SECRET_KEY", "Usf-default-secret-key"),
 }
 
-PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.0.1")
+PANEL_VERSION = os.environ.get("PANEL_VERSION", "v1.1.0")
 CORE_VERSION = os.environ.get("CORE_VERSION", "v26.4.25")
 TELEGRAM_HANDLE = os.environ.get("TELEGRAM_HANDLE", "@Usf")
 
@@ -986,7 +986,7 @@ async def get_subscription(uid: str, _=Depends(require_auth)):
     }
 
 @app.get("/sub/{uid}")
-async def subscription_endpoint(uid: str):
+async def subscription_endpoint(uid: str, request: Request):
     import base64
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -996,6 +996,27 @@ async def subscription_endpoint(uid: str):
         raise HTTPException(status_code=403, detail="link disabled")
     if is_expired(link):
         raise HTTPException(status_code=403, detail="link expired")
+
+    # ─── Dual-purpose endpoint: serve HTML to browsers, base64 to clients ──────
+    # Detect browser by User-Agent. Subscription clients (V2RayN, V2RayNG,
+    # Shadowrocket, Clash, Hiddify, etc.) either send no UA, or a custom UA
+    # like "okhttp", "v2rayN", "Shadowrocket/...". Browsers always include
+    # "Mozilla" + "AppleWebKit" or "Gecko" or "Chrome" in their UA.
+    user_agent = (request.headers.get("user-agent") or "").lower()
+    accept = (request.headers.get("accept") or "").lower()
+    is_browser = (
+        "mozilla" in user_agent
+        and ("applewebkit" in user_agent or "gecko" in user_agent or "chrome" in user_agent)
+        and "text/html" in accept
+        # Exclude known subscription clients that spoof Mozilla UA
+        and not any(c in user_agent for c in ["okhttp", "v2ray", "shadowrocket", "clash", "hiddify", "nekobox", "sing-box"])
+    )
+
+    if is_browser:
+        # Serve the premium HTML status page
+        return await _render_sub_status_page(uid, link)
+
+    # ─── Serve base64 subscription to clients ──────────────────────────────────
     async with CUSTOM_ADDRESSES_LOCK:
         addresses = list(CUSTOM_ADDRESSES)
     sub_links = []
@@ -1008,19 +1029,51 @@ async def subscription_endpoint(uid: str):
     sub_content = "\n".join(sub_links)
     encoded = base64.b64encode(sub_content.encode()).decode()
     # ─── Anti-leak headers ────────────────────────────────────────────────────
-    # Don't leak any identifying headers. Use only the minimum required headers
-    # for subscription clients to work.
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": "attachment; filename=\"sub.txt\"",
         "profile-update-interval": "6",
         "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}",
-        # Anti-leak hints (interpreted by modern VLESS clients like V2rayN, Nekoray):
-        # - profile-title: friendly name
-        # - profile-web-page-url: link back to status page (no IP leak — uses domain only)
         "profile-title": f"Usf-{link['label']}",
+        "profile-web-page-url": f"https://{get_domain()}/sub/{uid}",
     }
     return Response(content=encoded, headers=headers)
+
+
+async def _render_sub_status_page(uuid: str, link_data: dict):
+    """Render the premium HTML status page for a subscription link.
+    This is called when a user opens /sub/{uid} in a browser."""
+    used_bytes = int(link_data.get("used_bytes", 0))
+    limit_bytes = int(link_data.get("limit_bytes", 0))
+    remaining_bytes = max(0, limit_bytes - used_bytes) if limit_bytes > 0 else 0
+    vless_link = generate_vless_link(uuid, remark=f"Usf-{link_data['label']}")
+    sub_url = f"https://{get_domain()}/sub/{uuid}"
+    percent = min(100, (used_bytes / limit_bytes) * 100) if limit_bytes > 0 else 0
+
+    used_str = fmt_bytes(used_bytes)
+    limit_str = fmt_bytes(limit_bytes) if limit_bytes > 0 else "نامحدود"
+    remaining_str = fmt_bytes(remaining_bytes) if limit_bytes > 0 else "نامحدود"
+
+    expiry_raw = link_data.get('expiry', '')
+    expiry_display = "نامحدود"
+    expiry_epoch_val = 0
+    if expiry_raw:
+        try:
+            exp_dt = datetime.fromisoformat(expiry_raw)
+            expiry_epoch_val = int(exp_dt.timestamp())
+            expiry_display = exp_dt.strftime('%Y-%m-%d')
+        except (TypeError, ValueError):
+            expiry_raw = ''
+
+    label = link_data.get('label', 'بدون برچسب')
+    max_conn = link_data.get('max_connections', 0)
+    is_active = bool(link_data.get('active', False))
+    is_exp = is_expired(link_data)
+    status_text = 'فعال' if (is_active and not is_exp) else ('منقضی' if is_exp else 'غیرفعال')
+    status_class = 'on' if (is_active and not is_exp) else 'off'
+
+    # Render the premium HTML status page (same as /status/{uuid}/view)
+    return await subscription_status(uuid)
 
 # ─── WebSocket Tunnel ──────────────────────────────────────────────────────────
 
@@ -1187,7 +1240,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
 
 # ─── Subscription Status Page (Premium) ──────────────────────────────────────
 
-@app.get("/status/{uuid}", response_class=HTMLResponse)
+@app.get("/status/{uuid}")
+async def status_redirect(uuid: str):
+    """Redirect /status/{uuid} to /sub/{uid} — they're now the same endpoint."""
+    return RedirectResponse(url=f"/sub/{uuid}", status_code=302)
+
+@app.get("/status/{uuid}/view", response_class=HTMLResponse)
 async def subscription_status(uuid: str):
     async with LINKS_LOCK:
         link_data = LINKS.get(uuid)
@@ -1420,6 +1478,7 @@ html[data-theme="light"] .sub-link{background:rgba(255,255,255,0.6)}
   margin-top:14px;display:grid;
   grid-template-columns:repeat(3,1fr);gap:8px;
 }
+@media(min-width:480px){.client-row{grid-template-columns:repeat(3,1fr)}}
 .client-chip{
   display:flex;flex-direction:column;align-items:center;gap:4px;
   padding:10px 6px;border-radius:12px;text-decoration:none;
@@ -1431,6 +1490,7 @@ html[data-theme="light"] .sub-link{background:rgba(255,255,255,0.6)}
 .client-chip .ci{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff}
 .ci-v2n{background:#5b8def}.ci-v2g{background:#22c55e}.ci-str{background:#ff6b6b}
 .ci-sr{background:#1e293b}.ci-fox{background:#f97316}.ci-bull{background:#8b5cf6}
+.ci-hid{background:#3b82f6}.ci-npv{background:#ec4899}.ci-mah{background:#14b8a6}
 .client-chip span{display:block;text-align:center;line-height:1.2}
 
 /* Gauge + Progress */
@@ -1556,7 +1616,12 @@ html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
   <div class="header">
     <div class="logo-wrap">
       <div class="logo-ring"></div>
-      <div class="logo">&#9651;</div>
+      <div class="logo">
+        <svg width="44" height="44" viewBox="0 0 56 56">
+          <path d="M16 14 L16 36 Q16 44 24 44 L32 44 Q40 44 40 36 L40 14"
+                stroke="currentColor" stroke-width="5.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
     </div>
     <div class="title">Usf</div>
     <div class="label-chip"><span class="pin">&#128204;</span> __LABEL__</div>
@@ -1584,6 +1649,9 @@ html[data-theme="light"] .toast{background:rgba(15,23,42,0.95)}
       <a class="client-chip" href="streisand://import/__SUB_URL_ENC__"><span class="ci ci-str">S</span><span>Streisand</span></a>
       <a class="client-chip" href="shadowrocket://add/sub://__SUB_URL_B64__"><span class="ci ci-sr">SR</span><span>Shadowrocket</span></a>
       <a class="client-chip" href="foxray://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-fox">F</span><span>Foxray</span></a>
+      <a class="client-chip" href="hiddify://subscribe/__SUB_URL_B64__"><span class="ci ci-hid">H</span><span>Hiddify</span></a>
+      <a class="client-chip" href="npv://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-npv">P</span><span>NPV Tunnel</span></a>
+      <a class="client-chip" href="mahsan://install-sub?url=__SUB_URL_ENC__"><span class="ci ci-mah">M</span><span>MahsanG</span></a>
       <a class="client-chip" href="bullshit://install/__SUB_URL_ENC__"><span class="ci ci-bull">B</span><span>BS Client</span></a>
     </div>
   </div>
@@ -2118,19 +2186,13 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
 <aside class="ant-layout-sider" id="sidebar">
   <div class="ant-layout-sider-children">
     <div class="brand-title">
-      <svg width="26" height="26" viewBox="0 0 56 56" fill="none">
+      <svg width="28" height="28" viewBox="0 0 56 56" fill="none">
         <rect width="56" height="56" rx="14" fill="url(#lg)"/>
-        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3"/>
-        <circle cx="28" cy="18" r="3.5" fill="#fff"/>
-        <circle cx="19" cy="33" r="3.5" fill="#fff"/>
-        <circle cx="37" cy="33" r="3.5" fill="#fff"/>
-        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#008771"/><stop offset="1" stop-color="#005565"/></linearGradient></defs>
+        <path d="M16 16 L16 36 Q16 44 24 44 L32 44 Q40 44 40 36 L40 16"
+              stroke="#fff" stroke-width="5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#f5c542"/><stop offset="1" stop-color="#e6b422"/></linearGradient></defs>
       </svg>
-      <span>Usf <span class="version">v1.0</span></span>
+      <span>Usf <span class="version">v1.1.0</span></span>
     </div>
     <div class="nav-section">Main</div>
     <ul class="ant-menu">
@@ -2429,12 +2491,12 @@ button.split-col:hover{color:#2bd4a0;background:rgba(43,212,160,0.06)}
         <table class="ant-table">
           <thead><tr>
             <th style="width:36px">#</th>
-            <th>Remark</th>
-            <th style="width:64px">Type</th>
-            <th>Traffic</th>
-            <th style="width:72px">IPs</th>
-            <th style="width:60px">Status</th>
-            <th style="width:120px">Actions</th>
+            <th>نام</th>
+            <th style="width:64px">نوع</th>
+            <th>ترافیک</th>
+            <th style="width:72px">IP‌ها</th>
+            <th style="width:80px">وضعیت</th>
+            <th style="width:180px">عملیات</th>
           </tr></thead>
           <tbody id="inbounds-tbody"><tr><td colspan="7" style="text-align:center;padding:32px;color:#555">Loading...</td></tr></tbody>
         </table>
@@ -2835,7 +2897,10 @@ function renderInbounds(links) {
     const curC = l.current_connections || 0;
     return `<tr>
       <td style="color:#555;font-size:11px">${i}</td>
-      <td style="font-weight:600;color:#ccc">${esc(l.label)}</td>
+      <td>
+        <div style="font-weight:600;color:#e2e8f0;font-size:13px">${esc(l.label)}</div>
+        <div style="font-size:10px;color:#64748b;font-family:monospace;margin-top:2px">${l.uuid.substring(0,8)}...</div>
+      </td>
       <td><span class="ant-tag ant-tag-purple">VLESS</span></td>
       <td>
         <div class="usage-pill">
@@ -2843,15 +2908,31 @@ function renderInbounds(links) {
           <div class="bar"><div class="fill" style="width:${pct}%;background:${col}"></div></div>
           <span class="limit">${lF}</span>
         </div>
+        <div style="font-size:10px;color:#64748b;margin-top:3px">${pct.toFixed(1)}% used</div>
       </td>
-      <td style="font-size:12px;font-weight:600;color:${maxC>0&&curC>=maxC?'#ef4444':'#888'}">${curC}/${maxC||'∞'}</td>
-      <td><span class="ant-tag ${l.active?'ant-tag-green':'ant-tag-red'}">${l.active?'On':'Off'}</span></td>
+      <td style="font-size:12px;font-weight:600;color:${maxC>0&&curC>=maxC?'#ef4444':'#94a3b8'}">${curC}/${maxC||'∞'}</td>
       <td>
-        <div style="display:flex;gap:3px;align-items:center">
-          <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="toggleInbound(this)" title="Toggle"></button>
-          <button class="ant-btn ant-btn-secondary ant-btn-sm" onclick="showEditModal('${l.uuid}')" style="padding:3px 7px;color:#fbbf24;border-color:rgba(251,191,36,0.2);background:rgba(251,191,36,0.06)">e</button>
-          <button class="btn-copy" onclick="copyVless('${esc(l.vless_link)}')" title="Copy VLESS">c</button>
-          <button class="btn-copy" onclick="copySubUrl('${l.uuid}')" style="background:rgba(34,197,94,0.08);color:#22c55e;border-color:rgba(34,197,94,0.15)" title="Copy Sub URL">s</button>          <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteInbound('${l.uuid}')" title="Delete">x</button>
+        <span class="ant-tag ${l.active?'ant-tag-green':'ant-tag-red'}">${l.active?'On':'Off'}</span>
+        ${l.expired?'<span class="ant-tag ant-tag-red" style="margin-top:2px">Expired</span>':''}
+      </td>
+      <td>
+        <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+          <button class="toggle ${l.active?'on':''}" data-uid="${l.uuid}" onclick="toggleInbound(this)" title="فعال/غیرفعال"></button>
+          <button class="ant-btn ant-btn-secondary ant-btn-sm" onclick="showEditModal('${l.uuid}')" style="padding:4px 8px;color:#fbbf24;border-color:rgba(251,191,36,0.2);background:rgba(251,191,36,0.06)" title="ویرایش">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <a class="btn-copy" href="/sub/${l.uuid}" target="_blank" style="background:rgba(245,197,66,0.08);color:#f5c542;border-color:rgba(245,197,66,0.15);text-decoration:none" title="باز کردن صفحه ساب">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          </a>
+          <button class="btn-copy" onclick="copySubUrl('${l.uuid}')" style="background:rgba(34,197,94,0.08);color:#22c55e;border-color:rgba(34,197,94,0.15)" title="کپی لینک ساب">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+          <button class="btn-copy" onclick="copyVless('${esc(l.vless_link)}')" title="کپی کانفیگ VLESS">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
+          </button>
+          <button class="ant-btn ant-btn-danger ant-btn-sm" onclick="deleteInbound('${l.uuid}')" title="حذف" style="padding:4px 8px">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </button>
         </div>
       </td>
     </tr>`;
